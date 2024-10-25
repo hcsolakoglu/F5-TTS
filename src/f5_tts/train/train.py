@@ -34,6 +34,8 @@ num_warmup_updates = 20000  # warmup steps
 save_per_updates = 50000  # save checkpoint per steps
 last_per_steps = 5000  # save last checkpoint per steps
 
+use_ordered_sampler = False  # New parameter to use OrderedSampler
+
 # model params
 if exp_name == "F5TTS_Base":
     wandb_resume_id = None
@@ -83,6 +85,7 @@ def main():
         wandb_run_name=exp_name,
         wandb_resume_id=wandb_resume_id,
         last_per_steps=last_per_steps,
+        use_ordered_sampler=use_ordered_sampler,  # Pass the new parameter to the Trainer
     )
 
     train_dataset = load_dataset(dataset_name, tokenizer, mel_spec_kwargs=mel_spec_kwargs)

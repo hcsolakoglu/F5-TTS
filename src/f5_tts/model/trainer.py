@@ -17,7 +17,7 @@ from ema_pytorch import EMA
 
 from f5_tts.model import CFM
 from f5_tts.model.utils import exists, default
-from f5_tts.model.dataset import DynamicBatchSampler, collate_fn
+from f5_tts.model.dataset import DynamicBatchSampler, OrderedSampler, collate_fn
 
 
 # trainer
@@ -46,6 +46,7 @@ class Trainer:
         accelerate_kwargs: dict = dict(),
         ema_kwargs: dict = dict(),
         bnb_optimizer: bool = False,
+        use_ordered_sampler: bool = False,  # New parameter to use OrderedSampler
     ):
         ddp_kwargs = DistributedDataParallelKwargs(find_unused_parameters=True)
 
@@ -103,6 +104,8 @@ class Trainer:
         self.noise_scheduler = noise_scheduler
 
         self.duration_predictor = duration_predictor
+
+        self.use_ordered_sampler = use_ordered_sampler  # Initialize the new parameter
 
         if bnb_optimizer:
             import bitsandbytes as bnb
@@ -190,8 +193,9 @@ class Trainer:
                 pin_memory=True,
                 persistent_workers=True,
                 batch_size=self.batch_size,
-                shuffle=True,
+                shuffle=not self.use_ordered_sampler,  # Disable shuffling if using OrderedSampler
                 generator=generator,
+                sampler=OrderedSampler(train_dataset) if self.use_ordered_sampler else None,  # Use OrderedSampler if specified
             )
         elif self.batch_size_type == "frame":
             self.accelerator.even_batches = False

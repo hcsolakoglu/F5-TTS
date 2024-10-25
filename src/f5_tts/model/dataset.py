@@ -203,6 +203,19 @@ class DynamicBatchSampler(Sampler[list[int]]):
         return len(self.batches)
 
 
+class OrderedSampler(Sampler[int]):
+    """Sampler that iterates through the dataset in a specific order without shuffling."""
+
+    def __init__(self, data_source: Dataset):
+        self.data_source = data_source
+
+    def __iter__(self):
+        return iter(range(len(self.data_source)))
+
+    def __len__(self):
+        return len(self.data_source)
+
+
 # Load dataset
 
 

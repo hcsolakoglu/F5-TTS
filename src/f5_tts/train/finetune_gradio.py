@@ -252,6 +252,7 @@ def start_training(
     tokenizer_type="pinyin",
     tokenizer_file="",
     mixed_precision="fp16",
+    use_ordered_sampler=False,  # New parameter to use OrderedSampler
 ):
     global training_process, tts_api
 
@@ -323,6 +324,9 @@ def start_training(
         cmd += f" --tokenizer_path {tokenizer_file}"
 
     cmd += f" --tokenizer {tokenizer_type} "
+
+    if use_ordered_sampler:  # Add the new parameter to the command
+        cmd += " --use_ordered_sampler"
 
     print(cmd)
 
@@ -1101,6 +1105,7 @@ for tutorial and updates check here (https://github.com/SWivid/F5-TTS/discussion
                     tokenizer_type,
                     tokenizer_file,
                     mixed_precision,
+                    use_ordered_sampler,  # Pass the new parameter to the start_training function
                 ],
                 outputs=[txt_info_train, start_button, stop_button],
             )

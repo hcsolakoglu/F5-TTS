@@ -54,6 +54,7 @@ def parse_args():
         default=None,
         help="Path to custom tokenizer vocab file (only used if tokenizer = 'custom')",
     )
+    parser.add_argument("--use_ordered_sampler", action="store_true", help="Use OrderedSampler for dataset loading")
 
     return parser.parse_args()
 
@@ -131,6 +132,7 @@ def main():
         wandb_run_name=args.exp_name,
         wandb_resume_id=wandb_resume_id,
         last_per_steps=args.last_per_steps,
+        use_ordered_sampler=args.use_ordered_sampler,
     )
 
     train_dataset = load_dataset(args.dataset_name, tokenizer, mel_spec_kwargs=mel_spec_kwargs)
