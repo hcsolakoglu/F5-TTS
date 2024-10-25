@@ -204,25 +204,40 @@ with gr.Blocks() as app_multistyle:
         """
     # Multiple Speech-Type Generation
 
-    This section allows you to upload different audio clips for each speech type. 'Regular' emotion is mandatory. You can add additional speech types by clicking the "Add Speech Type" button. Enter your text in the format shown below, and the system will generate speech using the appropriate emotions. If unspecified, the model will use the regular speech type. The current speech type will be used until the next speech type is specified.
-
-    **Example Input:**     
-    {Regular} Hello, I'd like to order a sandwich please.     
-    {Surprised} What do you mean you're out of bread?     
-    {Sad} I really wanted a sandwich though...     
-    {Angry} You know what, darn you and your little shop!     
-    {Whisper} I'll just go back home and cry now.     
-    {Shouting} Why me?!     
+    This section allows you to generate multiple speech types or multiple people's voices. Enter your text in the format shown below, and the system will generate speech using the appropriate type. If unspecified, the model will use the regular speech type. The current speech type will be used until the next speech type is specified.
     """
     )
 
+    with gr.Row():
+        gr.Markdown(
+            """
+            **Example Input:**                                                                      
+            {Regular} Hello, I'd like to order a sandwich please.                                                         
+            {Surprised} What do you mean you're out of bread?                                                                      
+            {Sad} I really wanted a sandwich though...                                                              
+            {Angry} You know what, darn you and your little shop!                                                                       
+            {Whisper} I'll just go back home and cry now.                                                                           
+            {Shouting} Why me?!                                                                         
+            """
+        )
+
+        gr.Markdown(
+            """
+            **Example Input 2:**                                                                                
+            {Speaker1_Happy} Hello, I'd like to order a sandwich please.                                                            
+            {Speaker2_Regular} Sorry, we're out of bread.                                                                                
+            {Speaker1_Sad} I really wanted a sandwich though...                                                                             
+            {Speaker2_Whisper} I'll give you the last one I was hiding.                                                                     
+            """
+        )
+
     gr.Markdown(
-        "Upload different audio clips for each speech type. 'Regular' emotion is mandatory. You can add additional speech types by clicking the 'Add Speech Type' button."
+        "Upload different audio clips for each speech type. The first speech type is mandatory. You can add additional speech types by clicking the 'Add Speech Type' button."
     )
 
     # Regular speech type (mandatory)
     with gr.Row():
-        regular_name = gr.Textbox(value="Regular", label="Speech Type Name", interactive=False)
+        regular_name = gr.Textbox(value="Regular", label="Speech Type Name")
         regular_audio = gr.Audio(label="Regular Reference Audio", type="filepath")
         regular_ref_text = gr.Textbox(label="Reference Text (Regular)", lines=2)
 
@@ -236,10 +251,11 @@ with gr.Blocks() as app_multistyle:
 
     for i in range(max_speech_types - 1):
         with gr.Row(visible=False) as row:
-            name_input = gr.Textbox(label="Speech Type Name")
+            with gr.Column():
+                name_input = gr.Textbox(label="Speech Type Name")
+                delete_btn = gr.Button("Delete", variant="secondary")
             audio_input = gr.Audio(label="Reference Audio", type="filepath")
             ref_text_input = gr.Textbox(label="Reference Text", lines=2)
-            delete_btn = gr.Button("Delete", variant="secondary")
         speech_type_rows.append(row)
         speech_type_names.append(name_input)
         speech_type_audios.append(audio_input)
@@ -297,7 +313,7 @@ with gr.Blocks() as app_multistyle:
 
     # Text input for the prompt
     gen_text_input_emotional = gr.Textbox(
-        label="Text to Generate ( Make sure the type names you entered match the Speech Type Name above ! ! ! )",
+        label="Text to Generate",
         lines=10,
         placeholder="Enter the script with speaker names (or emotion types) at the start of each block, e.g.:\n\n{Regular} Hello, I'd like to order a sandwich please.\n{Surprised} What do you mean you're out of bread?\n{Sad} I really wanted a sandwich though...\n{Angry} You know what, darn you and your little shop!\n{Whisper} I'll just go back home and cry now.\n{Shouting} Why me?!",
     )
@@ -603,7 +619,7 @@ If you're having issues, try converting your reference audio to WAV or MP3, clip
     )
     gr.TabbedInterface(
         [app_tts, app_multistyle, app_chat, app_credits],
-        ["TTS", "Multi-Style", "Voice-Chat", "Credits"],
+        ["TTS", "Multi-Speech", "Voice-Chat", "Credits"],
     )
 
 
