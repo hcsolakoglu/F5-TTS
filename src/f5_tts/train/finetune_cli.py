@@ -54,6 +54,9 @@ def parse_args():
         default=None,
         help="Path to custom tokenizer vocab file (only used if tokenizer = 'custom')",
     )
+    parser.add_argument("--use_torch_compile", type=bool, default=False, help="Enable or disable torch.compile")
+    parser.add_argument("--compile_mode", type=str, default="default", choices=["default", "reduce-overhead", "max-autotune"], help="Compilation mode for torch.compile")
+    parser.add_argument("--compile_fullgraph", type=bool, default=False, help="Enable or disable full graph for torch.compile")
 
     return parser.parse_args()
 
@@ -131,6 +134,9 @@ def main():
         wandb_run_name=args.exp_name,
         wandb_resume_id=wandb_resume_id,
         last_per_steps=args.last_per_steps,
+        use_torch_compile=args.use_torch_compile,
+        compile_mode=args.compile_mode,
+        compile_fullgraph=args.compile_fullgraph,
     )
 
     train_dataset = load_dataset(args.dataset_name, tokenizer, mel_spec_kwargs=mel_spec_kwargs)

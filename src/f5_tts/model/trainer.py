@@ -46,6 +46,9 @@ class Trainer:
         accelerate_kwargs: dict = dict(),
         ema_kwargs: dict = dict(),
         bnb_optimizer: bool = False,
+        use_torch_compile: bool = False,
+        compile_mode: str = "default",
+        compile_fullgraph: bool = False,
     ):
         ddp_kwargs = DistributedDataParallelKwargs(find_unused_parameters=True)
 
@@ -81,7 +84,10 @@ class Trainer:
                 },
             )
 
-        self.model = model
+        if use_torch_compile:
+            self.model = torch.compile(model, mode=compile_mode, fullgraph=compile_fullgraph)
+        else:
+            self.model = model
 
         if self.is_main:
             self.ema_model = EMA(model, include_online_model=False, **ema_kwargs)

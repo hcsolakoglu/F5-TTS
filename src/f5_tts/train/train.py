@@ -5,6 +5,7 @@ from importlib.resources import files
 from f5_tts.model import CFM, UNetT, DiT, Trainer
 from f5_tts.model.utils import get_tokenizer
 from f5_tts.model.dataset import load_dataset
+import argparse
 
 
 # -------------------------- Dataset Settings --------------------------- #
@@ -47,8 +48,15 @@ elif exp_name == "E2TTS_Base":
 
 # ----------------------------------------------------------------------- #
 
+def parse_args():
+    parser = argparse.ArgumentParser(description="Train CFM Model")
+    parser.add_argument("--use_torch_compile", type=bool, default=False, help="Enable or disable torch.compile")
+    parser.add_argument("--compile_mode", type=str, default="default", choices=["default", "reduce-overhead", "max-autotune"], help="Compilation mode for torch.compile")
+    parser.add_argument("--compile_fullgraph", type=bool, default=False, help="Enable or disable full graph for torch.compile")
+    return parser.parse_args()
 
 def main():
+    args = parse_args()
     if tokenizer == "custom":
         tokenizer_path = tokenizer_path
     else:
@@ -83,6 +91,9 @@ def main():
         wandb_run_name=exp_name,
         wandb_resume_id=wandb_resume_id,
         last_per_steps=last_per_steps,
+        use_torch_compile=args.use_torch_compile,
+        compile_mode=args.compile_mode,
+        compile_fullgraph=args.compile_fullgraph,
     )
 
     train_dataset = load_dataset(dataset_name, tokenizer, mel_spec_kwargs=mel_spec_kwargs)
