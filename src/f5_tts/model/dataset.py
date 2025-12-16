@@ -170,16 +170,26 @@ class DynamicBatchSampler(Sampler[list[int]]):
         than a certain threshold.
     2.  Make sure the padding efficiency in the batch is high.
     3.  Shuffle batches each epoch while maintaining reproducibility.
+    4.  (Optional) Repeat batches and individual samples for RL-style data reuse.
     """
 
     def __init__(
-        self, sampler: Sampler[int], frames_threshold: int, max_samples=0, random_seed=None, drop_residual: bool = False
+        self,
+        sampler: Sampler[int],
+        frames_threshold: int,
+        max_samples: int = 0,
+        random_seed=None,
+        drop_residual: bool = False,
+        repeat_count: int = 1,
+        mini_repeat_count: int = 1,
     ):
         self.sampler = sampler
         self.frames_threshold = frames_threshold
         self.max_samples = max_samples
         self.random_seed = random_seed
         self.epoch = 0
+        self.repeat_count = repeat_count
+        self.mini_repeat_count = mini_repeat_count
 
         indices, batches = [], []
         data_source = self.sampler.data_source
@@ -226,15 +236,23 @@ class DynamicBatchSampler(Sampler[list[int]]):
         if self.random_seed is not None:
             g = torch.Generator()
             g.manual_seed(self.random_seed + self.epoch)
-            # Use PyTorch's random permutation for better reproducibility across PyTorch versions
             indices = torch.randperm(len(self.batches), generator=g).tolist()
             batches = [self.batches[i] for i in indices]
         else:
             batches = self.batches
-        return iter(batches)
+
+        repeated_batches: list[list[int]] = []
+        for chunk in batches:
+            for _ in range(self.repeat_count):
+                batch_sub: list[int] = []
+                for index in chunk:
+                    batch_sub.extend([index] * self.mini_repeat_count)
+                repeated_batches.append(batch_sub)
+
+        return iter(repeated_batches)
 
     def __len__(self):
-        return len(self.batches)
+        return len(self.batches) * self.repeat_count
 
 
 # Load dataset

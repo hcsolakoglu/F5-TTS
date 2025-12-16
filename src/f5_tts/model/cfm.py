@@ -13,6 +13,8 @@ from __future__ import annotations
 from random import random
 from typing import Callable
 
+from einops import rearrange
+
 import torch
 import torch.nn.functional as F
 from torch import nn
@@ -300,3 +302,116 @@ class CFM(nn.Module):
         loss = loss[rand_span_mask]
 
         return loss.mean(), cond, pred
+
+    def forward_rl(
+        self,
+        cond,  # float['b n d'] | float['b nw']
+        text,  # int['b nt'] | list[str]
+        duration,  # int | int['b']
+        *,
+        lens=None,  # int['b'] | None
+        steps=32,
+        cfg_strength=1.0,
+        sway_sampling_coef=None,
+        seed: int | None = None,
+        max_duration=4096,
+        vocoder=None,  # Callable[[float['b d n']], float['b nw']] | None
+        no_ref_audio: bool = False,
+        duplicate_test: bool = False,
+        t_inter=0.1,
+        edit_mask=None,
+    ):
+        from f5_tts.rl.difftools import odeint_rl
+
+        self.train()
+
+        batch, cond_seq_len, device = cond.size(0), cond.size(1), cond.device
+        if not exists(lens):
+            lens = torch.full((batch,), cond_seq_len, device=device, dtype=torch.long)
+
+        if isinstance(text, list):
+            if exists(self.vocab_char_map):
+                text = list_str_to_idx(text, self.vocab_char_map).to(device)
+            else:
+                text = list_str_to_tensor(text).to(device)
+            assert text.shape[0] == batch
+
+        if exists(text):
+            text_lens = (text != -1).sum(dim=-1)
+            lens = torch.maximum(text_lens, lens)
+
+        cond_mask = lens_to_mask(lens)
+        if edit_mask is not None:
+            cond_mask = cond_mask & edit_mask
+
+        if isinstance(duration, int):
+            duration = torch.full((batch,), duration, device=device, dtype=torch.long)
+
+        duration = torch.maximum(lens + 1, duration)
+        duration = duration.clamp(max=max_duration)
+        max_duration = duration.amax()
+
+        if duplicate_test:
+            test_cond = F.pad(cond, (0, 0, cond_seq_len, max_duration - 2 * cond_seq_len), value=0.0)
+
+        cond = F.pad(cond, (0, 0, 0, max_duration - cond_seq_len), value=0.0)
+        cond_mask = F.pad(cond_mask, (0, max_duration - cond_mask.shape[-1]), value=False)
+        cond_mask = rearrange(cond_mask, "... -> ... 1")
+        step_cond = torch.where(cond_mask, cond, torch.zeros_like(cond))
+
+        mask = lens_to_mask(duration) if batch > 1 else None
+
+        if no_ref_audio:
+            cond = torch.zeros_like(cond)
+
+        def fn(t, x):
+            pred, mu, log_sig = self.transformer.forward_rl(
+                x=x,
+                cond=step_cond,
+                text=text,
+                time=t,
+                mask=mask,
+                drop_audio_cond=False,
+                drop_text=False,
+            )
+            if cfg_strength < 1e-5:
+                return pred, mu, log_sig
+
+            null_pred, _, _ = self.transformer.forward_rl(
+                x=x,
+                cond=step_cond,
+                text=text,
+                time=t,
+                mask=mask,
+                drop_audio_cond=True,
+                drop_text=True,
+            )
+            return pred + (pred - null_pred) * cfg_strength, mu, log_sig
+
+        y0 = []
+        for dur in duration:
+            if exists(seed):
+                torch.manual_seed(seed)
+            y0.append(torch.randn(dur, self.num_channels, device=self.device))
+        y0 = pad_sequence(y0, padding_value=0, batch_first=True)
+
+        t_start = 0
+        if duplicate_test:
+            t_start = t_inter
+            y0 = (1 - t_start) * y0 + t_start * test_cond
+            steps = int(steps * (1 - t_start))
+
+        t = torch.linspace(t_start, 1, steps, device=self.device)
+        if sway_sampling_coef is not None:
+            t = t + sway_sampling_coef * (torch.cos(torch.pi / 2 * t) - 1 + t)
+
+        trajectory, pro_result = odeint_rl(fn, y0, t, **self.odeint_kwargs)
+
+        sampled = trajectory[-1]
+        out = torch.where(cond_mask, cond, sampled)
+
+        if exists(vocoder):
+            out = rearrange(out, "b n d -> b d n")
+            out = vocoder(out)
+
+        return out, trajectory, pro_result

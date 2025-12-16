@@ -327,3 +327,50 @@ class DiT(nn.Module):
         output = self.proj_out(x)
 
         return output
+
+    def forward_rl(
+        self,
+        x,  # nosied input audio float['b n d']
+        cond,  # masked cond audio float['b n d']
+        text,  # text int['b nt']
+        time,  # time step float['b'] | float['']
+        drop_audio_cond: bool,
+        drop_text: bool,
+        mask=None,  # bool['b n'] | None
+    ):
+        batch, seq_len = x.shape[0], x.shape[1]
+        if time.ndim == 0:
+            time = time.repeat(batch)
+
+        t = self.time_embed(time)
+        x = self.get_input_embed(
+            x,
+            cond,
+            text,
+            drop_audio_cond=drop_audio_cond,
+            drop_text=drop_text,
+            cache=False,
+            audio_mask=mask,
+        )
+
+        rope = self.rotary_embed.forward_from_seq_len(seq_len)
+
+        if self.long_skip_connection is not None:
+            residual = x
+
+        for block in self.transformer_blocks:
+            if self.checkpoint_activations:
+                x = torch.utils.checkpoint.checkpoint(self.ckpt_wrapper(block), x, t, mask, rope, use_reentrant=False)
+            else:
+                x = block(x, t, mask=mask, rope=rope)
+
+        if self.long_skip_connection is not None:
+            x = self.long_skip_connection(torch.cat((x, residual), dim=-1))
+
+        x = self.norm_out(x, t)
+        output_mu = self.proj_out(x)
+        output_ln_sig = torch.zeros_like(output_mu)
+        snd = torch.randn_like(output_mu)
+        output = output_mu + snd * torch.exp(output_ln_sig)
+
+        return output, output_mu, output_ln_sig

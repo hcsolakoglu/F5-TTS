@@ -256,6 +256,14 @@ If our work and codebase is useful for you, please cite as:
       journal={arXiv preprint arXiv:2410.06885},
       year={2024},
 }
+## RL training (experimental)
+
+- Install extras: `pip install .[rl]` (uses git to pull wespeaker + pip funasr).
+- Models: by default we auto-download ASR (`FunAudioLLM/SenseVoiceSmall`) and the wespeaker English speaker model. Use `F5TTS_RL_SPK_MODEL` to pick `english` (default), `chinese`, or a local path; `F5TTS_RL_ASR_MODEL` overrides the ASR repo/path.
+- Offline/manual: place weights under `src/f5_tts/rl/SenseVoiceSmall/` and `src/f5_tts/rl/wespeaker/chinese/` and set the env vars to those paths.
+- Trainers: standard pretrain/finetune uses [src/f5_tts/model/trainer.py](src/f5_tts/model/trainer.py); RL/GRPO uses [src/f5_tts/rl/trainer_rl.py](src/f5_tts/rl/trainer_rl.py).
+- Pretraining requirement for GRPO: train a base F5-TTS model first with the standard trainer, then point `train_rl.py` to that checkpoint (actor). The reference model path defaults to `ckpts/F5TTS_ref/model_last.pt`; place your best pretrained checkpoint there or adjust `load_model` in `trainer_rl.py` to match your path. GRPO should start from pretrained weights, not random init.
+- Run a minimal RL loop: `python -m f5_tts.train.train_rl` (edit hyperparameters at the top). RL training is independent and does not affect the standard finetune/infer flows.
 ```
 ## License
 
