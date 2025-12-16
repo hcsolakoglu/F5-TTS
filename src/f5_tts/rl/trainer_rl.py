@@ -270,7 +270,9 @@ class GRPOTrainer:
         decay_steps = total_steps - warmup_steps
         warmup_scheduler = LinearLR(self.optimizer, start_factor=1e-8, end_factor=1.0, total_iters=warmup_steps)
         decay_scheduler = LinearLR(self.optimizer, start_factor=1.0, end_factor=1e-8, total_iters=decay_steps)
-        self.scheduler = SequentialLR(self.optimizer, schedulers=[warmup_scheduler, decay_scheduler], milestones=[warmup_steps])
+        self.scheduler = SequentialLR(
+            self.optimizer, schedulers=[warmup_scheduler, decay_scheduler], milestones=[warmup_steps]
+        )
         train_dataloader, self.scheduler = self.accelerator.prepare(train_dataloader, self.scheduler)
         start_step = self.load_checkpoint()
         global_step = start_step

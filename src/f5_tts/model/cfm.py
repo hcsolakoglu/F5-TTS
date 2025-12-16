@@ -13,10 +13,9 @@ from __future__ import annotations
 from random import random
 from typing import Callable
 
-from einops import rearrange
-
 import torch
 import torch.nn.functional as F
+from einops import rearrange
 from torch import nn
 from torch.nn.utils.rnn import pad_sequence
 from torchdiffeq import odeint

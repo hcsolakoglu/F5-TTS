@@ -5,6 +5,7 @@ from f5_tts.model.dataset import load_dataset
 from f5_tts.model.utils import get_tokenizer
 from f5_tts.rl import trainer_rl
 
+
 # -------------------------- Dataset Settings --------------------------- #
 
 target_sample_rate = 24000

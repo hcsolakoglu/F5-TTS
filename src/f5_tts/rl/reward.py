@@ -29,9 +29,7 @@ def cal_kl(gen, ref):
     gen_mu, gen_sig = gen
     ref_mu, ref_sig = ref
     kl = ref_sig - gen_sig
-    kl += ((torch.exp(gen_sig) ** 2) + F.mse_loss(gen_mu, ref_mu, reduction="none")) / (
-        2 * (torch.exp(ref_sig) ** 2)
-    )
+    kl += ((torch.exp(gen_sig) ** 2) + F.mse_loss(gen_mu, ref_mu, reduction="none")) / (2 * (torch.exp(ref_sig) ** 2))
     return kl
 
 

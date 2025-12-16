@@ -1,13 +1,14 @@
 import os
+from pathlib import Path
+
 import numpy
 import torch
 import torch.nn.functional as F
 import torchaudio
+import wespeaker
 from funasr import AutoModel
 from funasr.utils.postprocess_utils import rich_transcription_postprocess
-from pathlib import Path
 from wespeaker.cli.speaker import Speaker
-import wespeaker
 
 
 class SpeakerEmb(Speaker):
@@ -31,6 +32,7 @@ class SpeakerEmb(Speaker):
 def _resolve_resource_dir(relative: str) -> str:
     base = Path(__file__).parent
     return str((base / relative).resolve())
+
 
 default_spk_id = "english"  # wespeaker hub id; set to "chinese" for Chinese model
 model_spk_dir = os.getenv("F5TTS_RL_SPK_MODEL", default_spk_id)
