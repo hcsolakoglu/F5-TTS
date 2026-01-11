@@ -124,6 +124,7 @@ class UNetT(nn.Module):
         attn_backend="torch",  # "torch" | "flash_attn"
         attn_mask_enabled=False,
         skip_connect_type: Literal["add", "concat", "none"] = "concat",
+        output_dist="deterministic",  # "deterministic" | "gaussian" for RL training
     ):
         super().__init__()
         assert depth % 2 == 0, "UNet-Transformer's depth should be even."
@@ -142,6 +143,8 @@ class UNetT(nn.Module):
         # transformer layers & skip connections
 
         self.dim = dim
+        self.mel_dim = mel_dim
+        self.output_dist = output_dist
         self.skip_connect_type = skip_connect_type
         needs_skip_proj = skip_connect_type == "concat"
 
@@ -184,6 +187,12 @@ class UNetT(nn.Module):
 
         self.norm_out = RMSNorm(dim)
         self.proj_out = nn.Linear(dim, mel_dim)
+
+        # Optional gaussian output head for RL training
+        if output_dist == "gaussian":
+            self.proj_out_ln_sig = nn.Linear(dim, mel_dim)
+        else:
+            self.proj_out_ln_sig = None
 
     def get_input_embed(
         self,
@@ -278,3 +287,91 @@ class UNetT(nn.Module):
         x = self.norm_out(x)[:, 1:, :]  # unpack t from x
 
         return self.proj_out(x)
+
+    def forward_prob(
+        self,
+        x: float["b n d"],  # nosied input audio
+        cond: float["b n d"],  # masked cond audio
+        text: int["b nt"],  # text
+        time: float["b"] | float[""],  # time step
+        mask: bool["b n"] | None = None,
+        drop_audio_cond: bool = False,  # cfg for cond audio
+        drop_text: bool = False,  # cfg for text
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Forward pass returning (mu, ln_sig) for gaussian output distribution.
+
+        This method is used for probabilistic training (gaussian NLL objective)
+        and RL training (GRPO).
+
+        Args:
+            x: Noised input audio [b n d]
+            cond: Masked conditioning audio [b n d]
+            text: Text tokens [b nt]
+            time: Time step [b] or scalar
+            mask: Optional attention mask [b n]
+            drop_audio_cond: Whether to drop audio conditioning (CFG)
+            drop_text: Whether to drop text conditioning (CFG)
+
+        Returns:
+            Tuple of (mu, ln_sig) where:
+                mu: Mean of the predicted distribution [b n mel_dim]
+                ln_sig: Log standard deviation [b n mel_dim]
+
+        Raises:
+            RuntimeError: If output_dist is not 'gaussian'.
+        """
+        if self.proj_out_ln_sig is None:
+            raise RuntimeError(
+                "forward_prob requires output_dist='gaussian'. "
+                "Initialize the model with output_dist='gaussian' to use this method."
+            )
+
+        batch, seq_len = x.shape[0], x.shape[1]
+        if time.ndim == 0:
+            time = time.repeat(batch)
+
+        # t: conditioning time, c: context (text + masked cond audio), x: noised input audio
+        t = self.time_embed(time)
+        x = self.get_input_embed(x, cond, text, drop_audio_cond=drop_audio_cond, drop_text=drop_text, cache=False)
+
+        # postfix time t to input x, [b n d] -> [b n+1 d]
+        x = torch.cat([t.unsqueeze(1), x], dim=1)  # pack t to x
+        if mask is not None:
+            mask = F.pad(mask, (1, 0), value=1)
+
+        rope = self.rotary_embed.forward_from_seq_len(seq_len + 1)
+
+        # flat unet transformer
+        skip_connect_type = self.skip_connect_type
+        skips = []
+        for idx, (maybe_skip_proj, attn_norm, attn, ff_norm, ff) in enumerate(self.layers):
+            layer = idx + 1
+
+            # skip connection logic
+            is_first_half = layer <= (self.depth // 2)
+            is_later_half = not is_first_half
+
+            if is_first_half:
+                skips.append(x)
+
+            if is_later_half:
+                skip = skips.pop()
+                if skip_connect_type == "concat":
+                    x = torch.cat((x, skip), dim=-1)
+                    x = maybe_skip_proj(x)
+                elif skip_connect_type == "add":
+                    x = x + skip
+
+            # attention and feedforward blocks
+            x = attn(attn_norm(x), rope=rope, mask=mask) + x
+            x = ff(ff_norm(x)) + x
+
+        assert len(skips) == 0
+
+        x = self.norm_out(x)[:, 1:, :]  # unpack t from x
+
+        # Output mean and log standard deviation
+        mu = self.proj_out(x)
+        ln_sig = self.proj_out_ln_sig(x)
+
+        return mu, ln_sig

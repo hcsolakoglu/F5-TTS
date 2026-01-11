@@ -96,6 +96,7 @@ class MMDiT(nn.Module):
         text_num_embeds=256,
         text_mask_padding=True,
         qk_norm=None,
+        output_dist="deterministic",  # "deterministic" | "gaussian" for RL training
     ):
         super().__init__()
 
@@ -108,6 +109,8 @@ class MMDiT(nn.Module):
 
         self.dim = dim
         self.depth = depth
+        self.mel_dim = mel_dim
+        self.output_dist = output_dist
 
         self.transformer_blocks = nn.ModuleList(
             [
@@ -126,6 +129,12 @@ class MMDiT(nn.Module):
         self.norm_out = AdaLayerNorm_Final(dim)  # final modulation
         self.proj_out = nn.Linear(dim, mel_dim)
 
+        # Optional gaussian output head for RL training
+        if output_dist == "gaussian":
+            self.proj_out_ln_sig = nn.Linear(dim, mel_dim)
+        else:
+            self.proj_out_ln_sig = None
+
         self.initialize_weights()
 
     def initialize_weights(self):
@@ -141,6 +150,11 @@ class MMDiT(nn.Module):
         nn.init.constant_(self.norm_out.linear.bias, 0)
         nn.init.constant_(self.proj_out.weight, 0)
         nn.init.constant_(self.proj_out.bias, 0)
+
+        # Initialize gaussian head if present
+        if self.proj_out_ln_sig is not None:
+            nn.init.constant_(self.proj_out_ln_sig.weight, 0)
+            nn.init.constant_(self.proj_out_ln_sig.bias, 0)
 
     def get_input_embed(
         self,
@@ -211,3 +225,67 @@ class MMDiT(nn.Module):
         output = self.proj_out(x)
 
         return output
+
+    def forward_prob(
+        self,
+        x: float["b n d"],  # nosied input audio
+        cond: float["b n d"],  # masked cond audio
+        text: int["b nt"],  # text
+        time: float["b"] | float[""],  # time step
+        mask: bool["b n"] | None = None,
+        drop_audio_cond: bool = False,  # cfg for cond audio
+        drop_text: bool = False,  # cfg for text
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """Forward pass returning (mu, ln_sig) for gaussian output distribution.
+
+        This method is used for probabilistic training (gaussian NLL objective)
+        and RL training (GRPO).
+
+        Args:
+            x: Noised input audio [b n d]
+            cond: Masked conditioning audio [b n d]
+            text: Text tokens [b nt]
+            time: Time step [b] or scalar
+            mask: Optional attention mask [b n]
+            drop_audio_cond: Whether to drop audio conditioning (CFG)
+            drop_text: Whether to drop text conditioning (CFG)
+
+        Returns:
+            Tuple of (mu, ln_sig) where:
+                mu: Mean of the predicted distribution [b n mel_dim]
+                ln_sig: Log standard deviation [b n mel_dim]
+
+        Raises:
+            RuntimeError: If output_dist is not 'gaussian'.
+        """
+        if self.proj_out_ln_sig is None:
+            raise RuntimeError(
+                "forward_prob requires output_dist='gaussian'. "
+                "Initialize the model with output_dist='gaussian' to use this method."
+            )
+
+        batch = x.shape[0]
+        if time.ndim == 0:
+            time = time.repeat(batch)
+
+        # t: conditioning (time), c: context (text + masked cond audio), x: noised input audio
+        t = self.time_embed(time)
+        x, c = self.get_input_embed(
+            x, cond, text, drop_audio_cond=drop_audio_cond, drop_text=drop_text, cache=False
+        )
+
+        seq_len = x.shape[1]
+        text_len = text.shape[1]
+        rope_audio = self.rotary_embed.forward_from_seq_len(seq_len)
+        rope_text = self.rotary_embed.forward_from_seq_len(text_len)
+
+        for block in self.transformer_blocks:
+            c, x = block(x, c, t, mask=mask, rope=rope_audio, c_rope=rope_text)
+
+        x = self.norm_out(x, t)
+
+        # Output mean and log standard deviation
+        mu = self.proj_out(x)
+        ln_sig = self.proj_out_ln_sig(x)
+
+        return mu, ln_sig

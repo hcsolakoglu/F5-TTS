@@ -11,7 +11,7 @@ d - dimension
 from __future__ import annotations
 
 from random import random
-from typing import Callable
+from typing import Callable, Literal
 
 import torch
 import torch.nn.functional as F
@@ -48,6 +48,8 @@ class CFM(nn.Module):
         mel_spec_kwargs: dict = dict(),
         frac_lengths_mask: tuple[float, float] = (0.7, 1.0),
         vocab_char_map: dict[str:int] | None = None,
+        objective: Literal["mse", "gaussian_nll", "rl_grpo"] = "mse",
+        ln_sig_clamp: tuple[float, float] = (-10.0, 10.0),  # clamp range for log sigma
     ):
         super().__init__()
 
@@ -75,6 +77,10 @@ class CFM(nn.Module):
 
         # vocab map for tokenization
         self.vocab_char_map = vocab_char_map
+
+        # training objective
+        self.objective = objective
+        self.ln_sig_clamp = ln_sig_clamp
 
     @property
     def device(self):
@@ -235,6 +241,7 @@ class CFM(nn.Module):
         *,
         lens: int["b"] | None = None,
         noise_scheduler: str | None = None,
+        objective: str | None = None,  # override self.objective if provided
     ):
         # handle raw wave
         if inp.ndim == 2:
@@ -290,13 +297,284 @@ class CFM(nn.Module):
         else:
             drop_text = False
 
-        # apply mask will use more memory; might adjust batchsize or batchsampler long sequence threshold
-        pred = self.transformer(
-            x=φ, cond=cond, text=text, time=time, drop_audio_cond=drop_audio_cond, drop_text=drop_text, mask=mask
+        # select objective
+        obj = objective if objective is not None else self.objective
+
+        if obj == "mse":
+            # Standard MSE flow matching loss
+            pred = self.transformer(
+                x=φ, cond=cond, text=text, time=time, drop_audio_cond=drop_audio_cond, drop_text=drop_text, mask=mask
+            )
+            loss = F.mse_loss(pred, flow, reduction="none")
+            loss = loss[rand_span_mask]
+            return loss.mean(), cond, pred
+
+        elif obj == "gaussian_nll":
+            # Gaussian NLL loss for probabilistic training
+            return self._forward_gaussian_nll(
+                φ=φ,
+                cond=cond,
+                text=text,
+                time=time,
+                flow=flow,
+                rand_span_mask=rand_span_mask,
+                mask=mask,
+                drop_audio_cond=drop_audio_cond,
+                drop_text=drop_text,
+            )
+
+        elif obj == "rl_grpo":
+            # RL GRPO objective - this requires special handling via GRPOTrainer
+            raise ValueError(
+                "rl_grpo objective should not be used directly in forward(). "
+                "Use GRPOTrainer for RL training."
+            )
+
+        else:
+            raise ValueError(f"Unknown objective: {obj}. Must be 'mse', 'gaussian_nll', or 'rl_grpo'.")
+
+    def _forward_gaussian_nll(
+        self,
+        φ: torch.Tensor,
+        cond: torch.Tensor,
+        text: torch.Tensor,
+        time: torch.Tensor,
+        flow: torch.Tensor,
+        rand_span_mask: torch.Tensor,
+        mask: torch.Tensor,
+        drop_audio_cond: bool,
+        drop_text: bool,
+    ):
+        """Compute Gaussian NLL loss for probabilistic training.
+
+        The loss is computed as:
+            -log p(flow | φ, cond, text, time)
+            = 0.5 * (ln_sig + (flow - mu)^2 / exp(2 * ln_sig))
+
+        Plus a constant term that we drop.
+        """
+        # Check if transformer supports gaussian output
+        if not hasattr(self.transformer, "forward_prob"):
+            raise RuntimeError(
+                "Gaussian NLL objective requires a transformer with forward_prob method. "
+                "Initialize the transformer with output_dist='gaussian'."
+            )
+
+        # Get mu and log sigma from transformer
+        mu, ln_sig = self.transformer.forward_prob(
+            x=φ, cond=cond, text=text, time=time, mask=mask,
+            drop_audio_cond=drop_audio_cond, drop_text=drop_text,
         )
 
-        # flow matching loss
-        loss = F.mse_loss(pred, flow, reduction="none")
-        loss = loss[rand_span_mask]
+        # Clamp log sigma for numerical stability
+        ln_sig = torch.clamp(ln_sig, self.ln_sig_clamp[0], self.ln_sig_clamp[1])
 
-        return loss.mean(), cond, pred
+        # Compute Gaussian NLL
+        # -log N(flow; mu, sigma) = 0.5 * log(2π) + ln_sig + 0.5 * (flow - mu)^2 / sigma^2
+        # We drop the constant 0.5 * log(2π) term
+        var = torch.exp(2 * ln_sig)
+        nll = ln_sig + 0.5 * (flow - mu) ** 2 / (var + 1e-8)
+
+        # Apply mask
+        nll = nll[rand_span_mask]
+
+        # Check for NaN/Inf
+        if not torch.isfinite(nll).all():
+            raise ValueError(
+                f"NaN or Inf in Gaussian NLL loss. "
+                f"mu range: [{mu.min():.4f}, {mu.max():.4f}], "
+                f"ln_sig range: [{ln_sig.min():.4f}, {ln_sig.max():.4f}]"
+            )
+
+        return nll.mean(), cond, mu
+
+    def forward_rl(
+        self,
+        inp: float["b n d"] | float["b nw"],
+        text: int["b nt"] | list[str],
+        *,
+        lens: int["b"] | None = None,
+        return_logprob: bool = True,
+    ):
+        """Forward pass for RL training, returning samples and log probabilities.
+
+        This method is used by GRPOTrainer to generate samples and compute
+        log probabilities for the policy gradient update.
+
+        Args:
+            inp: Input mel spectrogram or raw waveform
+            text: Text tokens or strings
+            lens: Optional sequence lengths
+            return_logprob: Whether to return log probabilities
+
+        Returns:
+            Tuple of (samples, log_probs, cond, mask) where:
+                samples: Generated samples
+                log_probs: Log probabilities of the samples (if return_logprob)
+                cond: Conditioning signal
+                mask: The mask used for generation
+        """
+        # handle raw wave
+        if inp.ndim == 2:
+            inp = self.mel_spec(inp)
+            inp = inp.permute(0, 2, 1)
+            assert inp.shape[-1] == self.num_channels
+
+        batch, seq_len, device = *inp.shape[:2], self.device
+
+        # handle text as string
+        if isinstance(text, list):
+            if exists(self.vocab_char_map):
+                text = list_str_to_idx(text, self.vocab_char_map).to(device)
+            else:
+                text = list_str_to_tensor(text).to(device)
+            assert text.shape[0] == batch
+
+        # lens and mask
+        if not exists(lens):
+            lens = torch.full((batch,), seq_len, device=device)
+        mask = lens_to_mask(lens, length=seq_len)
+
+        # get a random span to mask out
+        frac_lengths = torch.zeros((batch,), device=self.device).float().uniform_(*self.frac_lengths_mask)
+        rand_span_mask = mask_from_frac_lengths(lens, frac_lengths)
+
+        if exists(mask):
+            rand_span_mask &= mask
+
+        # mel is x1 (target)
+        x1 = inp
+
+        # x0 is gaussian noise
+        x0 = torch.randn_like(x1)
+
+        # only predict what is within the random mask span for infilling
+        cond = torch.where(rand_span_mask[..., None], torch.zeros_like(x1), x1)
+
+        # Sample trajectory and compute log probabilities
+        samples, log_probs = self._sample_rl_trajectory(
+            x0=x0,
+            cond=cond,
+            text=text,
+            mask=mask,
+            rand_span_mask=rand_span_mask,
+            return_logprob=return_logprob,
+        )
+
+        return samples, log_probs, cond, rand_span_mask
+
+    def _sample_rl_trajectory(
+        self,
+        x0: torch.Tensor,
+        cond: torch.Tensor,
+        text: torch.Tensor,
+        mask: torch.Tensor,
+        rand_span_mask: torch.Tensor,
+        return_logprob: bool = True,
+        num_steps: int = 10,
+    ):
+        """Sample a trajectory for RL training with log probability computation.
+
+        Uses simple Euler integration with gaussian sampling at each step.
+        """
+        if not hasattr(self.transformer, "forward_prob"):
+            raise RuntimeError(
+                "RL training requires a transformer with forward_prob method. "
+                "Initialize the transformer with output_dist='gaussian'."
+            )
+
+        batch, seq_len = x0.shape[:2]
+        device = x0.device
+        dtype = x0.dtype
+
+        # Time steps for integration
+        dt = 1.0 / num_steps
+        t_steps = torch.linspace(0, 1 - dt, num_steps, device=device, dtype=dtype)
+
+        x = x0.clone()
+        total_log_prob = torch.zeros(batch, device=device, dtype=dtype) if return_logprob else None
+
+        for t_val in t_steps:
+            t = torch.full((batch,), t_val, device=device, dtype=dtype)
+
+            # Get mu and log sigma from transformer
+            mu, ln_sig = self.transformer.forward_prob(
+                x=x, cond=cond, text=text, time=t, mask=mask,
+                drop_audio_cond=False, drop_text=False,
+            )
+
+            # Clamp log sigma
+            ln_sig = torch.clamp(ln_sig, self.ln_sig_clamp[0], self.ln_sig_clamp[1])
+            sigma = torch.exp(ln_sig)
+
+            # Sample next step: x_next = x + dt * (mu + sigma * noise)
+            noise = torch.randn_like(x)
+            dx = mu + sigma * noise
+            x_next = x + dt * dx
+
+            # Compute log probability of this step
+            if return_logprob:
+                # log p(noise) = -0.5 * noise^2 - 0.5 * log(2π)
+                # We only compute the -0.5 * noise^2 part and sum over dims
+                log_prob_step = -0.5 * (noise ** 2).sum(dim=(1, 2))
+                total_log_prob = total_log_prob + log_prob_step
+
+            x = x_next
+
+        return x, total_log_prob
+
+    def compute_logprob(
+        self,
+        samples: torch.Tensor,
+        x0: torch.Tensor,
+        cond: torch.Tensor,
+        text: torch.Tensor,
+        mask: torch.Tensor,
+        num_steps: int = 10,
+    ):
+        """Compute log probability of given samples under the model.
+
+        Used for computing KL divergence in GRPO.
+        """
+        if not hasattr(self.transformer, "forward_prob"):
+            raise RuntimeError(
+                "compute_logprob requires a transformer with forward_prob method."
+            )
+
+        batch = samples.shape[0]
+        device = samples.device
+        dtype = samples.dtype
+
+        dt = 1.0 / num_steps
+        t_steps = torch.linspace(0, 1 - dt, num_steps, device=device, dtype=dtype)
+
+        # Reconstruct trajectory from x0 to samples
+        # This is approximate - we interpolate linearly
+        total_log_prob = torch.zeros(batch, device=device, dtype=dtype)
+
+        for i, t_val in enumerate(t_steps):
+            t = torch.full((batch,), t_val, device=device, dtype=dtype)
+
+            # Interpolate x at time t
+            alpha = t_val
+            x_t = (1 - alpha) * x0 + alpha * samples
+
+            # Get mu and log sigma from transformer
+            mu, ln_sig = self.transformer.forward_prob(
+                x=x_t, cond=cond, text=text, time=t, mask=mask,
+                drop_audio_cond=False, drop_text=False,
+            )
+
+            ln_sig = torch.clamp(ln_sig, self.ln_sig_clamp[0], self.ln_sig_clamp[1])
+            sigma = torch.exp(ln_sig)
+
+            # Compute target velocity
+            target_velocity = samples - x0
+
+            # Log probability under the gaussian
+            # log N(target_velocity; mu, sigma)
+            log_prob = -0.5 * ((target_velocity - mu) / (sigma + 1e-8)) ** 2 - ln_sig
+            log_prob = log_prob.sum(dim=(1, 2))
+            total_log_prob = total_log_prob + log_prob * dt
+
+        return total_log_prob

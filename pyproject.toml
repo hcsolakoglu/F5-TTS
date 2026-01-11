@@ -54,6 +54,18 @@ eval = [
     "zhconv",
     "zhon",
 ]
+rl = [
+    "jiwer",  # for WER computation
+]
+reward_funasr = [
+    "funasr",
+    "jiwer",
+    "zhconv",
+    "zhon",
+]
+reward_wespeaker = [
+    # WeSpeaker uses the ECAPA-TDNN model already in the repo
+]
 
 [project.urls]
 Homepage = "https://github.com/SWivid/F5-TTS"
