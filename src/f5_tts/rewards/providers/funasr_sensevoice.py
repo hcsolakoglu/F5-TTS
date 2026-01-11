@@ -23,6 +23,9 @@ class FunASRWerReward(RewardProvider):
     and target text, and converts it to a reward signal:
         reward = 1.0 - WER
 
+    Note: WER is clamped to [0, 1] range, so reward is always in [0, 1].
+    Very poor transcriptions with WER > 1 will result in reward = 0.
+
     Attributes:
         model_id: FunASR model ID or path.
         device: Device for inference.

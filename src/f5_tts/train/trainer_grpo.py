@@ -76,8 +76,8 @@ class GRPOTrainer:
         is_local_vocoder: bool = False,
         local_vocoder_path: str = "",
         # Other
-        accelerate_kwargs: dict = dict(),
-        ema_kwargs: dict = dict(),
+        accelerate_kwargs: dict | None = None,
+        ema_kwargs: dict | None = None,
     ):
         """Initialize the GRPO trainer.
 
@@ -109,6 +109,10 @@ class GRPOTrainer:
             ema_kwargs: Additional kwargs for EMA.
         """
         ddp_kwargs = DistributedDataParallelKwargs(find_unused_parameters=True)
+
+        # Handle None defaults for mutable arguments
+        accelerate_kwargs = accelerate_kwargs or {}
+        ema_kwargs = ema_kwargs or {}
 
         if logger == "wandb" and not wandb.api.api_key:
             logger = None

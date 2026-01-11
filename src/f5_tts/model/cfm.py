@@ -372,8 +372,9 @@ class CFM(nn.Module):
         # Compute Gaussian NLL
         # -log N(flow; mu, sigma) = 0.5 * log(2π) + ln_sig + 0.5 * (flow - mu)^2 / sigma^2
         # We drop the constant 0.5 * log(2π) term
-        var = torch.exp(2 * ln_sig)
-        nll = ln_sig + 0.5 * (flow - mu) ** 2 / (var + 1e-8)
+        # Using exp(-2 * ln_sig) instead of dividing by var for efficiency
+        inv_var = torch.exp(-2 * ln_sig)
+        nll = ln_sig + 0.5 * (flow - mu) ** 2 * inv_var
 
         # Apply mask
         nll = nll[rand_span_mask]

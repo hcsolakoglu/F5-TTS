@@ -1,6 +1,5 @@
 # Customed
 .vscode/
-tests/
 runs/
 data/
 ckpts/
