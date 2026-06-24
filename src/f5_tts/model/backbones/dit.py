@@ -83,21 +83,25 @@ class TextEmbedding(nn.Module):
 
         return upsampled_text
 
-    def forward(self, text: int["b nt"], seq_len, drop_text=False):
+    def forward(self, text: int["b nt"], seq_len, drop_text=False, valid_seq_lens=None):
         text = text + 1  # use 0 as filler token. preprocess of batch pad -1, see list_str_to_idx()
         valid_pos_mask = None
-        if torch.is_tensor(seq_len):
+        if valid_seq_lens is not None:
+            max_seq_len = int(seq_len)
+            valid_seq_lens = valid_seq_lens.to(device=text.device, dtype=torch.long)
+        elif torch.is_tensor(seq_len):
             seq_len = seq_len.to(device=text.device, dtype=torch.long)
             max_seq_len = int(seq_len.max().item())
+            valid_seq_lens = seq_len
         else:
             max_seq_len = int(seq_len)
 
         text = text[:, :max_seq_len]  # curtail if character tokens are more than the mel spec tokens
         text = F.pad(text, (0, max_seq_len - text.shape[1]), value=0)
 
-        if torch.is_tensor(seq_len):
+        if valid_seq_lens is not None:
             seq_pos = torch.arange(max_seq_len, device=text.device).unsqueeze(0)
-            valid_pos_mask = seq_pos < seq_len.unsqueeze(1)
+            valid_pos_mask = seq_pos < valid_seq_lens.unsqueeze(1)
             text = text.masked_fill(~valid_pos_mask, 0)
 
         if self.mask_padding:
@@ -129,8 +133,8 @@ class TextEmbedding(nn.Module):
                 text = self.text_blocks(text)
 
         if self.average_upsampling:
-            if torch.is_tensor(seq_len):
-                target_lens = seq_len.to(device=text.device, dtype=torch.long)
+            if valid_seq_lens is not None:
+                target_lens = valid_seq_lens.to(device=text.device, dtype=torch.long)
             else:
                 target_lens = torch.full((text.shape[0],), int(seq_len), device=text.device, dtype=torch.long)
 
@@ -281,6 +285,10 @@ class DiT(nn.Module):
 
         return ckpt_forward
 
+    def prepare_training_text(self, text: int["b nt"], seq_len: int):
+        text = text[:, :seq_len]
+        return F.pad(text, (0, seq_len - text.shape[1]), value=-1)
+
     def get_input_embed(
         self,
         x,  # b n d
@@ -294,9 +302,11 @@ class DiT(nn.Module):
         if self.text_uncond is None or self.text_cond is None or not cache:
             if audio_mask is None:
                 seq_len = x.shape[1]
+                valid_seq_lens = None
             else:
-                seq_len = audio_mask.sum(dim=1)  # per-sample valid speech length
-            text_embed = self.text_embed(text, seq_len=seq_len, drop_text=drop_text)
+                seq_len = x.shape[1]
+                valid_seq_lens = audio_mask.sum(dim=1)  # per-sample valid speech length
+            text_embed = self.text_embed(text, seq_len=seq_len, drop_text=drop_text, valid_seq_lens=valid_seq_lens)
             if cache:
                 if drop_text:
                     self.text_uncond = text_embed

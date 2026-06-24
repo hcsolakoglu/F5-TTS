@@ -66,6 +66,44 @@ def parse_args():
         help="Log inferenced samples per ckpt save updates",
     )
     parser.add_argument("--logger", type=str, default=None, choices=[None, "wandb", "tensorboard"], help="logger")
+    parser.add_argument("--metrics_enabled", action="store_true", help="Log optional training runtime metrics")
+    parser.add_argument("--metrics_log_every", type=int, default=100, help="Log runtime metrics every N updates")
+    parser.add_argument(
+        "--metrics_warmup_updates", type=int, default=1, help="Skip runtime metrics for the first N updates"
+    )
+    parser.add_argument(
+        "--metrics_no_cuda_sync",
+        action="store_true",
+        help="Do not synchronize CUDA around timed regions when runtime metrics are enabled",
+    )
+    parser.add_argument(
+        "--metrics_no_memory",
+        action="store_true",
+        help="Do not include CUDA memory metrics when runtime metrics are enabled",
+    )
+    parser.add_argument("--compile_enabled", action="store_true", help="Enable optional torch.compile training path")
+    parser.add_argument(
+        "--compile_target",
+        type=str,
+        default="cfm_loss_core",
+        choices=["cfm_loss_core", "model"],
+        help="Compile target (model is a compatibility alias for cfm_loss_core)",
+    )
+    parser.add_argument("--compile_backend", type=str, default="inductor", help="torch.compile backend")
+    parser.add_argument("--compile_mode", type=str, default=None, help="torch.compile mode, e.g. default or reduce-overhead")
+    parser.add_argument("--compile_fullgraph", action="store_true", help="Require fullgraph torch.compile")
+    parser.add_argument(
+        "--compile_dynamic",
+        type=str,
+        default="default",
+        choices=["default", "true", "false"],
+        help="torch.compile dynamic shape setting",
+    )
+    parser.add_argument(
+        "--compile_no_fallback",
+        action="store_true",
+        help="Raise torch.compile errors instead of falling back to eager",
+    )
     parser.add_argument(
         "--bnb_optimizer",
         action="store_true",
@@ -80,6 +118,7 @@ def parse_args():
 
 def main():
     args = parse_args()
+    compile_dynamic = None if args.compile_dynamic == "default" else args.compile_dynamic == "true"
 
     checkpoint_path = str(files("f5_tts").joinpath(f"../../ckpts/{args.dataset_name}"))
 
@@ -200,6 +239,18 @@ def main():
         log_samples=args.log_samples,
         last_per_updates=args.last_per_updates,
         bnb_optimizer=args.bnb_optimizer,
+        metrics_enabled=args.metrics_enabled,
+        metrics_log_every=args.metrics_log_every,
+        metrics_warmup_updates=args.metrics_warmup_updates,
+        metrics_sync_cuda=not args.metrics_no_cuda_sync,
+        metrics_include_memory=not args.metrics_no_memory,
+        compile_enabled=args.compile_enabled,
+        compile_target=args.compile_target,
+        compile_backend=args.compile_backend,
+        compile_mode=args.compile_mode,
+        compile_fullgraph=args.compile_fullgraph,
+        compile_dynamic=compile_dynamic,
+        compile_fallback_to_eager=not args.compile_no_fallback,
     )
 
     train_dataset = load_dataset(args.dataset_name, tokenizer, mel_spec_kwargs=mel_spec_kwargs)

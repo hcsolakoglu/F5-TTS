@@ -1,0 +1,64 @@
+{
+  "output_dir": "/content/f5tts_a100_small_bf16_results",
+  "cases": [
+    {
+      "name": "f5small_a100_bf16_eager",
+      "timeout_s": 900,
+      "args": [
+        "--dataset-root",
+        "/content/data/librispeech_asr_custom",
+        "--dataset-cwd",
+        "/content",
+        "--device",
+        "cuda",
+        "--warmup-steps",
+        "4",
+        "--steps",
+        "10",
+        "--batch-size",
+        "1",
+        "--num-workers",
+        "0",
+        "--seed",
+        "1234",
+        "--model-profile",
+        "f5tts-small",
+        "--precision",
+        "bf16",
+        "--pad-to-frames",
+        "1536"
+      ]
+    },
+    {
+      "name": "f5small_a100_bf16_compile_false",
+      "timeout_s": 1800,
+      "args": [
+        "--dataset-root",
+        "/content/data/librispeech_asr_custom",
+        "--dataset-cwd",
+        "/content",
+        "--device",
+        "cuda",
+        "--warmup-steps",
+        "4",
+        "--steps",
+        "10",
+        "--batch-size",
+        "1",
+        "--num-workers",
+        "0",
+        "--seed",
+        "1234",
+        "--model-profile",
+        "f5tts-small",
+        "--precision",
+        "bf16",
+        "--pad-to-frames",
+        "1536",
+        "--compile-enabled",
+        "--compile-dynamic",
+        "false"
+      ]
+    }
+  ]
+}

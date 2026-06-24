@@ -27,6 +27,8 @@ def main(model_cfg):
         f"{model_cfg.model.name}_{mel_spec_type}_{model_cfg.model.tokenizer}_{model_cfg.datasets.name}",
     )
     wandb_resume_id = model_cfg.ckpts.get("wandb_resume_id", None)
+    metrics_cfg = model_cfg.get("metrics", {})
+    compile_cfg = model_cfg.get("compile", {})
 
     # set text tokenizer
     if tokenizer != "custom":
@@ -67,6 +69,18 @@ def main(model_cfg):
         is_local_vocoder=model_cfg.model.vocoder.is_local,
         local_vocoder_path=model_cfg.model.vocoder.local_path,
         model_cfg_dict=OmegaConf.to_container(model_cfg, resolve=True),
+        metrics_enabled=metrics_cfg.get("enabled", False),
+        metrics_log_every=metrics_cfg.get("log_every", 100),
+        metrics_warmup_updates=metrics_cfg.get("warmup_updates", 1),
+        metrics_sync_cuda=metrics_cfg.get("sync_cuda", True),
+        metrics_include_memory=metrics_cfg.get("include_memory", True),
+        compile_enabled=compile_cfg.get("enabled", False),
+        compile_target=compile_cfg.get("target", "cfm_loss_core"),
+        compile_backend=compile_cfg.get("backend", "inductor"),
+        compile_mode=compile_cfg.get("mode", None),
+        compile_fullgraph=compile_cfg.get("fullgraph", False),
+        compile_dynamic=compile_cfg.get("dynamic", None),
+        compile_fallback_to_eager=compile_cfg.get("fallback_to_eager", True),
     )
 
     train_dataset = load_dataset(model_cfg.datasets.name, tokenizer, mel_spec_kwargs=model_cfg.model.mel_spec)

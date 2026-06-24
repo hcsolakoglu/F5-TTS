@@ -212,6 +212,10 @@ class UNetT(nn.Module):
     def text_uncond(self, value):
         self._get_cache_local().text_uncond = value
 
+    def prepare_training_text(self, text: int["b nt"], seq_len: int):
+        text = text[:, :seq_len]
+        return F.pad(text, (0, seq_len - text.shape[1]), value=-1)
+
     def get_input_embed(
         self,
         x,  # b n d

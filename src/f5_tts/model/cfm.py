@@ -75,10 +75,104 @@ class CFM(nn.Module):
 
         # vocab map for tokenization
         self.vocab_char_map = vocab_char_map
+        object.__setattr__(self, "_compiled_training_core", None)
+        object.__setattr__(self, "_training_compile_kwargs", None)
+        object.__setattr__(self, "_training_compile_fallback_to_eager", True)
+        object.__setattr__(self, "_training_compile_fallback_active", False)
+        object.__setattr__(self, "_training_compile_error", None)
 
     @property
     def device(self):
         return next(self.parameters()).device
+
+    @property
+    def training_compile_state(self):
+        return {
+            "enabled": self._compiled_training_core is not None,
+            "fallback_active": self._training_compile_fallback_active,
+            "error": self._training_compile_error,
+            "kwargs": self._training_compile_kwargs,
+        }
+
+    def compile_training_core(self, *, fallback_to_eager=True, **compile_kwargs):
+        compiled_core = torch.compile(self._forward_loss_core, **compile_kwargs)
+        object.__setattr__(self, "_compiled_training_core", compiled_core)
+        object.__setattr__(self, "_training_compile_kwargs", dict(compile_kwargs))
+        object.__setattr__(self, "_training_compile_fallback_to_eager", fallback_to_eager)
+        object.__setattr__(self, "_training_compile_fallback_active", False)
+        object.__setattr__(self, "_training_compile_error", None)
+        return compiled_core
+
+    def clear_training_compile(self):
+        object.__setattr__(self, "_compiled_training_core", None)
+        object.__setattr__(self, "_training_compile_kwargs", None)
+        object.__setattr__(self, "_training_compile_fallback_active", False)
+        object.__setattr__(self, "_training_compile_error", None)
+
+    def _run_training_core(self, *args):
+        compiled_core = self._compiled_training_core
+        if compiled_core is None:
+            return self._forward_loss_core(*args)
+
+        cpu_rng_state = None
+        cuda_rng_state = None
+        cuda_device = None
+        if self._training_compile_fallback_to_eager:
+            cpu_rng_state = torch.get_rng_state()
+            x1 = args[0]
+            if x1.is_cuda:
+                cuda_device = x1.device
+                cuda_rng_state = torch.cuda.get_rng_state(cuda_device)
+
+        try:
+            return compiled_core(*args)
+        except Exception as compile_error:
+            if not self._training_compile_fallback_to_eager:
+                raise
+
+            # Reuse the already-prepared stochastic inputs. Retrying CFM.forward()
+            # would draw a different mask, noise tensor, time, and CFG branch.
+            object.__setattr__(self, "_compiled_training_core", None)
+            object.__setattr__(self, "_training_compile_fallback_active", True)
+            object.__setattr__(self, "_training_compile_error", repr(compile_error))
+            torch.set_rng_state(cpu_rng_state)
+            if cuda_rng_state is not None:
+                torch.cuda.set_rng_state(cuda_rng_state, cuda_device)
+            try:
+                return self._forward_loss_core(*args)
+            except Exception as eager_error:
+                raise eager_error from compile_error
+
+    def _forward_loss_core(
+        self,
+        x1: torch.Tensor,
+        text: torch.Tensor,
+        mask: torch.Tensor,
+        rand_span_mask: torch.Tensor,
+        x0: torch.Tensor,
+        time: torch.Tensor,
+        drop_audio_cond: bool,
+        drop_text: bool,
+    ):
+        # sample xt (φ_t(x) in the paper)
+        t = time.unsqueeze(-1).unsqueeze(-1)
+        φ = (1 - t) * x0 + t * x1
+        flow = x1 - x0
+
+        # only predict what is within the random mask span for infilling
+        cond = torch.where(rand_span_mask[..., None], torch.zeros_like(x1), x1)
+
+        # apply mask will use more memory; might adjust batchsize or batchsampler long sequence threshold
+        pred = self.transformer(
+            x=φ, cond=cond, text=text, time=time, drop_audio_cond=drop_audio_cond, drop_text=drop_text, mask=mask
+        )
+
+        # flow matching loss
+        loss = F.mse_loss(pred, flow, reduction="none")
+        loss_mask = rand_span_mask[..., None].to(loss.dtype)
+        loss = (loss * loss_mask).sum() / (loss_mask.sum() * loss.shape[-1])
+
+        return loss, cond, pred
 
     @torch.no_grad()
     def sample(
@@ -252,6 +346,10 @@ class CFM(nn.Module):
                 text = list_str_to_tensor(text).to(device)
             assert text.shape[0] == batch
 
+        prepare_training_text = getattr(self.transformer, "prepare_training_text", None)
+        if prepare_training_text is not None:
+            text = prepare_training_text(text, seq_len)
+
         # lens and mask
         if not exists(lens):  # if lens not acquired by trainer from collate_fn
             lens = torch.full((batch,), seq_len, device=device)
@@ -259,7 +357,7 @@ class CFM(nn.Module):
 
         # get a random span to mask out for training conditionally
         frac_lengths = torch.zeros((batch,), device=self.device).float().uniform_(*self.frac_lengths_mask)
-        rand_span_mask = mask_from_frac_lengths(lens, frac_lengths)
+        rand_span_mask = mask_from_frac_lengths(lens, frac_lengths, length=seq_len)
 
         if exists(mask):
             rand_span_mask &= mask
@@ -274,14 +372,6 @@ class CFM(nn.Module):
         time = torch.rand((batch,), dtype=dtype, device=self.device)
         # TODO. noise_scheduler
 
-        # sample xt (φ_t(x) in the paper)
-        t = time.unsqueeze(-1).unsqueeze(-1)
-        φ = (1 - t) * x0 + t * x1
-        flow = x1 - x0
-
-        # only predict what is within the random mask span for infilling
-        cond = torch.where(rand_span_mask[..., None], torch.zeros_like(x1), x1)
-
         # transformer and cfg training with a drop rate
         drop_audio_cond = random() < self.audio_drop_prob  # p_drop in voicebox paper
         if random() < self.cond_drop_prob:  # p_uncond in voicebox paper
@@ -290,13 +380,13 @@ class CFM(nn.Module):
         else:
             drop_text = False
 
-        # apply mask will use more memory; might adjust batchsize or batchsampler long sequence threshold
-        pred = self.transformer(
-            x=φ, cond=cond, text=text, time=time, drop_audio_cond=drop_audio_cond, drop_text=drop_text, mask=mask
+        return self._run_training_core(
+            x1,
+            text,
+            mask,
+            rand_span_mask,
+            x0,
+            time,
+            drop_audio_cond,
+            drop_text,
         )
-
-        # flow matching loss
-        loss = F.mse_loss(pred, flow, reduction="none")
-        loss = loss[rand_span_mask]
-
-        return loss.mean(), cond, pred

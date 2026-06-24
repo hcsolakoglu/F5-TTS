@@ -56,3 +56,19 @@ ckpts:
   keep_last_n_checkpoints: -1  # -1 to keep all, 0 to not save intermediate, > 0 to keep last N checkpoints
   last_per_updates: 5000  # save last checkpoint per updates
   save_dir: ckpts/${model.name}_${model.mel_spec.mel_spec_type}_${model.tokenizer}_${datasets.name}
+
+metrics:
+  enabled: False  # optional low-overhead runtime metrics; disabled by default
+  log_every: 100  # log metrics every N optimizer updates
+  warmup_updates: 1  # skip initial updates when reporting runtime metrics
+  sync_cuda: True  # synchronize CUDA around timed regions for accurate timings
+  include_memory: True  # include CUDA memory metrics when available
+
+compile:
+  enabled: False  # optional torch.compile path; disabled by default
+  target: cfm_loss_core  # deterministic CFM loss core; stochastic preparation stays eager
+  backend: inductor
+  mode: null  # e.g. default, reduce-overhead, max-autotune
+  fullgraph: False
+  dynamic: null  # experiment knob; compare null/True/False instead of assuming dynamic=True is fastest
+  fallback_to_eager: True  # fall back to eager if compile setup/runtime fails
