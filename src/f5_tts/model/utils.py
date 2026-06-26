@@ -58,15 +58,17 @@ def lens_to_mask(t: int["b"], length: int | None = None) -> bool["b n"]:
     return seq[None, :] < t[:, None]
 
 
-def mask_from_start_end_indices(seq_len: int["b"], start: int["b"], end: int["b"]):
-    max_seq_len = seq_len.max().item()
-    seq = torch.arange(max_seq_len, device=start.device).long()
+def mask_from_start_end_indices(seq_len: int["b"], start: int["b"], end: int["b"], length: int | None = None):
+    # Optional explicit length avoids a seq_len.max().item() CPU-GPU sync (graph break under torch.compile).
+    if not exists(length):
+        length = seq_len.max().item()
+    seq = torch.arange(length, device=start.device).long()
     start_mask = seq[None, :] >= start[:, None]
     end_mask = seq[None, :] < end[:, None]
     return start_mask & end_mask
 
 
-def mask_from_frac_lengths(seq_len: int["b"], frac_lengths: float["b"]):
+def mask_from_frac_lengths(seq_len: int["b"], frac_lengths: float["b"], length: int | None = None):
     lengths = (frac_lengths * seq_len).long()
     max_start = seq_len - lengths
 
@@ -74,7 +76,7 @@ def mask_from_frac_lengths(seq_len: int["b"], frac_lengths: float["b"]):
     start = (max_start * rand).long().clamp(min=0)
     end = start + lengths
 
-    return mask_from_start_end_indices(seq_len, start, end)
+    return mask_from_start_end_indices(seq_len, start, end, length=length)
 
 
 def maybe_masked_mean(t: float["b n d"], mask: bool["b n"] = None) -> float["b d"]:

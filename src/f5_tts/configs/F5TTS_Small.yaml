@@ -55,3 +55,11 @@ ckpts:
   keep_last_n_checkpoints: -1  # -1 to keep all, 0 to not save intermediate, > 0 to keep last N checkpoints
   last_per_updates: 5000  # save last checkpoint per updates
   save_dir: ckpts/${model.name}_${model.mel_spec.mel_spec_type}_${model.tokenizer}_${datasets.name}
+
+compile:
+  enabled: False  # optional torch.compile path; disabled by default
+  backend: inductor  # requires triton on CUDA
+  mode: null  # e.g. default, reduce-overhead, max-autotune (reduce-overhead/max-autotune need fixed shapes)
+  fullgraph: False
+  dynamic: null  # variable lengths may recompile; compare null/True/False or fixed shapes
+  fallback_to_eager: True  # fall back to eager if compile setup fails (runtime fallback disabled in DDP)

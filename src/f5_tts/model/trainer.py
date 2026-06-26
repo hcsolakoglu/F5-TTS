@@ -3,6 +3,7 @@ from __future__ import annotations
 import gc
 import math
 import os
+from typing import Any, cast
 
 import torch
 import torchaudio
@@ -53,6 +54,12 @@ class Trainer:
         is_local_vocoder: bool = False,  # use local path vocoder
         local_vocoder_path: str = "",  # local vocoder path
         model_cfg_dict: dict = dict(),  # training config
+        compile_enabled: bool = False,
+        compile_backend: str | None = "inductor",
+        compile_mode: str | None = None,
+        compile_fullgraph: bool = False,
+        compile_dynamic: bool | None = None,
+        compile_fallback_to_eager: bool = True,
     ):
         ddp_kwargs = DistributedDataParallelKwargs(find_unused_parameters=True)
 
@@ -117,7 +124,7 @@ class Trainer:
         self.num_warmup_updates = num_warmup_updates
         self.save_per_updates = save_per_updates
         self.keep_last_n_checkpoints = keep_last_n_checkpoints
-        self.last_per_updates = default(last_per_updates, save_per_updates)
+        self.last_per_updates = int(cast(Any, default(last_per_updates, save_per_updates)))
         self.checkpoint_path = default(checkpoint_path, "ckpts/test_f5-tts")
 
         self.batch_size_per_gpu = batch_size_per_gpu
@@ -135,17 +142,147 @@ class Trainer:
 
         self.duration_predictor = duration_predictor
 
+        # torch.compile configuration (optional, default-off)
+        self.compile_enabled = compile_enabled
+        self.compile_backend = compile_backend
+        self.compile_mode = compile_mode
+        self.compile_fullgraph = compile_fullgraph
+        self.compile_dynamic = compile_dynamic
+        self.compile_fallback_to_eager = compile_fallback_to_eager
+        self.compile_active = False
+        self.compile_fallback_active = False
+        self._unwrapped_model = None  # cached after accelerator.prepare
+
         if bnb_optimizer:
             import bitsandbytes as bnb
 
             self.optimizer = bnb.optim.AdamW8bit(model.parameters(), lr=learning_rate)
         else:
-            self.optimizer = AdamW(model.parameters(), lr=learning_rate, fused=True)
+            # fused AdamW requires CUDA; fall back to the standard kernel on CPU/other devices
+            # so CPU/ MPS training does not raise a device assert.
+            self.optimizer = AdamW(model.parameters(), lr=learning_rate, fused=torch.cuda.is_available())
         self.model, self.optimizer = self.accelerator.prepare(self.model, self.optimizer)
+        self._unwrapped_model = self.accelerator.unwrap_model(self.model)
+        self._configure_compile()
 
     @property
     def is_main(self):
         return self.accelerator.is_main_process
+
+    # ---- torch.compile support (optional, default-off) ----
+
+    def _configure_compile(self):
+        """Set up torch.compile on the CFM loss core if enabled.
+
+        Compilation is lazy (triggered by the first real training batch); there is no
+        synthetic preflight, which avoids shape/vocab mismatches with arbitrary models.
+        In DDP (num_processes > 1) runtime fallback is disabled: a per-rank eager fallback
+        would desynchronise the gradient all-reduce. Setup-time fallback is still allowed
+        and synchronised across ranks via ``_sync_compile_setup_ddp``.
+        """
+        if not self.compile_enabled:
+            return
+
+        if not hasattr(torch, "compile"):
+            if self.compile_fallback_to_eager:
+                if self.is_main:
+                    print("torch.compile is unavailable; falling back to eager training.")
+                self.compile_fallback_active = True
+                self._sync_compile_setup_ddp()
+                return
+            raise RuntimeError("torch.compile is unavailable in this PyTorch build")
+
+        compile_kwargs = {
+            "backend": self.compile_backend,
+            "mode": self.compile_mode,
+            "fullgraph": self.compile_fullgraph,
+            "dynamic": self.compile_dynamic,
+        }
+        compile_kwargs = {k: v for k, v in compile_kwargs.items() if v is not None}
+
+        # Under DDP, disable runtime fallback so a compile failure raises on all ranks
+        # (collective-safe) instead of one rank silently going eager.
+        runtime_fallback = self.compile_fallback_to_eager and self.accelerator.num_processes <= 1
+
+        try:
+            compile_fn = getattr(self._unwrapped_model, "compile_training_core", None)
+            if compile_fn is None:
+                raise TypeError("The training model does not expose compile_training_core()")
+            compile_fn(runtime_fallback=runtime_fallback, **compile_kwargs)
+            self.compile_active = True
+        except Exception as exc:
+            if not self.compile_fallback_to_eager:
+                raise
+            if self.is_main:
+                print(f"torch.compile setup failed; falling back to eager training. Error: {exc}")
+            clear_fn = getattr(self._unwrapped_model, "clear_training_compile", None)
+            if clear_fn is not None:
+                clear_fn()
+            self.compile_active = False
+            self.compile_fallback_active = True
+
+        # Synchronise setup-time fallback across DDP ranks (single all_reduce, all ranks).
+        self._sync_compile_setup_ddp()
+
+        if self.compile_active and self.is_main:
+            print(
+                f"torch.compile enabled (target=cfm_loss_core, backend={self.compile_backend}, "
+                f"mode={self.compile_mode}, fullgraph={self.compile_fullgraph}, dynamic={self.compile_dynamic})"
+            )
+            if self.accelerator.num_processes > 1 and self.compile_fallback_to_eager:
+                print("DDP detected: runtime compile fallback disabled (errors will raise on all ranks).")
+
+    def _sync_compile_setup_ddp(self):
+        """Synchronise setup-time compile fallback across DDP ranks.
+
+        If any rank failed to compile, all ranks switch to eager so the gradient all-reduce
+        stays consistent. Uses a single all_reduce(MAX) collective in which every rank
+        participates; no rank-only collective that would hang the others.
+        """
+        if self.accelerator.num_processes <= 1:
+            return
+        flag = torch.tensor(1.0 if self.compile_fallback_active else 0.0, device=self.accelerator.device)
+        torch.distributed.all_reduce(flag, op=torch.distributed.ReduceOp.MAX)
+        if float(flag) > 0.0 and self.compile_active:
+            if self.is_main:
+                print("torch.compile setup failed on at least one rank; switching all ranks to eager.")
+            clear_fn = getattr(self._unwrapped_model, "clear_training_compile", None)
+            if clear_fn is not None:
+                clear_fn()
+            self.compile_active = False
+            self.compile_fallback_active = True
+
+    def _check_compile_runtime_fallback(self):
+        """Detect a runtime compile failure surfaced by the CFM module and update trainer state."""
+        if not self.compile_active:
+            return
+        state = getattr(self._unwrapped_model, "training_compile_state", None)
+        if state is not None and state["fallback_active"]:
+            if self.is_main:
+                print(f"torch.compile runtime failed; continuing eagerly. Error: {state['error']}")
+            self.compile_active = False
+            self.compile_fallback_active = True
+
+    def _global_loss_denom(self, local_loss_denom: torch.Tensor) -> torch.Tensor:
+        """Sum the masked-frame denominator across all ranks for the active update."""
+        if hasattr(self.accelerator, "device"):
+            local_loss_denom = local_loss_denom.to(device=self.accelerator.device)
+        local_loss_denom = local_loss_denom.detach().to(dtype=torch.float32)
+        global_loss_denom = cast(torch.Tensor, self.accelerator.reduce(local_loss_denom, reduction="sum"))
+        return global_loss_denom.clamp(min=1.0)
+
+    def _scale_gradients_by_loss_denom(self, global_loss_denom: torch.Tensor):
+        """Convert accumulated loss-sum gradients into global masked-mean gradients.
+
+        ``Accelerator.backward`` divides by ``gradient_accumulation_steps`` and DDP
+        averages gradients across ranks. We backpropagate raw ``loss_sum`` values, then
+        multiply the synced gradient buffer by ``G * world_size / global_denom`` so the
+        effective gradient is ``grad(sum(loss_sum) / sum(denom))``.
+        """
+        scale = (self.grad_accumulation_steps * self.accelerator.num_processes) / global_loss_denom
+        for parameter in self.model.parameters():
+            if parameter.grad is not None:
+                parameter.grad.mul_(scale.to(device=parameter.grad.device, dtype=parameter.grad.dtype))
 
     def save_checkpoint(self, update, last=False):
         self.accelerator.wait_for_everyone()
@@ -182,7 +319,7 @@ class Trainer:
                         os.remove(os.path.join(self.checkpoint_path, oldest_checkpoint))
                         print(f"Removed old checkpoint: {oldest_checkpoint}")
 
-    def load_checkpoint(self):
+    def load_checkpoint(self) -> int:
         if (
             not exists(self.checkpoint_path)
             or not os.path.exists(self.checkpoint_path)
@@ -260,7 +397,7 @@ class Trainer:
 
         del checkpoint
         gc.collect()
-        return update
+        return int(cast(Any, update))
 
     def train(self, train_dataset: Dataset, num_workers=16, resumable_with_seed: int = None):
         if self.log_samples:
@@ -279,13 +416,15 @@ class Trainer:
         else:
             generator = None
 
+        persistent_workers = num_workers > 0
+
         if self.batch_size_type == "sample":
             train_dataloader = DataLoader(
                 train_dataset,
                 collate_fn=collate_fn,
                 num_workers=num_workers,
                 pin_memory=True,
-                persistent_workers=True,
+                persistent_workers=persistent_workers,
                 batch_size=self.batch_size_per_gpu,
                 shuffle=True,
                 generator=generator,
@@ -305,7 +444,7 @@ class Trainer:
                 collate_fn=collate_fn,
                 num_workers=num_workers,
                 pin_memory=True,
-                persistent_workers=True,
+                persistent_workers=persistent_workers,
                 batch_sampler=batch_sampler,
             )
         else:
@@ -327,7 +466,7 @@ class Trainer:
         train_dataloader, self.scheduler = self.accelerator.prepare(
             train_dataloader, self.scheduler
         )  # actual multi_gpu updates = single_gpu updates / gpu nums
-        start_update = self.load_checkpoint()
+        start_update = int(self.load_checkpoint())
         global_update = start_update
 
         if exists(resumable_with_seed):
@@ -338,6 +477,8 @@ class Trainer:
             skipped_dataloader = self.accelerator.skip_first_batches(train_dataloader, num_batches=skipped_batch)
         else:
             skipped_epoch = 0
+
+        loss_denom_accum = None
 
         for epoch in range(skipped_epoch, self.epochs):
             self.model.train()
@@ -361,6 +502,7 @@ class Trainer:
             )
 
             for batch in current_dataloader:
+                duration_loss = None
                 with self.accelerator.accumulate(self.model):
                     text_inputs = batch["text"]
                     mel_spec = batch["mel"].permute(0, 2, 1)
@@ -368,13 +510,25 @@ class Trainer:
 
                     # TODO. add duration predictor training
                     if self.duration_predictor is not None and self.accelerator.is_local_main_process:
-                        dur_loss = self.duration_predictor(mel_spec, lens=batch.get("durations"))
-                        self.accelerator.log({"duration loss": dur_loss.item()}, step=global_update)
+                        duration_loss = self.duration_predictor(mel_spec, lens=batch.get("durations")).detach()
 
-                    loss, cond, pred = self.model(
-                        mel_spec, text=text_inputs, lens=mel_lengths, noise_scheduler=self.noise_scheduler
+                    loss, loss_sum, loss_denom, cond, pred = self.model(
+                        mel_spec,
+                        text=text_inputs,
+                        lens=mel_lengths,
+                        noise_scheduler=self.noise_scheduler,
+                        return_loss_components=True,
                     )
-                    self.accelerator.backward(loss)
+                    loss_denom = loss_denom.detach().to(dtype=torch.float32)
+                    loss_denom_accum = loss_denom if loss_denom_accum is None else loss_denom_accum + loss_denom
+                    self._check_compile_runtime_fallback()
+                    self.accelerator.backward(loss_sum)
+
+                    if self.accelerator.sync_gradients:
+                        assert loss_denom_accum is not None
+                        global_loss_denom = self._global_loss_denom(loss_denom_accum)
+                        self._scale_gradients_by_loss_denom(global_loss_denom)
+                        loss_denom_accum = None
 
                     if self.max_grad_norm > 0 and self.accelerator.sync_gradients:
                         self.accelerator.clip_grad_norm_(self.model.parameters(), self.max_grad_norm)
@@ -383,20 +537,36 @@ class Trainer:
                     self.scheduler.step()
                     self.optimizer.zero_grad()
 
+                # Materialise the scalar loss at most once per step for all progress/logging
+                # consumers. Each loss.item() forces a CUDA sync; reuse one value and compute
+                # it lazily so non-logging ranks never sync just for display.
+                loss_scalar = None
+                duration_loss_scalar = None
+
                 if self.accelerator.sync_gradients:
                     if self.is_main:
                         self.ema_model.update()
 
                     global_update += 1
                     progress_bar.update(1)
-                    progress_bar.set_postfix(update=str(global_update), loss=loss.item())
+                    if self.accelerator.is_local_main_process:
+                        if loss_scalar is None:
+                            loss_scalar = loss.item()
+                        progress_bar.set_postfix(update=str(global_update), loss=loss_scalar)
 
                 if self.accelerator.is_local_main_process:
-                    self.accelerator.log(
-                        {"loss": loss.item(), "lr": self.scheduler.get_last_lr()[0]}, step=global_update
-                    )
+                    if loss_scalar is None:
+                        loss_scalar = loss.item()
+                    metrics = {"loss": loss_scalar, "lr": self.scheduler.get_last_lr()[0]}
+                    if duration_loss is not None:
+                        duration_loss_scalar = duration_loss.item()
+                        metrics["duration loss"] = duration_loss_scalar
+                    self.accelerator.log(metrics, step=int(global_update))
                 if self.logger == "tensorboard" and self.accelerator.is_main_process:
-                    self.writer.add_scalar("loss", loss.item(), global_update)
+                    if loss_scalar is None:
+                        loss_scalar = loss.item()
+                    assert self.writer is not None
+                    self.writer.add_scalar("loss", loss_scalar, global_update)
                     self.writer.add_scalar("lr", self.scheduler.get_last_lr()[0], global_update)
 
                 if global_update % self.last_per_updates == 0 and self.accelerator.sync_gradients:

@@ -31,6 +31,14 @@ from f5_tts.model.utils import (
 )
 
 
+def _is_cuda_oom(exc: BaseException) -> bool:
+    """Return True for CUDA out-of-memory errors, typed or message-based."""
+    oom_type = getattr(torch.cuda, "OutOfMemoryError", None)
+    if oom_type is not None and isinstance(exc, oom_type):
+        return True
+    return isinstance(exc, RuntimeError) and "out of memory" in str(exc).lower()
+
+
 class CFM(nn.Module):
     def __init__(
         self,
@@ -76,9 +84,198 @@ class CFM(nn.Module):
         # vocab map for tokenization
         self.vocab_char_map = vocab_char_map
 
+        # torch.compile state for the deterministic CFM loss core (optional, default-off).
+        # object.__setattr__ bypasses nn.Module.__setattr__ so these are never registered as
+        # parameters/buffers; state_dict is unchanged and EMA deepcopy (which runs before any
+        # compile call) never sees a compiled callable.
+        object.__setattr__(self, "_compiled_loss_core", None)
+        object.__setattr__(self, "_compile_runtime_fallback", True)
+        object.__setattr__(self, "_compile_fallback_active", False)
+        object.__setattr__(self, "_compile_error", None)
+
     @property
     def device(self):
         return next(self.parameters()).device
+
+    @property
+    def training_compile_state(self):
+        return {
+            "enabled": self._compiled_loss_core is not None,
+            "fallback_active": self._compile_fallback_active,
+            "error": self._compile_error,
+        }
+
+    def compile_training_core(self, *, runtime_fallback: bool = True, **compile_kwargs):
+        """Compile the deterministic CFM loss core for an optional training speedup.
+
+        Only the deterministic core (xt interpolation, transformer forward, masked MSE) is
+        compiled; the stochastic preparation (mel extraction, span masking, noise/time
+        sampling, CFG dropout) stays eager in ``forward`` so RNG state is unaffected.
+
+        ``runtime_fallback`` (default True) lets a *forward* compile failure permanently
+        switch this module to eager. Set it False under DDP so a failure raises on every
+        rank instead of desynchronising the gradient all-reduce. Note: this fallback covers
+        forward failures only; a compile failure during backward is not caught and will
+        raise; disable compile (``fallback_to_eager=False``) to surface such errors.
+        """
+        self._check_compile_compatible_transformer()
+        compiled = torch.compile(self._forward_loss_core_components, **compile_kwargs)
+        object.__setattr__(self, "_compiled_loss_core", compiled)
+        object.__setattr__(self, "_compile_runtime_fallback", bool(runtime_fallback))
+        object.__setattr__(self, "_compile_fallback_active", False)
+        object.__setattr__(self, "_compile_error", None)
+        return compiled
+
+    def clear_training_compile(self):
+        """Remove the compiled loss core, reverting to eager execution."""
+        object.__setattr__(self, "_compiled_loss_core", None)
+        object.__setattr__(self, "_compile_runtime_fallback", True)
+        object.__setattr__(self, "_compile_fallback_active", False)
+        object.__setattr__(self, "_compile_error", None)
+
+    def _check_compile_compatible_transformer(self):
+        """Reject transformer paths known to graph-break inside compiled training.
+
+        DiT's ``text_embedding_average_upsampling=True`` calls
+        ``average_upsample_text_by_mask`` from the compiled loss core. That path
+        contains a per-sample Python loop plus ``Tensor.item()`` calls, which graph-break
+        under torch.compile and hard-fail with ``fullgraph=True``. Failing at setup gives
+        Trainer a clean eager fallback path instead of a late Dynamo error.
+        """
+        text_embed = getattr(self.transformer, "text_embed", None)
+        if text_embed is not None and getattr(text_embed, "average_upsampling", False):
+            raise ValueError(
+                "torch.compile training is incompatible with "
+                "DiT text_embedding_average_upsampling=True: the per-sample "
+                "average_upsample_text_by_mask loop uses Tensor.item() and breaks "
+                "the compiled graph. Disable compile (fallback_to_eager=True) or set "
+                "text_embedding_average_upsampling=False to enable compiled training."
+            )
+
+    def _run_loss_core_components(self, *args):
+        """Run the deterministic loss core via the compiled callable, with eager fallback.
+
+        No RNG save/restore: the stochastic inputs (x0, time, rand_span_mask, drop_*) are
+        already materialised in ``args`` before this call, so an eager retry reuses them
+        exactly. The only RNG inside the compiled region is nn.Dropout in the transformer;
+        torch.get_rng_state does not round-trip the Philox offset used by compiled code, so
+        restoring it would give a false guarantee. A fresh dropout draw on fallback is valid.
+        """
+        compiled = self._compiled_loss_core
+        if compiled is None:
+            return self._forward_loss_core_components(*args)
+        try:
+            return compiled(*args)
+        except Exception as exc:
+            # A compiled CUDA OOM is a capacity failure, not a compiler failure.
+            # Retrying eagerly usually repeats the same allocation pressure and can hide
+            # the real problem behind a fallback state, so preserve the OOM as cause.
+            if _is_cuda_oom(exc):
+                raise RuntimeError(
+                    "torch.compile CFM loss core ran out of GPU memory; not falling "
+                    "back to eager (reduce batch size / sequence length)."
+                ) from exc
+            if not self._compile_runtime_fallback:
+                raise
+            # Permanently disable compile for the rest of this run.
+            object.__setattr__(self, "_compiled_loss_core", None)
+            object.__setattr__(self, "_compile_fallback_active", True)
+            object.__setattr__(self, "_compile_error", repr(exc))
+            return self._forward_loss_core_components(*args)
+
+    def _run_loss_core(self, *args):
+        """Run the loss core and preserve the public training return shape."""
+        loss, _, _, cond, pred = self._run_loss_core_components(*args)
+        return loss, cond, pred
+
+    def _prepare_training_inputs(self, inp, text, lens):
+        """Stochastic preparation shared by ``forward`` (stays eager; not compiled)."""
+        # handle raw wave
+        if inp.ndim == 2:
+            inp = self.mel_spec(inp)
+            inp = inp.permute(0, 2, 1)
+            assert inp.shape[-1] == self.num_channels
+
+        batch, seq_len, dtype, device = *inp.shape[:2], inp.dtype, self.device
+
+        # handle text as string
+        if isinstance(text, list):
+            if exists(self.vocab_char_map):
+                text = list_str_to_idx(text, self.vocab_char_map).to(device)
+            else:
+                text = list_str_to_tensor(text).to(device)
+            assert text.shape[0] == batch
+
+        # lens and mask: long dtype for mask index arithmetic
+        if not exists(lens):  # if lens not acquired by trainer from collate_fn
+            lens = torch.full((batch,), seq_len, device=device, dtype=torch.long)
+        else:
+            lens = lens.to(device=device, dtype=torch.long)
+        mask = lens_to_mask(lens, length=seq_len)
+
+        # get a random span to mask out for training conditionally
+        frac_lengths = torch.zeros((batch,), device=self.device).float().uniform_(*self.frac_lengths_mask)
+        rand_span_mask = mask_from_frac_lengths(lens, frac_lengths, length=seq_len)
+
+        if exists(mask):
+            rand_span_mask &= mask
+
+        # mel is x1; x0 is gaussian noise; time step
+        x1 = inp
+        x0 = torch.randn_like(x1)
+        time = torch.rand((batch,), dtype=dtype, device=self.device)
+        # TODO. noise_scheduler
+
+        # transformer and cfg training with a drop rate
+        drop_audio_cond = random() < self.audio_drop_prob  # p_drop in voicebox paper
+        if random() < self.cond_drop_prob:  # p_uncond in voicebox paper
+            drop_audio_cond = True
+            drop_text = True
+        else:
+            drop_text = False
+
+        return x1, text, mask, rand_span_mask, x0, time, drop_audio_cond, drop_text
+
+    def _forward_loss_core_components(
+        self,
+        x1: torch.Tensor,
+        text: torch.Tensor,
+        mask: torch.Tensor,
+        rand_span_mask: torch.Tensor,
+        x0: torch.Tensor,
+        time: torch.Tensor,
+        drop_audio_cond: bool,
+        drop_text: bool,
+    ):
+        # Deterministic loss core: sample xt (φ_t(x) in the paper)
+        t = time.unsqueeze(-1).unsqueeze(-1)
+        φ = (1 - t) * x0 + t * x1
+        flow = x1 - x0
+
+        # only predict what is within the random mask span for infilling
+        cond = torch.where(rand_span_mask[..., None], torch.zeros_like(x1), x1)
+
+        # apply mask will use more memory; might adjust batchsize or batchsampler long sequence threshold
+        pred = self.transformer(
+            x=φ, cond=cond, text=text, time=time, drop_audio_cond=drop_audio_cond, drop_text=drop_text, mask=mask
+        )
+
+        # flow matching loss: masked mean over valid span tokens and feature dim.
+        # Boolean indexing (loss[rand_span_mask]) causes a graph break under torch.compile;
+        # the elementwise multiply form is numerically equivalent and compile-friendly.
+        # denom.clamp(min=1.0) keeps the loss finite when no token is selected.
+        loss = F.mse_loss(pred, flow, reduction="none")
+        loss_mask = rand_span_mask[..., None].to(loss.dtype)
+        loss_sum = (loss * loss_mask).sum()
+        denom = (loss_mask.sum() * loss.shape[-1]).clamp(min=1.0)
+        loss = loss_sum / denom
+
+        return loss, loss_sum, denom, cond, pred
+
+    def _forward_loss_core(self, *args):
+        """Return the historical mean-loss tuple for callers outside the trainer."""
+        loss, _, _, cond, pred = self._forward_loss_core_components(*args)
+        return loss, cond, pred
 
     @torch.no_grad()
     def sample(
@@ -235,68 +432,13 @@ class CFM(nn.Module):
         *,
         lens: int["b"] | None = None,
         noise_scheduler: str | None = None,
+        return_loss_components: bool = False,
     ):
-        # handle raw wave
-        if inp.ndim == 2:
-            inp = self.mel_spec(inp)
-            inp = inp.permute(0, 2, 1)
-            assert inp.shape[-1] == self.num_channels
-
-        batch, seq_len, dtype, device, _σ1 = *inp.shape[:2], inp.dtype, self.device, self.sigma
-
-        # handle text as string
-        if isinstance(text, list):
-            if exists(self.vocab_char_map):
-                text = list_str_to_idx(text, self.vocab_char_map).to(device)
-            else:
-                text = list_str_to_tensor(text).to(device)
-            assert text.shape[0] == batch
-
-        # lens and mask
-        if not exists(lens):  # if lens not acquired by trainer from collate_fn
-            lens = torch.full((batch,), seq_len, device=device)
-        mask = lens_to_mask(lens, length=seq_len)
-
-        # get a random span to mask out for training conditionally
-        frac_lengths = torch.zeros((batch,), device=self.device).float().uniform_(*self.frac_lengths_mask)
-        rand_span_mask = mask_from_frac_lengths(lens, frac_lengths)
-
-        if exists(mask):
-            rand_span_mask &= mask
-
-        # mel is x1
-        x1 = inp
-
-        # x0 is gaussian noise
-        x0 = torch.randn_like(x1)
-
-        # time step
-        time = torch.rand((batch,), dtype=dtype, device=self.device)
-        # TODO. noise_scheduler
-
-        # sample xt (φ_t(x) in the paper)
-        t = time.unsqueeze(-1).unsqueeze(-1)
-        φ = (1 - t) * x0 + t * x1
-        flow = x1 - x0
-
-        # only predict what is within the random mask span for infilling
-        cond = torch.where(rand_span_mask[..., None], torch.zeros_like(x1), x1)
-
-        # transformer and cfg training with a drop rate
-        drop_audio_cond = random() < self.audio_drop_prob  # p_drop in voicebox paper
-        if random() < self.cond_drop_prob:  # p_uncond in voicebox paper
-            drop_audio_cond = True
-            drop_text = True
-        else:
-            drop_text = False
-
-        # apply mask will use more memory; might adjust batchsize or batchsampler long sequence threshold
-        pred = self.transformer(
-            x=φ, cond=cond, text=text, time=time, drop_audio_cond=drop_audio_cond, drop_text=drop_text, mask=mask
+        # Stochastic preparation stays eager; deterministic loss core may be compiled.
+        x1, text, mask, rand_span_mask, x0, time, drop_audio_cond, drop_text = self._prepare_training_inputs(
+            inp, text, lens
         )
-
-        # flow matching loss
-        loss = F.mse_loss(pred, flow, reduction="none")
-        loss = loss[rand_span_mask]
-
-        return loss.mean(), cond, pred
+        if return_loss_components:
+            return self._run_loss_core_components(x1, text, mask, rand_span_mask, x0, time, drop_audio_cond, drop_text)
+        loss, cond, pred = self._run_loss_core(x1, text, mask, rand_span_mask, x0, time, drop_audio_cond, drop_text)
+        return loss, cond, pred
