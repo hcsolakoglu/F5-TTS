@@ -92,7 +92,9 @@ class TextEmbedding(nn.Module):
             if valid_seq_lens is None:
                 valid_seq_lens = seq_len_tensor
         else:
-            max_seq_len = int(seq_len)
+            # Keep SymInt (not int()) so dynamic-shape torch.compile does not specialize
+            # the graph per sequence length. In eager mode seq_len is already a Python int.
+            max_seq_len = seq_len
 
         text = text[:, :max_seq_len]  # curtail if character tokens are more than the mel spec tokens
         text = F.pad(text, (0, max_seq_len - text.shape[1]), value=0)
@@ -137,7 +139,7 @@ class TextEmbedding(nn.Module):
             elif torch.is_tensor(seq_len):
                 target_lens = seq_len.to(device=text.device, dtype=torch.long)
             else:
-                target_lens = torch.full((text.shape[0],), int(seq_len), device=text.device, dtype=torch.long)
+                target_lens = torch.full((text.shape[0],), seq_len, device=text.device, dtype=torch.long)
 
             text = self.average_upsample_text_by_mask(text, ~text_mask, target_lens)
 

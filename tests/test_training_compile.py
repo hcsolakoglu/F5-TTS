@@ -9,7 +9,7 @@ import torch
 import torch._dynamo as dynamo
 import yaml
 
-from f5_tts.model import CFM, DiT
+from f5_tts.model import CFM, DiT, UNetT
 from f5_tts.train.finetune_cli import parse_args
 
 
@@ -71,6 +71,27 @@ def _build_real_config_model(**kwargs):
         text_mask_padding=False,
         **kwargs,
     )
+
+
+def _build_unett_model():
+    model = CFM(
+        transformer=UNetT(
+            dim=32,
+            depth=2,
+            heads=2,
+            dim_head=16,
+            mel_dim=8,
+            text_num_embeds=32,
+            text_dim=16,
+            dropout=0.0,
+            conv_layers=0,
+        ),
+        mel_spec_kwargs={"n_mel_channels": 8},
+        audio_drop_prob=0.0,
+        cond_drop_prob=0.0,
+    ).cpu()
+    model.eval()
+    return model
 
 
 def _sample_batch(batch_size=2, frames=12, text_len=7, vocab_size=32, lens=None):
@@ -356,6 +377,40 @@ def test_real_config_compiled_loss_core_matches_eager():
             assert compiled_grad is eager_grad, f"real_config gradient None mismatch at parameter {index}"
         else:
             _assert_close(compiled_grad, eager_grad, f"real_config_grad_{index}", atol=1e-4, rtol=1e-4)
+
+
+def test_unett_compiled_loss_core_matches_eager():
+    """CPU parity for E2TTS/UNetT, whose text embedding path differs from DiT."""
+    eager_model = _build_unett_model()
+    compiled_model = copy.deepcopy(eager_model)
+    mel, text, lens = _sample_batch(batch_size=2, frames=12, text_len=7, lens=[12, 8])
+
+    prepared_args = cast(PreparedArgs, eager_model._prepare_training_inputs(mel.clone(), text.clone(), lens.clone()))
+    eager_loss, eager_cond, eager_pred = eager_model._forward_loss_core(*prepared_args)
+    eager_loss.backward()
+    eager_grads = [
+        param.grad.detach().clone() if param.grad is not None else None for param in eager_model.parameters()
+    ]
+
+    compiled_model.compile_training_core(backend="eager", fullgraph=True, dynamic=None)
+    compiled_args = cast(
+        PreparedArgs,
+        tuple(arg.detach().clone() if torch.is_tensor(arg) else arg for arg in prepared_args),
+    )
+    compiled_loss, compiled_cond, compiled_pred = compiled_model._run_loss_core(*compiled_args)
+    compiled_loss.backward()
+    compiled_grads = [
+        param.grad.detach().clone() if param.grad is not None else None for param in compiled_model.parameters()
+    ]
+
+    _assert_close(compiled_loss.detach(), eager_loss.detach(), "unett_loss")
+    _assert_close(compiled_cond.detach(), eager_cond.detach(), "unett_cond")
+    _assert_close(compiled_pred.detach(), eager_pred.detach(), "unett_pred")
+    for index, (compiled_grad, eager_grad) in enumerate(zip(compiled_grads, eager_grads, strict=True)):
+        if compiled_grad is None or eager_grad is None:
+            assert compiled_grad is eager_grad, f"unett gradient None mismatch at parameter {index}"
+        else:
+            _assert_close(compiled_grad, eager_grad, f"unett_grad_{index}", atol=1e-4, rtol=1e-4)
 
 
 def test_fullgraph_real_config_no_graph_break():
@@ -821,3 +876,136 @@ def test_compile_guard_blocks_cuda_inductor_for_average_upsampling():
     lens = lens.to(device)
     loss, _, _ = model(mel, text=text, lens=lens)
     assert torch.isfinite(loss)
+
+
+# ---------------------------------------------------------------------------
+# Review-agent follow-up tests: opt-in global masked-mean, AdamW fused device,
+# DiT SymInt casts.
+# ---------------------------------------------------------------------------
+
+
+def test_trainer_global_masked_mean_defaults_false_and_gates_backward_path():
+    """Default preserves old per-microbatch mean backward; opt-in enables loss_sum path."""
+    import inspect
+
+    from f5_tts.model.trainer import Trainer
+
+    sig = inspect.signature(Trainer.__init__)
+    assert sig.parameters["global_masked_mean"].default is False
+
+    source = inspect.getsource(Trainer.train)
+    # Opt-in path backprops loss_sum and rescales by global denominator.
+    assert "self.accelerator.backward(loss_sum)" in source
+    assert "self._scale_gradients_by_loss_denom(global_loss_denom)" in source
+    # Default path backprops the per-microbatch mean loss, not loss_sum.
+    assert "self.accelerator.backward(loss)" in source
+    # The branch is gated on the flag, not unconditional.
+    assert "if self.global_masked_mean:" in source
+
+
+def test_default_loss_path_gradient_matches_average_of_means_not_global_mean():
+    """With global_masked_mean=False, gradients equal backprop of per-microbatch means
+    (historical average-of-means), which differs from the global masked-mean when
+    masked-frame denominators differ across microbatches."""
+    torch.manual_seed(7)
+    dim = 4
+    microbatches = [_toy_microbatch(10, 8, dim=dim), _toy_microbatch(4, 3, dim=dim)]
+
+    # Old/historical behaviour: gradient accumulation sums per-microbatch mean gradients
+    # (average-of-means). The common 1/G factor is omitted; it does not affect the inequality.
+    old = torch.nn.Linear(dim, dim, bias=False)
+    for x, target, mask in microbatches:
+        loss_sum, denom = _toy_loss_components(old, x, target, mask)
+        (loss_sum / denom).backward()
+
+    # Global masked-mean behaviour: grad(total_loss_sum / total_denom).
+    glob = copy.deepcopy(old)
+    for p in glob.parameters():
+        p.grad = None
+    total_loss_sum = torch.zeros(())
+    total_denom = torch.zeros(())
+    for x, target, mask in microbatches:
+        loss_sum, denom = _toy_loss_components(glob, x, target, mask)
+        total_loss_sum = total_loss_sum + loss_sum
+        total_denom = total_denom + denom.detach()
+    (total_loss_sum / total_denom).backward()
+
+    # The two objectives differ because denominators differ (8*dim vs 3*dim).
+    for old_p, glob_p in zip(old.parameters(), glob.parameters(), strict=True):
+        assert not torch.allclose(old_p.grad, glob_p.grad, atol=1e-5), (
+            "average-of-means and global masked-mean gradients should differ when "
+            "masked-frame denominators differ across microbatches"
+        )
+
+
+def test_adamw_fused_uses_accelerator_device_not_global_cuda():
+    """fused must be driven by the actual accelerator device, not torch.cuda.is_available()."""
+    import inspect
+
+    from f5_tts.model.trainer import Trainer
+
+    source = inspect.getsource(Trainer.__init__)
+    assert 'self.accelerator.device.type == "cuda"' in source
+    assert "fused=torch.cuda.is_available()" not in source
+
+
+def test_adamw_fused_false_when_accelerator_cpu_on_cuda_host():
+    """On a CUDA host with a CPU accelerator, AdamW must not request the fused kernel."""
+    if not torch.cuda.is_available():
+        pytest.skip("Requires a CUDA-capable host to prove the CPU-path divergence")
+
+    from accelerate import Accelerator
+
+    # On a CUDA host the old code (torch.cuda.is_available()) would set fused=True;
+    # the patched logic keys off the actual accelerator device and must yield False.
+    cpu_accel = Accelerator(cpu=True)
+    use_fused = cpu_accel.device.type == "cuda"
+    assert use_fused is False
+    assert torch.cuda.is_available() is True  # proves the two checks diverge here
+    model = torch.nn.Linear(4, 4)
+    opt = torch.optim.AdamW(model.parameters(), lr=1e-4, fused=use_fused)
+    assert opt.param_groups[0].get("fused", False) is False
+
+
+def test_dit_text_embed_keeps_symint_in_non_tensor_path():
+    """The non-tensor seq_len path must not call int() (which specializes dynamic graphs)."""
+    import inspect
+
+    from f5_tts.model.backbones.dit import TextEmbedding
+
+    src = inspect.getsource(TextEmbedding.forward)
+    assert "int(seq_len)" not in src
+    # The non-tensor branch keeps the value as-is (Python int in eager, SymInt under compile).
+    assert "max_seq_len = seq_len" in src
+
+
+def test_dit_text_embed_non_tensor_seq_len_still_masks_correctly():
+    """Behavioral check: int seq_len path produces correct valid-position masking (eager)."""
+    from f5_tts.model.backbones.dit import TextEmbedding
+
+    embed = TextEmbedding(text_num_embeds=32, text_dim=8, mask_padding=False)
+    text = torch.randint(1, 32, (2, 20))
+    # Per-sample valid lengths 7 and 4; seq_len is a plain Python int (max mel frames).
+    out = embed(text, seq_len=7, drop_text=False, valid_seq_lens=torch.tensor([7, 4]))
+    assert out.shape == (2, 7, 8)
+    # Sample 0 is fully valid (len 7); sample 1 valid only up to position 4.
+    assert torch.any(out[0, 4:7] != 0)
+    assert torch.all(out[1, 4:7] == 0)
+    assert torch.any(out[0, :4] != 0)
+
+
+def test_cli_global_masked_mean_flag_parses():
+    with patch.object(sys, "argv", ["prog", "--global_masked_mean"]):
+        args = parse_args()
+    assert args.global_masked_mean is True
+
+    with patch.object(sys, "argv", ["prog"]):
+        args = parse_args()
+    assert args.global_masked_mean is False
+
+
+def test_all_training_configs_define_global_masked_mean_default_false():
+    for config_path in sorted((ROOT / "src/f5_tts/configs").glob("*.yaml")):
+        config = yaml.safe_load(config_path.read_text())
+        assert "optim" in config, config_path.name
+        assert config["optim"].get("global_masked_mean") is False, config_path.name

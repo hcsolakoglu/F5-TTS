@@ -60,6 +60,7 @@ class Trainer:
         compile_fullgraph: bool = False,
         compile_dynamic: bool | None = None,
         compile_fallback_to_eager: bool = True,
+        global_masked_mean: bool = False,
     ):
         ddp_kwargs = DistributedDataParallelKwargs(find_unused_parameters=True)
 
@@ -149,6 +150,12 @@ class Trainer:
         self.compile_fullgraph = compile_fullgraph
         self.compile_dynamic = compile_dynamic
         self.compile_fallback_to_eager = compile_fallback_to_eager
+        # Opt-in global masked-mean loss normalization (default off): when enabled the
+        # trainer backprops per-microbatch loss_sum and rescales synced gradients by the
+        # global masked-frame denominator across accumulation windows and DDP ranks, so
+        # every masked frame is weighted equally. When disabled (default) the trainer
+        # preserves the historical per-microbatch mean-loss backward (average-of-means).
+        self.global_masked_mean = global_masked_mean
         self.compile_active = False
         self.compile_fallback_active = False
         self._unwrapped_model = None  # cached after accelerator.prepare
@@ -158,9 +165,10 @@ class Trainer:
 
             self.optimizer = bnb.optim.AdamW8bit(model.parameters(), lr=learning_rate)
         else:
-            # fused AdamW requires CUDA; fall back to the standard kernel on CPU/other devices
-            # so CPU/ MPS training does not raise a device assert.
-            self.optimizer = AdamW(model.parameters(), lr=learning_rate, fused=torch.cuda.is_available())
+            # fused AdamW requires the actual training device to be CUDA; global
+            # torch.cuda.is_available() is wrong when Accelerate runs on CPU/MPS on a CUDA host.
+            use_fused = self.accelerator.device.type == "cuda"
+            self.optimizer = AdamW(model.parameters(), lr=learning_rate, fused=use_fused)
         self.model, self.optimizer = self.accelerator.prepare(self.model, self.optimizer)
         self._unwrapped_model = self.accelerator.unwrap_model(self.model)
         self._configure_compile()
@@ -512,23 +520,34 @@ class Trainer:
                     if self.duration_predictor is not None and self.accelerator.is_local_main_process:
                         duration_loss = self.duration_predictor(mel_spec, lens=batch.get("durations")).detach()
 
-                    loss, loss_sum, loss_denom, cond, pred = self.model(
-                        mel_spec,
-                        text=text_inputs,
-                        lens=mel_lengths,
-                        noise_scheduler=self.noise_scheduler,
-                        return_loss_components=True,
-                    )
-                    loss_denom = loss_denom.detach().to(dtype=torch.float32)
-                    loss_denom_accum = loss_denom if loss_denom_accum is None else loss_denom_accum + loss_denom
-                    self._check_compile_runtime_fallback()
-                    self.accelerator.backward(loss_sum)
+                    if self.global_masked_mean:
+                        loss, loss_sum, loss_denom, cond, pred = self.model(
+                            mel_spec,
+                            text=text_inputs,
+                            lens=mel_lengths,
+                            noise_scheduler=self.noise_scheduler,
+                            return_loss_components=True,
+                        )
+                        loss_denom = loss_denom.detach().to(dtype=torch.float32)
+                        loss_denom_accum = loss_denom if loss_denom_accum is None else loss_denom_accum + loss_denom
+                        self._check_compile_runtime_fallback()
+                        self.accelerator.backward(loss_sum)
 
-                    if self.accelerator.sync_gradients:
-                        assert loss_denom_accum is not None
-                        global_loss_denom = self._global_loss_denom(loss_denom_accum)
-                        self._scale_gradients_by_loss_denom(global_loss_denom)
-                        loss_denom_accum = None
+                        if self.accelerator.sync_gradients:
+                            assert loss_denom_accum is not None
+                            global_loss_denom = self._global_loss_denom(loss_denom_accum)
+                            self._scale_gradients_by_loss_denom(global_loss_denom)
+                            loss_denom_accum = None
+                    else:
+                        # Default: preserve historical per-microbatch mean-loss backward.
+                        loss, cond, pred = self.model(
+                            mel_spec,
+                            text=text_inputs,
+                            lens=mel_lengths,
+                            noise_scheduler=self.noise_scheduler,
+                        )
+                        self._check_compile_runtime_fallback()
+                        self.accelerator.backward(loss)
 
                     if self.max_grad_norm > 0 and self.accelerator.sync_gradients:
                         self.accelerator.clip_grad_norm_(self.model.parameters(), self.max_grad_norm)

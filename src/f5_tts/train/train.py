@@ -74,6 +74,7 @@ def main(model_cfg):
         compile_fullgraph=compile_cfg.get("fullgraph", False),
         compile_dynamic=compile_cfg.get("dynamic", None),
         compile_fallback_to_eager=compile_cfg.get("fallback_to_eager", True),
+        global_masked_mean=model_cfg.optim.get("global_masked_mean", False),
     )
 
     train_dataset = load_dataset(model_cfg.datasets.name, tokenizer, mel_spec_kwargs=model_cfg.model.mel_spec)
