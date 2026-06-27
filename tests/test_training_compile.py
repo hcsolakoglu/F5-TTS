@@ -94,6 +94,28 @@ def _build_unett_model():
     return model
 
 
+class _ZeroTransformer(torch.nn.Module):
+    """Minimal CFM-compatible transformer for loss dtype/overflow tests."""
+
+    dim = 2
+
+    def forward(self, *, x, **_kwargs):
+        return torch.zeros_like(x)
+
+
+class _LearnedConstantTransformer(torch.nn.Module):
+    """CFM-compatible transformer with one trainable scalar for AMP gradient checks."""
+
+    dim = 2
+
+    def __init__(self):
+        super().__init__()
+        self.bias = torch.nn.Parameter(torch.zeros(()))
+
+    def forward(self, *, x, **_kwargs):
+        return self.bias.to(device=x.device, dtype=x.dtype) * torch.ones_like(x)
+
+
 def _sample_batch(batch_size=2, frames=12, text_len=7, vocab_size=32, lens=None):
     torch.manual_seed(1234)
     mel = torch.randn(batch_size, frames, 8)
@@ -197,6 +219,76 @@ def test_loss_core_components_preserve_public_forward_contract():
     _assert_close(compiled_denom.detach(), denom.detach(), "compiled_component_denom")
     _assert_close(compiled_cond.detach(), cond.detach(), "compiled_component_cond")
     _assert_close(compiled_pred.detach(), pred.detach(), "compiled_component_pred")
+
+
+def test_loss_core_accumulates_mse_in_fp32_for_half_precision_inputs():
+    model = CFM(
+        transformer=_ZeroTransformer(),
+        mel_spec_kwargs={"n_mel_channels": 2},
+        audio_drop_prob=0.0,
+        cond_drop_prob=0.0,
+    )
+    x1 = torch.full((1, 4, 2), 400.0, dtype=torch.float16)
+    x0 = torch.zeros_like(x1)
+    text = torch.zeros((1, 1), dtype=torch.long)
+    mask = torch.ones((1, 4), dtype=torch.bool)
+    rand_span_mask = torch.ones((1, 4), dtype=torch.bool)
+    time = torch.zeros((1,), dtype=torch.float16)
+
+    loss, loss_sum, denom, _, pred = model._forward_loss_core_components(
+        x1, text, mask, rand_span_mask, x0, time, False, False
+    )
+
+    assert pred.dtype == torch.float16
+    assert loss.dtype == torch.float32
+    assert loss_sum.dtype == torch.float32
+    assert denom.dtype == torch.float32
+    assert torch.isfinite(loss_sum)
+    assert torch.isfinite(loss)
+    assert loss_sum.item() == pytest.approx(1_280_000.0)
+    assert denom.item() == pytest.approx(8.0)
+    assert loss.item() == pytest.approx(160_000.0)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required for fp16 AMP GradScaler probe")
+def test_loss_sum_fp16_amp_gradscaler_stays_finite_for_large_errors():
+    device = torch.device("cuda")
+    model = CFM(
+        transformer=_LearnedConstantTransformer(),
+        mel_spec_kwargs={"n_mel_channels": 2},
+        audio_drop_prob=0.0,
+        cond_drop_prob=0.0,
+    ).to(device)
+    optimizer = torch.optim.SGD(model.parameters(), lr=0.0)
+    # Keep the scale at 1.0 to isolate the fp32 loss-sum safety property. The
+    # default GradScaler scale can legitimately overflow very large gradients
+    # before it backs off, which is separate from loss_sum overflowing in fp16.
+    scaler = getattr(torch.amp, "GradScaler")("cuda", init_scale=1.0)
+
+    x1 = torch.full((1, 4, 2), 400.0, device=device, dtype=torch.float16)
+    x0 = torch.zeros_like(x1)
+    text = torch.zeros((1, 1), device=device, dtype=torch.long)
+    mask = torch.ones((1, 4), device=device, dtype=torch.bool)
+    rand_span_mask = torch.ones((1, 4), device=device, dtype=torch.bool)
+    time = torch.zeros((1,), device=device, dtype=torch.float16)
+
+    optimizer.zero_grad(set_to_none=True)
+    with torch.autocast("cuda", dtype=torch.float16):
+        loss, loss_sum, denom, _, _ = model._forward_loss_core_components(
+            x1, text, mask, rand_span_mask, x0, time, False, False
+        )
+
+    assert loss.dtype == torch.float32
+    assert loss_sum.dtype == torch.float32
+    assert denom.dtype == torch.float32
+    assert torch.isfinite(loss_sum)
+    assert torch.isfinite(loss)
+    scaler.scale(loss_sum).backward()
+    scaler.unscale_(optimizer)
+
+    bias = cast(Any, model.transformer).bias
+    assert bias.grad is not None
+    assert torch.isfinite(bias.grad)
 
 
 def _toy_microbatch(n_frames: int, n_masked: int, dim: int = 4):

@@ -264,7 +264,9 @@ class CFM(nn.Module):
         # Boolean indexing (loss[rand_span_mask]) causes a graph break under torch.compile;
         # the elementwise multiply form is numerically equivalent and compile-friendly.
         # denom.clamp(min=1.0) keeps the loss finite when no token is selected.
-        loss = F.mse_loss(pred, flow, reduction="none")
+        # Accumulate the squared error in fp32 so fp16 AMP/global loss-sum
+        # training cannot overflow before GradScaler sees the loss.
+        loss = F.mse_loss(pred.float(), flow.float(), reduction="none")
         loss_mask = rand_span_mask[..., None].to(loss.dtype)
         loss_sum = (loss * loss_mask).sum()
         denom = (loss_mask.sum() * loss.shape[-1]).clamp(min=1.0)
