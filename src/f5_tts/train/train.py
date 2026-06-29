@@ -27,6 +27,7 @@ def main(model_cfg):
         f"{model_cfg.model.name}_{mel_spec_type}_{model_cfg.model.tokenizer}_{model_cfg.datasets.name}",
     )
     wandb_resume_id = model_cfg.ckpts.get("wandb_resume_id", None)
+    compile_cfg = model_cfg.get("compile", {})
 
     # set text tokenizer
     if tokenizer != "custom":
@@ -41,6 +42,9 @@ def main(model_cfg):
         mel_spec_kwargs=model_cfg.model.mel_spec,
         vocab_char_map=vocab_char_map,
     )
+    compile_target = compile_cfg.get("target", None)
+    if compile_target in (None, "auto"):
+        compile_target = "dit_blocks" if hasattr(model.transformer, "compile_training_target") else "cfm_loss_core"
 
     # init trainer
     trainer = Trainer(
@@ -67,6 +71,14 @@ def main(model_cfg):
         is_local_vocoder=model_cfg.model.vocoder.is_local,
         local_vocoder_path=model_cfg.model.vocoder.local_path,
         model_cfg_dict=OmegaConf.to_container(model_cfg, resolve=True),
+        compile_enabled=compile_cfg.get("enabled", False),
+        compile_backend=compile_cfg.get("backend", "inductor"),
+        compile_target=compile_target,
+        compile_mode=compile_cfg.get("mode", None),
+        compile_fullgraph=compile_cfg.get("fullgraph", False),
+        compile_dynamic=compile_cfg.get("dynamic", None),
+        compile_fallback_to_eager=compile_cfg.get("fallback_to_eager", True),
+        global_masked_mean=model_cfg.optim.get("global_masked_mean", False),
     )
 
     train_dataset = load_dataset(model_cfg.datasets.name, tokenizer, mel_spec_kwargs=model_cfg.model.mel_spec)

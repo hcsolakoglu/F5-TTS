@@ -71,6 +71,38 @@ def parse_args():
         action="store_true",
         help="Use 8-bit Adam optimizer from bitsandbytes",
     )
+    # torch.compile options (optional, default-off)
+    parser.add_argument("--compile_enabled", action="store_true", help="Enable optional torch.compile training path")
+    parser.add_argument("--compile_backend", type=str, default="inductor", help="torch.compile backend")
+    parser.add_argument(
+        "--compile_target",
+        type=str,
+        default="auto",
+        choices=["auto", "cfm_loss_core", "dit_blocks"],
+        help="torch.compile training target (auto chooses a model-compatible target)",
+    )
+    parser.add_argument(
+        "--compile_mode", type=str, default=None, help="torch.compile mode (e.g. default, reduce-overhead)"
+    )
+    parser.add_argument("--compile_fullgraph", action="store_true", help="Require fullgraph torch.compile")
+    parser.add_argument(
+        "--compile_dynamic",
+        type=str,
+        default="default",
+        choices=["default", "true", "false"],
+        help="torch.compile dynamic shape setting (default leaves it unset)",
+    )
+    parser.add_argument(
+        "--compile_no_fallback",
+        action="store_true",
+        help="Raise torch.compile errors instead of falling back to eager",
+    )
+    parser.add_argument(
+        "--global_masked_mean",
+        action="store_true",
+        help="Opt-in: weight every masked frame equally across gradient accumulation and DDP "
+        "(default off preserves the historical per-microbatch mean loss)",
+    )
 
     return parser.parse_args()
 
@@ -80,6 +112,7 @@ def parse_args():
 
 def main():
     args = parse_args()
+    compile_dynamic = None if args.compile_dynamic == "default" else args.compile_dynamic == "true"
 
     checkpoint_path = str(files("f5_tts").joinpath(f"../../ckpts/{args.dataset_name}"))
 
@@ -179,6 +212,9 @@ def main():
         mel_spec_kwargs=mel_spec_kwargs,
         vocab_char_map=vocab_char_map,
     )
+    compile_target = args.compile_target
+    if compile_target == "auto":
+        compile_target = "dit_blocks" if hasattr(model.transformer, "compile_training_target") else "cfm_loss_core"
 
     trainer = Trainer(
         model,
@@ -200,6 +236,14 @@ def main():
         log_samples=args.log_samples,
         last_per_updates=args.last_per_updates,
         bnb_optimizer=args.bnb_optimizer,
+        compile_enabled=args.compile_enabled,
+        compile_backend=args.compile_backend,
+        compile_target=compile_target,
+        compile_mode=args.compile_mode,
+        compile_fullgraph=args.compile_fullgraph,
+        compile_dynamic=compile_dynamic,
+        compile_fallback_to_eager=not args.compile_no_fallback,
+        global_masked_mean=args.global_masked_mean,
     )
 
     train_dataset = load_dataset(args.dataset_name, tokenizer, mel_spec_kwargs=mel_spec_kwargs)
