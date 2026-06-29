@@ -42,6 +42,9 @@ def main(model_cfg):
         mel_spec_kwargs=model_cfg.model.mel_spec,
         vocab_char_map=vocab_char_map,
     )
+    compile_target = compile_cfg.get("target", None)
+    if compile_target in (None, "auto"):
+        compile_target = "dit_blocks" if hasattr(model.transformer, "compile_training_target") else "cfm_loss_core"
 
     # init trainer
     trainer = Trainer(
@@ -70,6 +73,7 @@ def main(model_cfg):
         model_cfg_dict=OmegaConf.to_container(model_cfg, resolve=True),
         compile_enabled=compile_cfg.get("enabled", False),
         compile_backend=compile_cfg.get("backend", "inductor"),
+        compile_target=compile_target,
         compile_mode=compile_cfg.get("mode", None),
         compile_fullgraph=compile_cfg.get("fullgraph", False),
         compile_dynamic=compile_cfg.get("dynamic", None),

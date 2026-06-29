@@ -31,6 +31,9 @@ from f5_tts.model.utils import (
 )
 
 
+TRAINING_COMPILE_TARGETS = ("cfm_loss_core", "dit_blocks")
+
+
 def _is_cuda_oom(exc: BaseException) -> bool:
     """Return True for CUDA out-of-memory errors, typed or message-based."""
     oom_type = getattr(torch.cuda, "OutOfMemoryError", None)
@@ -84,11 +87,12 @@ class CFM(nn.Module):
         # vocab map for tokenization
         self.vocab_char_map = vocab_char_map
 
-        # torch.compile state for the deterministic CFM loss core (optional, default-off).
-        # object.__setattr__ bypasses nn.Module.__setattr__ so these are never registered as
-        # parameters/buffers; state_dict is unchanged and EMA deepcopy (which runs before any
-        # compile call) never sees a compiled callable.
+        # torch.compile state for optional training targets. object.__setattr__ bypasses
+        # nn.Module.__setattr__ so these are never registered as parameters/buffers;
+        # state_dict is unchanged and EMA deepcopy (which runs before any compile call)
+        # never sees a compiled callable.
         object.__setattr__(self, "_compiled_loss_core", None)
+        object.__setattr__(self, "_compile_target", None)
         object.__setattr__(self, "_compile_runtime_fallback", True)
         object.__setattr__(self, "_compile_fallback_active", False)
         object.__setattr__(self, "_compile_error", None)
@@ -99,18 +103,26 @@ class CFM(nn.Module):
 
     @property
     def training_compile_state(self):
+        enabled = self._training_compile_enabled()
         return {
-            "enabled": self._compiled_loss_core is not None,
+            "enabled": enabled,
+            "target": self._compile_target if enabled else None,
             "fallback_active": self._compile_fallback_active,
             "error": self._compile_error,
         }
 
-    def compile_training_core(self, *, runtime_fallback: bool = True, **compile_kwargs):
-        """Compile the deterministic CFM loss core for an optional training speedup.
+    def compile_training_core(self, *, target: str = "cfm_loss_core", runtime_fallback: bool = True, **compile_kwargs):
+        """Compile an explicit training target for an optional speedup.
 
-        Only the deterministic core (xt interpolation, transformer forward, masked MSE) is
-        compiled; the stochastic preparation (mel extraction, span masking, noise/time
-        sampling, CFG dropout) stays eager in ``forward`` so RNG state is unaffected.
+        ``target=cfm_loss_core`` preserves the original behavior: only the deterministic
+        core (xt interpolation, transformer forward, masked MSE) is compiled; stochastic
+        preparation (mel extraction, span masking, noise/time sampling, CFG dropout) stays
+        eager in ``forward`` so RNG state is unaffected.
+
+        ``target=dit_blocks`` compiles each repeated DiT block independently and leaves
+        embeddings, rotary setup, final projection, and loss reduction eager. This regional
+        target is useful for variable-length training where the larger CFM loss-core graph
+        has excessive cold compile/recompile overhead.
 
         ``runtime_fallback`` (default True) lets a *forward* compile failure permanently
         switch this module to eager. Set it False under DDP so a failure raises on every
@@ -118,22 +130,54 @@ class CFM(nn.Module):
         forward failures only; a compile failure during backward is not caught and will
         raise; disable compile (``fallback_to_eager=False``) to surface such errors.
         """
-        self._check_compile_compatible_transformer()
-        compiled = torch.compile(self._forward_loss_core_components, **compile_kwargs)
-        object.__setattr__(self, "_compiled_loss_core", compiled)
+        if target not in TRAINING_COMPILE_TARGETS:
+            valid = ", ".join(TRAINING_COMPILE_TARGETS)
+            raise ValueError(f"Unknown torch.compile training target {target!r}; expected one of: {valid}")
+
+        self.clear_training_compile()
+
+        if target == "cfm_loss_core":
+            self._check_compile_compatible_transformer(target=target)
+            compiled = torch.compile(self._forward_loss_core_components, **compile_kwargs)
+            object.__setattr__(self, "_compiled_loss_core", compiled)
+        else:
+            compile_fn = getattr(self.transformer, "compile_training_target", None)
+            if compile_fn is None:
+                raise ValueError(
+                    "torch.compile target='dit_blocks' requires a DiT transformer exposing "
+                    "compile_training_target(); use target='cfm_loss_core' for other backbones."
+                )
+            compiled = compile_fn(target, **compile_kwargs)
+
+        object.__setattr__(self, "_compile_target", target)
         object.__setattr__(self, "_compile_runtime_fallback", bool(runtime_fallback))
         object.__setattr__(self, "_compile_fallback_active", False)
         object.__setattr__(self, "_compile_error", None)
         return compiled
 
     def clear_training_compile(self):
-        """Remove the compiled loss core, reverting to eager execution."""
+        """Remove any compiled training target, reverting to eager execution."""
+        clear_transformer = getattr(self.transformer, "clear_training_compile", None)
+        if clear_transformer is not None:
+            clear_transformer()
         object.__setattr__(self, "_compiled_loss_core", None)
+        object.__setattr__(self, "_compile_target", None)
         object.__setattr__(self, "_compile_runtime_fallback", True)
         object.__setattr__(self, "_compile_fallback_active", False)
         object.__setattr__(self, "_compile_error", None)
 
-    def _check_compile_compatible_transformer(self):
+    def _transformer_training_compile_state(self):
+        state = getattr(self.transformer, "training_compile_state", None)
+        if state is None:
+            return {"enabled": False}
+        return state
+
+    def _training_compile_enabled(self):
+        return self._compiled_loss_core is not None or bool(
+            self._transformer_training_compile_state().get("enabled", False)
+        )
+
+    def _check_compile_compatible_transformer(self, *, target: str):
         """Reject transformer paths known to graph-break inside compiled training.
 
         DiT's ``text_embedding_average_upsampling=True`` calls
@@ -142,6 +186,9 @@ class CFM(nn.Module):
         under torch.compile and hard-fail with ``fullgraph=True``. Failing at setup gives
         Trainer a clean eager fallback path instead of a late Dynamo error.
         """
+        if target != "cfm_loss_core":
+            return
+
         text_embed = getattr(self.transformer, "text_embed", None)
         if text_embed is not None and getattr(text_embed, "average_upsampling", False):
             raise ValueError(
@@ -161,11 +208,16 @@ class CFM(nn.Module):
         torch.get_rng_state does not round-trip the Philox offset used by compiled code, so
         restoring it would give a false guarantee. A fresh dropout draw on fallback is valid.
         """
-        compiled = self._compiled_loss_core
-        if compiled is None:
+        compiled = self.__dict__.get("_compiled_loss_core")
+        compiled_active = self._training_compile_enabled()
+        if not compiled_active:
             return self._forward_loss_core_components(*args)
         try:
-            return compiled(*args)
+            if compiled is not None:
+                return compiled(*args)
+            # Regional DiT targets execute through the eager loss-core path; the DiT
+            # blocks invoked from the transformer are the compiled callables.
+            return self._forward_loss_core_components(*args)
         except Exception as exc:
             # A compiled CUDA OOM is a capacity failure, not a compiler failure.
             # Retrying eagerly usually repeats the same allocation pressure and can hide
@@ -175,10 +227,11 @@ class CFM(nn.Module):
                     "torch.compile CFM loss core ran out of GPU memory; not falling "
                     "back to eager (reduce batch size / sequence length)."
                 ) from exc
-            if not self._compile_runtime_fallback:
+            runtime_fallback = self._compile_runtime_fallback
+            if not runtime_fallback:
                 raise
             # Permanently disable compile for the rest of this run.
-            object.__setattr__(self, "_compiled_loss_core", None)
+            self.clear_training_compile()
             object.__setattr__(self, "_compile_fallback_active", True)
             object.__setattr__(self, "_compile_error", repr(exc))
             return self._forward_loss_core_components(*args)
@@ -234,6 +287,14 @@ class CFM(nn.Module):
         else:
             drop_text = False
 
+        # Tensor-aware backbones consume CFG flags with branchless embedding masks.
+        # Keeping these flags as 0-D tensors avoids separate torch.compile graphs for
+        # each CFG bool combination while preserving the same sampled drop decisions.
+        # Backbones without this explicit capability keep their historical bool inputs.
+        if getattr(self.transformer, "supports_tensor_cfg_training_flags", False):
+            drop_audio_cond = torch.as_tensor(drop_audio_cond, device=device, dtype=torch.bool)
+            drop_text = torch.as_tensor(drop_text, device=device, dtype=torch.bool)
+
         return x1, text, mask, rand_span_mask, x0, time, drop_audio_cond, drop_text
 
     def _forward_loss_core_components(
@@ -244,8 +305,8 @@ class CFM(nn.Module):
         rand_span_mask: torch.Tensor,
         x0: torch.Tensor,
         time: torch.Tensor,
-        drop_audio_cond: bool,
-        drop_text: bool,
+        drop_audio_cond: bool | torch.Tensor,
+        drop_text: bool | torch.Tensor,
     ):
         # Deterministic loss core: sample xt (φ_t(x) in the paper)
         t = time.unsqueeze(-1).unsqueeze(-1)

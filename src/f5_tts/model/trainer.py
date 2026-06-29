@@ -56,6 +56,7 @@ class Trainer:
         model_cfg_dict: dict = dict(),  # training config
         compile_enabled: bool = False,
         compile_backend: str | None = "inductor",
+        compile_target: str = "cfm_loss_core",
         compile_mode: str | None = None,
         compile_fullgraph: bool = False,
         compile_dynamic: bool | None = None,
@@ -146,6 +147,7 @@ class Trainer:
         # torch.compile configuration (optional, default-off)
         self.compile_enabled = compile_enabled
         self.compile_backend = compile_backend
+        self.compile_target = compile_target
         self.compile_mode = compile_mode
         self.compile_fullgraph = compile_fullgraph
         self.compile_dynamic = compile_dynamic
@@ -216,7 +218,8 @@ class Trainer:
             compile_fn = getattr(self._unwrapped_model, "compile_training_core", None)
             if compile_fn is None:
                 raise TypeError("The training model does not expose compile_training_core()")
-            compile_fn(runtime_fallback=runtime_fallback, **compile_kwargs)
+            compile_target = getattr(self, "compile_target", "cfm_loss_core")
+            compile_fn(target=compile_target, runtime_fallback=runtime_fallback, **compile_kwargs)
             self.compile_active = True
         except Exception as exc:
             if not self.compile_fallback_to_eager:
@@ -233,8 +236,9 @@ class Trainer:
         self._sync_compile_setup_ddp()
 
         if self.compile_active and self.is_main:
+            compile_target = getattr(self, "compile_target", "cfm_loss_core")
             print(
-                f"torch.compile enabled (target=cfm_loss_core, backend={self.compile_backend}, "
+                f"torch.compile enabled (target={compile_target}, backend={self.compile_backend}, "
                 f"mode={self.compile_mode}, fullgraph={self.compile_fullgraph}, dynamic={self.compile_dynamic})"
             )
             if self.accelerator.num_processes > 1 and self.compile_fallback_to_eager:

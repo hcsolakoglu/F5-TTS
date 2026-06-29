@@ -60,6 +60,7 @@ ckpts:
 
 compile:
   enabled: False  # optional torch.compile path; disabled by default
+  target: dit_blocks  # dit_blocks | cfm_loss_core
   backend: inductor  # requires triton on CUDA
   mode: null  # e.g. default, reduce-overhead, max-autotune (reduce-overhead/max-autotune need fixed shapes)
   fullgraph: False

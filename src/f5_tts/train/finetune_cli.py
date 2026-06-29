@@ -75,6 +75,13 @@ def parse_args():
     parser.add_argument("--compile_enabled", action="store_true", help="Enable optional torch.compile training path")
     parser.add_argument("--compile_backend", type=str, default="inductor", help="torch.compile backend")
     parser.add_argument(
+        "--compile_target",
+        type=str,
+        default="auto",
+        choices=["auto", "cfm_loss_core", "dit_blocks"],
+        help="torch.compile training target (auto chooses a model-compatible target)",
+    )
+    parser.add_argument(
         "--compile_mode", type=str, default=None, help="torch.compile mode (e.g. default, reduce-overhead)"
     )
     parser.add_argument("--compile_fullgraph", action="store_true", help="Require fullgraph torch.compile")
@@ -205,6 +212,9 @@ def main():
         mel_spec_kwargs=mel_spec_kwargs,
         vocab_char_map=vocab_char_map,
     )
+    compile_target = args.compile_target
+    if compile_target == "auto":
+        compile_target = "dit_blocks" if hasattr(model.transformer, "compile_training_target") else "cfm_loss_core"
 
     trainer = Trainer(
         model,
@@ -228,6 +238,7 @@ def main():
         bnb_optimizer=args.bnb_optimizer,
         compile_enabled=args.compile_enabled,
         compile_backend=args.compile_backend,
+        compile_target=compile_target,
         compile_mode=args.compile_mode,
         compile_fullgraph=args.compile_fullgraph,
         compile_dynamic=compile_dynamic,

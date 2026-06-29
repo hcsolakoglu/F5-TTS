@@ -14,7 +14,16 @@ from f5_tts.train.finetune_cli import parse_args
 
 
 ROOT = Path(__file__).resolve().parents[1]
-PreparedArgs = tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, bool, bool]
+PreparedArgs = tuple[
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+    bool | torch.Tensor,
+    bool | torch.Tensor,
+]
 
 CUDA_INDUCTOR_EQUIVALENCE_KWARGS = [
     pytest.param({"fullgraph": False, "dynamic": None}, id="default_autodynamic"),
@@ -73,7 +82,7 @@ def _build_real_config_model(**kwargs):
     )
 
 
-def _build_unett_model():
+def _build_unett_model(*, audio_drop_prob=0.0, cond_drop_prob=0.0):
     model = CFM(
         transformer=UNetT(
             dim=32,
@@ -87,8 +96,8 @@ def _build_unett_model():
             conv_layers=0,
         ),
         mel_spec_kwargs={"n_mel_channels": 8},
-        audio_drop_prob=0.0,
-        cond_drop_prob=0.0,
+        audio_drop_prob=audio_drop_prob,
+        cond_drop_prob=cond_drop_prob,
     ).cpu()
     model.eval()
     return model
@@ -128,6 +137,46 @@ def _sample_batch(batch_size=2, frames=12, text_len=7, vocab_size=32, lens=None)
         if valid_len < frames:
             mel[index, valid_len:] = 0.0
     return mel, text, lens_tensor
+
+
+class _PrecomputedMelDataset(torch.utils.data.Dataset):
+    """Tiny real Trainer dataset: variable mel/text lengths, no external downloads."""
+
+    def __init__(self):
+        generator = torch.Generator().manual_seed(2026)
+        self.lengths = [8, 12, 16, 20]
+        self.texts = ["a", "abcdef", "hi", "long text"]
+        self.mels = [torch.randn(8, frames, generator=generator) for frames in self.lengths]
+
+    def __len__(self):
+        return len(self.mels)
+
+    def get_frame_len(self, index):
+        return self.lengths[index]
+
+    def __getitem__(self, index):
+        return {"mel_spec": self.mels[index], "text": self.texts[index]}
+
+
+class _SilentProgress:
+    def __init__(self, iterable, *args, **kwargs):
+        self.iterable = iterable
+
+    def __iter__(self):
+        return iter(self.iterable)
+
+    def update(self, *args, **kwargs):
+        pass
+
+    def set_postfix(self, *args, **kwargs):
+        pass
+
+
+def _assert_clean_checkpoint_state_dict(checkpoint_path: Path):
+    checkpoint = torch.load(checkpoint_path, map_location="cpu", weights_only=True)
+    state_dict = checkpoint["model_state_dict"]
+    assert state_dict
+    assert not any("_orig_mod" in key or "compile" in key or "compiled" in key for key in state_dict)
 
 
 def _assert_close(actual, expected, name, *, atol=1e-5, rtol=1e-5):
@@ -191,6 +240,89 @@ def test_compiled_loss_core_matches_eager_loss_outputs_and_gradients():
             assert compiled_grad is eager_grad, f"gradient None mismatch at parameter {index}"
         else:
             _assert_close(compiled_grad, eager_grad, f"grad_{index}", atol=1e-4, rtol=1e-4)
+
+
+def test_regional_dit_blocks_matches_eager_loss_outputs_and_gradients():
+    eager_model = _build_model()
+    compiled_model = copy.deepcopy(eager_model)
+    mel, text, lens = _sample_batch(batch_size=3, frames=12, text_len=7, lens=[12, 8, 5])
+    transformer = cast(Any, compiled_model.transformer)
+    for block in transformer.transformer_blocks:
+        assert "forward" not in block.__dict__
+
+    prepared_args = cast(PreparedArgs, eager_model._prepare_training_inputs(mel.clone(), text.clone(), lens.clone()))
+
+    eager_loss, eager_cond, eager_pred = eager_model._forward_loss_core(*prepared_args)
+    eager_loss.backward()
+    eager_grads = [
+        param.grad.detach().clone() if param.grad is not None else None for param in eager_model.parameters()
+    ]
+
+    compiled = compiled_model.compile_training_core(target="dit_blocks", backend="eager", fullgraph=False, dynamic=None)
+    compiled_args = cast(
+        PreparedArgs,
+        tuple(arg.detach().clone() if torch.is_tensor(arg) else arg for arg in prepared_args),
+    )
+    compiled_loss, compiled_cond, compiled_pred = compiled_model._run_loss_core(*compiled_args)
+    compiled_loss.backward()
+    compiled_grads = [
+        param.grad.detach().clone() if param.grad is not None else None for param in compiled_model.parameters()
+    ]
+
+    assert isinstance(compiled, tuple)
+    compiled_forwards = cast(tuple[Any, ...], compiled)
+    assert len(compiled_forwards) == len(transformer.transformer_blocks)
+    for block in transformer.transformer_blocks:
+        assert "forward" in block.__dict__
+    assert compiled_model.training_compile_state == {
+        "enabled": True,
+        "target": "dit_blocks",
+        "fallback_active": False,
+        "error": None,
+    }
+    assert not any("_orig_mod" in key or "compile" in key or "compiled" in key for key in compiled_model.state_dict())
+    _assert_close(compiled_loss.detach(), eager_loss.detach(), "dit_blocks_loss")
+    _assert_close(compiled_cond.detach(), eager_cond.detach(), "dit_blocks_cond")
+    _assert_close(compiled_pred.detach(), eager_pred.detach(), "dit_blocks_pred")
+    for index, (compiled_grad, eager_grad) in enumerate(zip(compiled_grads, eager_grads, strict=True)):
+        if compiled_grad is None or eager_grad is None:
+            assert compiled_grad is eager_grad, f"dit_blocks gradient None mismatch at parameter {index}"
+        else:
+            _assert_close(compiled_grad, eager_grad, f"dit_blocks_grad_{index}", atol=1e-4, rtol=1e-4)
+
+    compiled_model.clear_training_compile()
+    assert compiled_model.training_compile_state == {
+        "enabled": False,
+        "target": None,
+        "fallback_active": False,
+        "error": None,
+    }
+    for block in transformer.transformer_blocks:
+        assert "forward" not in block.__dict__
+
+
+def test_regional_dit_blocks_runtime_fallback_restores_eager_blocks():
+    model = _build_model()
+    mel, text, lens = _sample_batch()
+    prepared_args = cast(PreparedArgs, model._prepare_training_inputs(mel.clone(), text.clone(), lens.clone()))
+    transformer = cast(Any, model.transformer)
+    block = transformer.transformer_blocks[0]
+
+    assert "forward" not in block.__dict__
+    model.compile_training_core(target="dit_blocks", backend="eager", fullgraph=False, dynamic=None)
+    assert "forward" in block.__dict__
+
+    def raise_compile_error(*_args, **_kwargs):
+        raise RuntimeError("synthetic dit block compile failure")
+
+    block.forward = raise_compile_error
+    loss, _, _ = model._run_loss_core(*prepared_args)
+
+    assert torch.isfinite(loss)
+    assert model.training_compile_state["enabled"] is False
+    assert model.training_compile_state["fallback_active"] is True
+    assert "synthetic dit block compile failure" in model.training_compile_state["error"]
+    assert "forward" not in block.__dict__
 
 
 def test_loss_core_components_preserve_public_forward_contract():
@@ -419,6 +551,215 @@ def test_compiled_loss_core_handles_cfg_branches_and_empty_mask():
     assert loss.item() == 0.0
 
 
+def test_tensor_aware_training_cfg_flags_are_tensorized_for_dit_and_unett():
+    mel, text, lens = _sample_batch(batch_size=2, frames=12, text_len=7, lens=[12, 8])
+
+    dit_model = _build_model(audio_drop_prob=1.0, cond_drop_prob=0.0)
+    dit_prepared = cast(PreparedArgs, dit_model._prepare_training_inputs(mel.clone(), text.clone(), lens.clone()))
+    drop_audio_cond, drop_text = dit_prepared[6], dit_prepared[7]
+    assert torch.is_tensor(drop_audio_cond)
+    assert torch.is_tensor(drop_text)
+    assert drop_audio_cond.shape == torch.Size([])
+    assert drop_text.shape == torch.Size([])
+    assert drop_audio_cond.dtype is torch.bool
+    assert drop_text.dtype is torch.bool
+    assert drop_audio_cond.item() is True
+    assert drop_text.item() is False
+
+    unett_model = _build_unett_model(audio_drop_prob=1.0, cond_drop_prob=0.0)
+    unett_prepared = cast(PreparedArgs, unett_model._prepare_training_inputs(mel.clone(), text.clone(), lens.clone()))
+    unett_drop_audio_cond, unett_drop_text = unett_prepared[6], unett_prepared[7]
+    assert torch.is_tensor(unett_drop_audio_cond)
+    assert torch.is_tensor(unett_drop_text)
+    assert unett_drop_audio_cond.shape == torch.Size([])
+    assert unett_drop_text.shape == torch.Size([])
+    assert unett_drop_audio_cond.dtype is torch.bool
+    assert unett_drop_text.dtype is torch.bool
+    assert unett_drop_audio_cond.item() is True
+    assert unett_drop_text.item() is False
+
+
+def test_branchless_tensor_cfg_flags_match_bool_loss_outputs_and_gradients():
+    bool_model = _build_model()
+    tensor_model = copy.deepcopy(bool_model)
+    mel, text, lens = _sample_batch(batch_size=3, frames=12, text_len=7, lens=[12, 8, 5])
+
+    prepared_args = cast(PreparedArgs, bool_model._prepare_training_inputs(mel.clone(), text.clone(), lens.clone()))
+    core_args = prepared_args[:6]
+
+    bool_loss, bool_cond, bool_pred = bool_model._forward_loss_core(*core_args, True, True)
+    bool_loss.backward()
+    bool_grads = [param.grad.detach().clone() if param.grad is not None else None for param in bool_model.parameters()]
+
+    tensor_core_args = tuple(arg.detach().clone() if torch.is_tensor(arg) else arg for arg in core_args)
+    tensor_flag = torch.tensor(True, device=tensor_core_args[0].device)
+    tensor_loss, tensor_cond, tensor_pred = tensor_model._forward_loss_core(*tensor_core_args, tensor_flag, tensor_flag)
+    tensor_loss.backward()
+    tensor_grads = [
+        param.grad.detach().clone() if param.grad is not None else None for param in tensor_model.parameters()
+    ]
+
+    _assert_close(tensor_loss.detach(), bool_loss.detach(), "branchless_loss")
+    _assert_close(tensor_cond.detach(), bool_cond.detach(), "branchless_cond")
+    _assert_close(tensor_pred.detach(), bool_pred.detach(), "branchless_pred")
+    for index, (tensor_grad, bool_grad) in enumerate(zip(tensor_grads, bool_grads, strict=True)):
+        if tensor_grad is None or bool_grad is None:
+            assert tensor_grad is bool_grad, f"branchless gradient None mismatch at parameter {index}"
+        else:
+            _assert_close(tensor_grad, bool_grad, f"branchless_grad_{index}", atol=1e-4, rtol=1e-4)
+
+
+def test_unett_branchless_tensor_cfg_flags_match_bool_loss_outputs_and_gradients():
+    bool_model = _build_unett_model()
+    tensor_model = copy.deepcopy(bool_model)
+    mel, text, lens = _sample_batch(batch_size=3, frames=12, text_len=7, lens=[12, 8, 5])
+
+    prepared_args = cast(PreparedArgs, bool_model._prepare_training_inputs(mel.clone(), text.clone(), lens.clone()))
+    core_args = prepared_args[:6]
+
+    bool_loss, bool_cond, bool_pred = bool_model._forward_loss_core(*core_args, True, True)
+    bool_loss.backward()
+    bool_grads = [param.grad.detach().clone() if param.grad is not None else None for param in bool_model.parameters()]
+
+    tensor_core_args = tuple(arg.detach().clone() if torch.is_tensor(arg) else arg for arg in core_args)
+    tensor_flag = torch.tensor(True, device=tensor_core_args[0].device)
+    tensor_loss, tensor_cond, tensor_pred = tensor_model._forward_loss_core(*tensor_core_args, tensor_flag, tensor_flag)
+    tensor_loss.backward()
+    tensor_grads = [
+        param.grad.detach().clone() if param.grad is not None else None for param in tensor_model.parameters()
+    ]
+
+    _assert_close(tensor_loss.detach(), bool_loss.detach(), "unett_branchless_loss")
+    _assert_close(tensor_cond.detach(), bool_cond.detach(), "unett_branchless_cond")
+    _assert_close(tensor_pred.detach(), bool_pred.detach(), "unett_branchless_pred")
+    for index, (tensor_grad, bool_grad) in enumerate(zip(tensor_grads, bool_grads, strict=True)):
+        if tensor_grad is None or bool_grad is None:
+            assert tensor_grad is bool_grad, f"unett branchless gradient None mismatch at parameter {index}"
+        else:
+            _assert_close(tensor_grad, bool_grad, f"unett_branchless_grad_{index}", atol=1e-4, rtol=1e-4)
+
+
+def test_unett_fullgraph_compile_accepts_tensor_cfg_flags():
+    model = _build_unett_model()
+    mel, text, lens = _sample_batch(batch_size=2, frames=12, text_len=7, lens=[12, 8])
+    prepared_args = cast(PreparedArgs, model._prepare_training_inputs(mel.clone(), text.clone(), lens.clone()))
+    core_args = prepared_args[:6]
+    tensor_flag = torch.tensor(True, device=core_args[0].device)
+    tensor_args = (*core_args, tensor_flag, tensor_flag)
+
+    model.compile_training_core(backend="eager", fullgraph=True, dynamic=None, runtime_fallback=False)
+    loss, cond, pred = model._run_loss_core(*tensor_args)
+    loss.backward()
+
+    dynamo.reset()
+    explanation = dynamo.explain(model._forward_loss_core)(*tensor_args)
+
+    assert torch.isfinite(loss)
+    assert cond.shape == mel.shape
+    assert pred.shape == mel.shape
+    assert explanation.graph_break_count == 0
+
+
+def test_unett_compiled_loss_core_handles_tensor_cfg_flags_without_fallback():
+    """UNetT tensor CFG path must compile all CFG combos without fallback or graph breaks."""
+    model = _build_unett_model()
+    mel, text, lens = _sample_batch(batch_size=2, frames=12, text_len=7, lens=[12, 8])
+    prepared_args = cast(PreparedArgs, model._prepare_training_inputs(mel.clone(), text.clone(), lens.clone()))
+    core_args = prepared_args[:6]
+
+    model.compile_training_core(backend="eager", fullgraph=True, dynamic=True)
+
+    cfg_combos = ((False, False), (True, False), (True, True))
+    for drop_audio_cond, drop_text in cfg_combos:
+        drop_audio_cond_tensor = torch.tensor(drop_audio_cond, device=core_args[0].device)
+        drop_text_tensor = torch.tensor(drop_text, device=core_args[0].device)
+        loss, cond, pred = model._run_loss_core(*core_args, drop_audio_cond_tensor, drop_text_tensor)
+        assert torch.isfinite(loss), f"UNetT compiled loss not finite for combo {(drop_audio_cond, drop_text)}"
+        assert cond.shape == mel.shape
+        assert pred.shape == mel.shape
+
+    assert not model._compile_fallback_active
+
+    dynamo.reset()
+    drop_audio_cond_tensor = torch.tensor(True, device=core_args[0].device)
+    drop_text_tensor = torch.tensor(True, device=core_args[0].device)
+    explanation = dynamo.explain(model._forward_loss_core)(*core_args, drop_audio_cond_tensor, drop_text_tensor)
+    assert explanation.graph_break_count == 0
+
+    dynamo.reset()
+    torch._dynamo.utils.counters.clear()
+    for drop_audio_cond, drop_text in cfg_combos:
+        model._run_loss_core(*core_args, drop_audio_cond, drop_text)
+    bool_unique_graphs = int(torch._dynamo.utils.counters.get("stats", {}).get("unique_graphs", 0))
+
+    dynamo.reset()
+    torch._dynamo.utils.counters.clear()
+    model.clear_training_compile()
+    model.compile_training_core(backend="eager", fullgraph=True, dynamic=True)
+    for drop_audio_cond, drop_text in cfg_combos:
+        drop_audio_cond_tensor = torch.tensor(drop_audio_cond, device=core_args[0].device)
+        drop_text_tensor = torch.tensor(drop_text, device=core_args[0].device)
+        model._run_loss_core(*core_args, drop_audio_cond_tensor, drop_text_tensor)
+    tensor_unique_graphs = int(torch._dynamo.utils.counters.get("stats", {}).get("unique_graphs", 0))
+
+    assert tensor_unique_graphs <= bool_unique_graphs, (
+        f"UNetT tensor CFG unique graphs ({tensor_unique_graphs}) should be <= bool ({bool_unique_graphs})"
+    )
+
+
+def test_unett_bool_inference_cache_behavior_still_works():
+    """Existing UNetT bool-flag inference + cache path must remain functional."""
+    model = _build_unett_model()
+    model.eval()
+    mel, text, _ = _sample_batch(batch_size=2, frames=12, text_len=7, lens=[12, 8])
+    x = mel
+    cond = mel.clone()
+    time = torch.rand((mel.shape[0],))
+
+    out_cond = model.transformer(
+        x=x,
+        cond=cond,
+        text=text,
+        time=time,
+        mask=None,
+        drop_audio_cond=False,
+        drop_text=False,
+        cache=True,
+    )
+    out_uncond = model.transformer(
+        x=x,
+        cond=cond,
+        text=text,
+        time=time,
+        mask=None,
+        drop_audio_cond=True,
+        drop_text=True,
+        cache=True,
+    )
+
+    assert out_cond.shape == mel.shape
+    assert out_uncond.shape == mel.shape
+    assert not torch.allclose(out_cond, out_uncond, atol=1e-6)
+
+    out_cfg = model.transformer(
+        x=x,
+        cond=cond,
+        text=text,
+        time=time,
+        mask=None,
+        drop_audio_cond=False,
+        drop_text=False,
+        cfg_infer=True,
+        cache=True,
+    )
+    assert out_cfg.shape == (mel.shape[0] * 2, mel.shape[1], mel.shape[2])
+
+    keys = set(model.transformer.state_dict().keys())
+    assert "text_embed.text_embed.weight" in keys
+    assert "input_embed.proj.weight" in keys
+    assert "proj_out.weight" in keys
+
+
 def test_fullgraph_compile_handles_ragged_lens_without_text_embedding_graph_break():
     model = _build_model()
     mel, text, lens = _sample_batch(batch_size=2, frames=12, text_len=7, lens=[12, 8])
@@ -544,7 +885,12 @@ def test_cuda_inductor_real_config_smoke():
     assert torch.isfinite(loss)
     assert cond.shape == mel.shape
     assert pred.shape == mel.shape
-    assert model.training_compile_state == {"enabled": True, "fallback_active": False, "error": None}
+    assert model.training_compile_state == {
+        "enabled": True,
+        "target": "cfm_loss_core",
+        "fallback_active": False,
+        "error": None,
+    }
 
 
 @pytest.mark.skipif(
@@ -588,7 +934,12 @@ def test_cuda_inductor_real_config_matches_eager_across_compile_knobs(compile_kw
             assert compiled_grad is eager_grad, f"cuda real_config gradient None mismatch at parameter {index}"
         else:
             _assert_close(compiled_grad, eager_grad, f"cuda_real_config_grad_{index}", atol=1e-3, rtol=1e-3)
-    assert compiled_model.training_compile_state == {"enabled": True, "fallback_active": False, "error": None}
+    assert compiled_model.training_compile_state == {
+        "enabled": True,
+        "target": "cfm_loss_core",
+        "fallback_active": False,
+        "error": None,
+    }
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required for GPU torch.compile smoke test")
@@ -609,7 +960,12 @@ def test_cuda_inductor_training_loss_core_smoke():
     assert torch.isfinite(loss)
     assert cond.shape == mel.shape
     assert pred.shape == mel.shape
-    assert model.training_compile_state == {"enabled": True, "fallback_active": False, "error": None}
+    assert model.training_compile_state == {
+        "enabled": True,
+        "target": "cfm_loss_core",
+        "fallback_active": False,
+        "error": None,
+    }
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required for GPU inductor equivalence test")
@@ -650,7 +1006,12 @@ def test_cuda_inductor_matches_eager_loss_outputs_and_gradients_across_compile_k
             assert compiled_grad is eager_grad, f"cuda gradient None mismatch at parameter {index}"
         else:
             _assert_close(compiled_grad, eager_grad, f"cuda_grad_{index}", atol=1e-3, rtol=1e-3)
-    assert compiled_model.training_compile_state == {"enabled": True, "fallback_active": False, "error": None}
+    assert compiled_model.training_compile_state == {
+        "enabled": True,
+        "target": "cfm_loss_core",
+        "fallback_active": False,
+        "error": None,
+    }
 
 
 def test_runtime_fallback_can_be_enabled_or_disabled():
@@ -821,6 +1182,10 @@ def test_duration_predictor_scalar_is_logged_lazily_with_main_metrics():
 
 
 def test_cli_compile_flags_parse():
+    with patch.object(sys, "argv", ["prog"]):
+        args = parse_args()
+    assert args.compile_target == "auto"
+
     with patch.object(
         sys,
         "argv",
@@ -829,6 +1194,8 @@ def test_cli_compile_flags_parse():
             "--compile_enabled",
             "--compile_backend",
             "eager",
+            "--compile_target",
+            "dit_blocks",
             "--compile_mode",
             "reduce-overhead",
             "--compile_fullgraph",
@@ -841,6 +1208,7 @@ def test_cli_compile_flags_parse():
 
     assert args.compile_enabled is True
     assert args.compile_backend == "eager"
+    assert args.compile_target == "dit_blocks"
     assert args.compile_mode == "reduce-overhead"
     assert args.compile_fullgraph is True
     assert args.compile_dynamic == "true"
@@ -850,10 +1218,12 @@ def test_cli_compile_flags_parse():
 def test_all_training_configs_define_default_off_compile_block_without_metrics():
     for config_path in sorted((ROOT / "src/f5_tts/configs").glob("*.yaml")):
         config = yaml.safe_load(config_path.read_text())
+        expected_target = "cfm_loss_core" if config["model"]["backbone"] == "UNetT" else "dit_blocks"
         assert "compile" in config, config_path.name
         assert "metrics" not in config, config_path.name
         assert config["compile"] == {
             "enabled": False,
+            "target": expected_target,
             "backend": "inductor",
             "mode": None,
             "fullgraph": False,
@@ -871,6 +1241,7 @@ def test_compile_guard_rejects_average_upsampling_with_clear_value_error():
 
     assert model.training_compile_state == {
         "enabled": False,
+        "target": None,
         "fallback_active": False,
         "error": None,
     }
@@ -886,6 +1257,100 @@ def test_compile_guard_average_upsampling_eager_forward_still_works():
     assert cond.shape == mel.shape
     assert pred.shape == mel.shape
     assert model.training_compile_state["enabled"] is False
+
+
+def test_dit_blocks_compile_target_allows_average_upsampling_outside_compiled_region():
+    model = _build_model(average_upsampling=True)
+    mel, text, lens = _sample_batch(batch_size=2, frames=12, text_len=7, lens=[12, 8])
+
+    model.compile_training_core(target="dit_blocks", backend="eager", fullgraph=False, dynamic=None)
+    loss, cond, pred = model(mel, text=text, lens=lens)
+
+    assert torch.isfinite(loss)
+    assert cond.shape == mel.shape
+    assert pred.shape == mel.shape
+    assert model.training_compile_state["enabled"] is True
+    assert model.training_compile_state["target"] == "dit_blocks"
+
+
+def test_real_trainer_frame_dataset_dit_blocks_compile_runs_variable_shape_epoch(tmp_path, monkeypatch):
+    """Regression for compile bugs missed by direct CFM calls.
+
+    This uses the actual Trainer.train DataLoader path with DynamicBatchSampler and
+    collate_fn, variable mel/text lengths, string tokenization, optimizer/scheduler,
+    EMA checkpoint save, and target=dit_blocks compile setup after Accelerator.prepare.
+    """
+    from f5_tts.model import dataset as dataset_module
+    from f5_tts.model import trainer as trainer_module
+    from f5_tts.model.trainer import Trainer
+
+    monkeypatch.setattr(trainer_module, "tqdm", _SilentProgress)
+    monkeypatch.setattr(dataset_module, "tqdm", _SilentProgress)
+    torch.manual_seed(2026)
+
+    train_dataset = _PrecomputedMelDataset()
+    model = _build_model(
+        audio_drop_prob=1.0,
+        cond_drop_prob=1.0,
+        vocab_size=256,
+    )
+    trainer = Trainer(
+        model,
+        epochs=1,
+        learning_rate=1e-4,
+        num_warmup_updates=1,
+        save_per_updates=10**9,
+        keep_last_n_checkpoints=0,
+        checkpoint_path=str(tmp_path),
+        batch_size_per_gpu=20,
+        batch_size_type="frame",
+        max_samples=2,
+        grad_accumulation_steps=1,
+        max_grad_norm=1.0,
+        logger=None,
+        log_samples=False,
+        last_per_updates=10**9,
+        compile_enabled=True,
+        compile_backend="eager",
+        compile_target="dit_blocks",
+        compile_fullgraph=False,
+        compile_dynamic=None,
+        compile_fallback_to_eager=False,
+    )
+
+    module = cast(Any, trainer._unwrapped_model)
+    original_run_components = module._run_loss_core_components
+    seen_core_calls = []
+
+    def recording_run_components(*loss_args):
+        x1, text, _mask, _rand_span_mask, _x0, _time, drop_audio_cond, drop_text = loss_args
+        seen_core_calls.append(
+            {
+                "mel_shape": tuple(x1.shape),
+                "text_shape": tuple(text.shape),
+                "drop_audio_cond": bool(drop_audio_cond),
+                "drop_text": bool(drop_text),
+            }
+        )
+        return original_run_components(*loss_args)
+
+    object.__setattr__(module, "_run_loss_core_components", recording_run_components)
+
+    trainer.train(train_dataset, num_workers=0, resumable_with_seed=123)
+
+    assert trainer.compile_active is True
+    assert trainer.compile_fallback_active is False
+    assert module.training_compile_state == {
+        "enabled": True,
+        "target": "dit_blocks",
+        "fallback_active": False,
+        "error": None,
+    }
+    assert len(seen_core_calls) == 3
+    assert len({call["mel_shape"] for call in seen_core_calls}) > 1
+    assert len({call["text_shape"] for call in seen_core_calls}) > 1
+    assert all(call["drop_audio_cond"] and call["drop_text"] for call in seen_core_calls)
+    _assert_clean_checkpoint_state_dict(tmp_path / "model_last.pt")
 
 
 def test_compile_guard_default_off_path_still_compiles():
