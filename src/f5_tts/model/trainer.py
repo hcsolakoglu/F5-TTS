@@ -269,7 +269,7 @@ class Trainer:
                 self.compile_fallback_active = True
                 if self.is_main:
                     print("torch.compile is unavailable; falling back to eager training.")
-            any_failed = self._sync_compile_setup_ddp(local_failed=True)
+            self._sync_compile_setup_ddp(local_failed=True)
             if not self.compile_fallback_to_eager:
                 raise RuntimeError("torch.compile is unavailable in this PyTorch build")
             return
