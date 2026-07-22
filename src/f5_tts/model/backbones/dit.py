@@ -340,12 +340,15 @@ class DiT(nn.Module):
     def compile_training_target(self, target: str, **compile_kwargs):
         """Compile a regional DiT training target without changing module ownership.
 
-        ``target='dit_blocks'`` compiles each existing ``DiTBlock.forward`` callable and
-        stores the compiled callables on the owning DiT. The ``ModuleList`` and parameter
-        registration remain unchanged, avoiding ``_orig_mod`` checkpoint keys and
-        preserving Accelerate/DDP ownership. No ``block.forward`` is patched, so deep
-        copies, ``torch.save``, and multiprocessing spawn see ordinary pickleable modules
-        and deserialize to eager execution.
+        ``target='dit_blocks'`` compiles each existing ``DiTBlock``'s hook-aware
+        ``_call_impl`` and stores the compiled callables on the owning DiT. The
+        ``ModuleList`` and parameter registration remain unchanged, avoiding ``_orig_mod``
+        checkpoint keys and preserving Accelerate/DDP ownership. No ``block.forward`` is
+        patched, so deep copies, ``torch.save``, and multiprocessing spawn see ordinary
+        pickleable modules and deserialize to eager execution. Compiling ``_call_impl``
+        (the same mechanism ``nn.Module.compile`` uses) rather than the bare ``forward``
+        preserves forward pre/post hooks and full backward hooks exactly as in eager mode,
+        because ``_call_impl`` is nn.Module's hook-dispatch path.
         """
         if target != "dit_blocks":
             raise ValueError("DiT regional compile target must be 'dit_blocks'")
@@ -367,10 +370,19 @@ class DiT(nn.Module):
         object.__setattr__(self, "_compiled_dit_block_forwards", None)
 
     def _compile_each_dit_block(self, **compile_kwargs):
-        # Compile every block first; only commit the tuple to instance state once the
-        # whole list succeeds, so a partial failure leaves no compiled state behind.
+        # Compile each block's ``_call_impl`` rather than its bare ``forward``. ``_call_impl``
+        # is nn.Module's hook-aware dispatch: it runs forward pre/post hooks and wires full
+        # backward hooks (via BackwardHook) around ``forward``. Compiling it -- the same
+        # mechanism ``nn.Module.compile`` uses -- lets the owner-loop dispatch route through
+        # the compiled callable while preserving module hooks exactly as in eager mode.
+        # Compiling the bare ``forward`` instead would bypass ``_call_impl`` and silently
+        # drop every registered hook. ``block._compiled_call_impl`` is intentionally NOT set
+        # so eval/inference ``block(...)`` calls (which skip this training-gated dispatch)
+        # stay eager and never consume the training compile cache. Compile every block
+        # first; only commit the tuple to instance state once the whole list succeeds, so a
+        # partial failure leaves no compiled state behind.
         compiled_forwards = tuple(
-            torch.compile(block.forward, **compile_kwargs) for block in self.transformer_blocks
+            torch.compile(block._call_impl, **compile_kwargs) for block in self.transformer_blocks
         )
         object.__setattr__(self, "_compiled_dit_block_forwards", compiled_forwards)
         return compiled_forwards
@@ -388,11 +400,16 @@ class DiT(nn.Module):
             return x
 
         # Regional compile dispatch: route through the compiled per-block callables only
-        # while training. Inference (CFM.sample, logged samples) uses the eager path so its
-        # distinct shapes (cfg_infer-doubled batch, swept durations) never consume the
-        # training compile cache's per-code-object recompile budget. Dispatch lives in the
-        # owner loop rather than on each block.forward so modules stay unpatched, deepcopy-
-        # safe, and pickleable.
+        # while training. Each callable is a compiled ``block._call_impl``, so calling it
+        # fires forward pre/post hooks and full backward hooks exactly as an eager
+        # ``block(...)`` would -- the compiled graph includes nn.Module's hook-dispatch
+        # path, not just the bare forward. Inference (CFM.sample, logged samples) uses the
+        # eager path so its distinct shapes (cfg_infer-doubled batch, swept durations)
+        # never consume the training compile cache's per-code-object recompile budget, and
+        # because ``block._compiled_call_impl`` is never set, an eager ``block(...)`` never
+        # accidentally enters the compiled path. Dispatch lives in the owner loop rather
+        # than on each block.forward so modules stay unpatched, deepcopy-safe, and
+        # pickleable.
         compiled = self.__dict__.get("_compiled_dit_block_forwards")
         if compiled is not None and self.training:
             for compiled_forward in compiled:

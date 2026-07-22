@@ -570,6 +570,136 @@ def test_regional_dit_blocks_dispatch_uses_compiled_callable_in_train_mode(monke
     assert calls["n"] > before, "a new training shape must still dispatch through the compiled callable"
 
 
+def _attach_recording_hooks(block):
+    """Register forward pre/post and full backward hooks that record every firing.
+
+    Returns a dict of lists so a test can compare hook fire counts and captured
+    tensors between an eager and a compiled run. Hooks must be attached *before*
+    ``torch.compile`` so the compiled ``_call_impl`` graph traces them in.
+    """
+    records: dict[str, list[Any]] = {"fwd_pre": [], "fwd": [], "bwd": []}
+
+    def fwd_pre_hook(module, args):
+        records["fwd_pre"].append(len(args))
+
+    def fwd_hook(module, args, output):
+        records["fwd"].append(output.detach().clone())
+
+    def bwd_hook(module, grad_input, grad_output):
+        records["bwd"].append(tuple(g.detach().clone() if g is not None else None for g in grad_output))
+
+    block.register_forward_pre_hook(fwd_pre_hook)
+    block.register_forward_hook(fwd_hook)
+    block.register_full_backward_hook(bwd_hook)
+    return records
+
+
+def test_regional_dit_blocks_forward_and_backward_hooks_fire_as_eager():
+    """Forward pre/post hooks and full backward hooks must fire exactly as eager under regional compile.
+
+    Regression for the bare-``block.forward`` compile design: calling a compiled
+    ``block.forward`` directly from the owner loop bypasses ``nn.Module._call_impl``, so
+    none of the module hooks registered on the block fired. Compiling ``_call_impl``
+    instead (nn.Module's hook-dispatch path, the same mechanism ``nn.Module.compile``
+    uses) keeps the hook machinery inside the compiled graph. This test proves the
+    compiled dispatch fires forward pre-hooks, forward hooks, and full backward hooks
+    with the same counts and numerically equal captured tensors as the eager path.
+    """
+    eager_model = _randomize_zero_init_(_build_model())
+    compiled_model = copy.deepcopy(eager_model)
+    eager_model.train()
+    compiled_model.train()
+
+    eager_block = cast(Any, eager_model.transformer).transformer_blocks[0]
+    compiled_block = cast(Any, compiled_model.transformer).transformer_blocks[0]
+    eager_records = _attach_recording_hooks(eager_block)
+    compiled_records = _attach_recording_hooks(compiled_block)
+    # Attach before compile so the compiled _call_impl graph traces the hooks in.
+    compiled_model.compile_training_core(target="dit_blocks", backend="eager", fullgraph=False, dynamic=None)
+
+    mel, text, lens = _sample_batch(batch_size=3, frames=12, text_len=7, lens=[12, 8, 5])
+    prepared = cast(PreparedArgs, eager_model._prepare_training_inputs(mel.clone(), text.clone(), lens.clone()))
+    prepared_compiled = cast(
+        PreparedArgs,
+        tuple(arg.detach().clone() if torch.is_tensor(arg) else arg for arg in prepared),
+    )
+
+    eager_loss, _, eager_pred = eager_model._run_loss_core(*prepared)
+    eager_loss.backward()
+    compiled_loss, _, compiled_pred = compiled_model._run_loss_core(*prepared_compiled)
+    compiled_loss.backward()
+
+    _assert_parity_is_meaningful(eager_pred, eager_model)
+    # Hook fire counts match exactly: one forward pre, one forward, one full backward.
+    assert len(eager_records["fwd_pre"]) == len(compiled_records["fwd_pre"]) == 1
+    assert len(eager_records["fwd"]) == len(compiled_records["fwd"]) == 1
+    assert len(eager_records["bwd"]) == len(compiled_records["bwd"]) == 1
+    # Captured forward outputs and backward grad_outputs are numerically equal.
+    _assert_close(compiled_records["fwd"][0], eager_records["fwd"][0], "compiled_block_hook_forward_output")
+    _assert_close(compiled_records["bwd"][0][0], eager_records["bwd"][0][0], "compiled_block_hook_grad_output")
+    _assert_close(compiled_loss.detach(), eager_loss.detach(), "hook_parity_loss")
+
+    # Inference must still bypass the compiled path: with the model in eval mode, the
+    # training-gated dispatch falls through to eager ``block(...)`` and the compiled
+    # callable is never invoked, so hooks fire through the eager path only once more.
+    compiled_model.eval()
+    before_fwd = len(compiled_records["fwd"])
+    with torch.no_grad():
+        compiled_model._run_loss_core(*prepared_compiled)
+    assert len(compiled_records["fwd"]) == before_fwd + 1, "eval-mode forward must still fire hooks via the eager path"
+    assert len(compiled_records["bwd"]) == 1, "no-grad eval forward must not add a backward hook firing"
+
+
+def test_regional_dit_blocks_hook_preservation_keeps_blocks_deepcopy_and_pickle_safe():
+    """Compiling ``_call_impl`` must not leave unpickleable state on the blocks.
+
+    The design never sets ``block._compiled_call_impl`` (which would make eval/inference
+    ``block(...)`` accidentally enter the compiled path); the compiled callables live
+    only in the DiT-owned ``_compiled_dit_block_forwards`` tuple, stripped by
+    ``__getstate__``. This asserts the blocks stay free of compile state so deepcopy and
+    ``torch.save``/``load`` deserialize to eager modules that still support hooks.
+    """
+    model = _build_model()
+    model.compile_training_core(target="dit_blocks", backend="eager", fullgraph=False, dynamic=None)
+    transformer = cast(Any, model.transformer)
+    # The hook-preservation design compiles _call_impl without setting _compiled_call_impl
+    # on the blocks, so blocks carry no compiled closure and stay pickleable.
+    for block in transformer.transformer_blocks:
+        assert block._compiled_call_impl is None
+        assert "forward" not in block.__dict__
+
+    # deepcopy strips the DiT-owned compiled tuple; the copy is eager and hooks fire eager.
+    copied = copy.deepcopy(model)
+    copied_transformer = cast(Any, copied.transformer)
+    assert copied_transformer._compiled_dit_block_forwards is None
+    for block in copied_transformer.transformer_blocks:
+        assert block._compiled_call_impl is None
+    copied_records = _attach_recording_hooks(copied_transformer.transformer_blocks[0])
+    copied.train()
+    mel, text, lens = _sample_batch()
+    prepared = cast(PreparedArgs, copied._prepare_training_inputs(mel.clone(), text.clone(), lens.clone()))
+    loss, _, _ = copied._run_loss_core(*prepared)
+    loss.backward()
+    assert len(copied_records["fwd"]) == 1 and len(copied_records["bwd"]) == 1, "deep-copied eager model must fire hooks"
+
+    # torch.save/load deserializes eager; hooks attached post-load fire eager.
+    buf = io.BytesIO()
+    torch.save(model, buf)
+    buf.seek(0)
+    loaded = torch.load(buf, weights_only=False)
+    loaded_transformer = cast(Any, loaded.transformer)
+    assert loaded_transformer._compiled_dit_block_forwards is None
+    for block in loaded_transformer.transformer_blocks:
+        assert block._compiled_call_impl is None
+    loaded_records = _attach_recording_hooks(loaded_transformer.transformer_blocks[0])
+    loaded.train()
+    prepared_loaded = cast(PreparedArgs, loaded._prepare_training_inputs(mel.clone(), text.clone(), lens.clone()))
+    loaded_loss, _, _ = loaded._run_loss_core(*prepared_loaded)
+    loaded_loss.backward()
+    assert torch.isfinite(loaded_loss)
+    assert len(loaded_records["fwd"]) == 1 and len(loaded_records["bwd"]) == 1, "loaded eager model must fire hooks"
+
+
 def test_loss_core_components_preserve_public_forward_contract():
     model = _build_model()
     mel, text, lens = _sample_batch(batch_size=2, frames=12, text_len=7, lens=[12, 8])
