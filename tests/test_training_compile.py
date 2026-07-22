@@ -2947,15 +2947,31 @@ def _upstream_reference_loss(pred, flow, rand_span_mask):
 
 
 def _base_commit_forward(model, mel, text, lens):
-    """Verbatim transcription of ``CFM.forward`` from base commit 2ae2c9b (compile-disabled).
+    """Transcribe the CFM forward *orchestration* from base commit 2ae2c9b (compile-disabled).
 
-    Pinned to SWivid/F5-TTS 2ae2c9b ``src/f5_tts/model/cfm.py`` lines 231-302. This is the
-    behaviour users who never enabled compile must reproduce bit-for-bit. Any divergence
-    between this and the current default path is a real parity regression.
+    Pinned to SWivid/F5-TTS 2ae2c9b ``src/f5_tts/model/cfm.py`` lines 231-302.
+
+    Scope -- what this does and does not prove:
+      * It transcribes the CFM-level orchestration only: stochastic input preparation
+        (frac_lengths -> rand_span_mask, x0/time sampling, cond construction, bool CFG
+        drop decisions) and the ``loss[rand_span_mask].mean()`` reduction.
+      * It calls ``model.transformer`` -- the *current* DiT/UNetT implementation -- not a
+        frozen base-commit transformer. Both this oracle and the current default path
+        share the same transformer, so the transformer tree (TextEmbedding,
+        InputEmbedding, DiTBlock, attention, projections) is a held constant, not a
+        variable under test. This oracle therefore cannot detect a divergence between
+        the current transformer and the base-commit transformer; it only proves the
+        CFM orchestration wrapping it is unchanged.
+      * Full-tree base parity (TextEmbedding/InputEmbedding/block internals) is out of
+        scope here and is not claimed. Vendoring a frozen base-commit transformer would
+        add that coverage but at large maintenance/drift cost for a regression surface
+        already covered by the dedicated backbone tests in this file.
 
     Differences from the current ``_prepare_training_inputs`` + ``_run_loss_core`` path
     that this transcription preserves:
-      * Bool CFG drop flags (base) vs 0-D bool tensors (current DiT path).
+      * Bool CFG drop flags (base) vs 0-D bool tensors (current DiT path) -- but only
+        when a compile target is active; the compile-disabled default path this oracle
+        compares against also uses bool flags, so the flag dtype is not a variable here.
       * Inline stochastic preparation with no compile-friendly split.
       * ``loss[rand_span_mask].mean()`` reduction (no masked-multiply reassociation).
 
@@ -3015,19 +3031,28 @@ def _base_commit_forward(model, mel, text, lens):
 
 
 def test_default_path_matches_base_commit_forward_end_to_end():
-    """The compile-disabled default path must be bit-for-bit identical to base 2ae2c9b.
+    """The compile-disabled default path's CFM orchestration must match base 2ae2c9b.
 
     The previous parity test compared the new path's prediction against itself (it fed the
-    same ``pred`` into a reduction helper), so changes to TextEmbedding, InputEmbedding,
-    CFG handling, or stochastic input preparation could alter predictions while the test
-    stayed green. This replacement runs a transcribed base-commit forward and the current
-    default path (``_prepare_training_inputs`` + ``_run_loss_core``) from identical model
-    state and RNG state, then asserts bitwise equality of predictions, conditioning, loss,
-    and the span mask end-to-end.
+    same ``pred`` into a reduction helper), so changes to the stochastic input preparation
+    or the loss reduction could alter outputs while the test stayed green. This replacement
+    runs a transcribed base-commit CFM orchestration and the current default path
+    (``_prepare_training_inputs`` + ``_run_loss_core``) from identical model state and RNG
+    state, then asserts bitwise equality of predictions, conditioning, loss, and the span
+    mask end-to-end.
+
+    Scope: both paths call the *same* ``model.transformer``, so this proves the CFM-level
+    orchestration (stochastic preparation, cond construction, reduction form) is unchanged
+    -- not full-tree base parity. A divergence in TextEmbedding/InputEmbedding/block
+    internals would change both paths equally and stay green here; that regression surface
+    is covered by the dedicated backbone tests (e.g. ``test_dit_text_embed_*``,
+    ``test_branchless_tensor_cfg_flags_match_bool_loss_outputs_and_gradients``) rather than
+    by this orchestration oracle.
 
     With ``audio_drop_prob=cond_drop_prob=0`` the Python ``random()`` drop decisions are
-    deterministic, so the only behavioural difference between the two paths is bool vs
-    0-D-tensor CFG flags -- exactly the surface this test is meant to verify.
+    deterministic, and the compile-disabled default path keeps bool CFG flags, so the two
+    paths exercise identical flag dtypes -- the only remaining variable is the orchestration
+    split, which is exactly what this test verifies.
     """
     model = _build_model()
     for seed in range(8):
@@ -3051,40 +3076,6 @@ def test_default_path_matches_base_commit_forward_end_to_end():
         assert torch.equal(new_pred, base_pred), f"seed {seed}: pred diverged"
         assert torch.equal(new_cond, base_cond), f"seed {seed}: cond diverged"
         assert torch.equal(new_loss, base_loss), f"seed {seed}: loss diverged"
-
-
-def test_default_path_tensor_cfg_flags_match_bool_flags_eager():
-    """The tensor CFG flag conversion must not change eager DiT behaviour.
-
-    The current default path converts bool drop flags to 0-D bool tensors for DiT
-    (``supports_tensor_cfg_training_flags``) so torch.compile sees branchless inputs.
-    In eager mode this must be observationally identical to the base-commit bool flags.
-    This isolates that one difference from the end-to-end test above by forcing the new
-    path to use bool flags and comparing against the tensor-flag default.
-    """
-    model = _build_model()
-    torch.manual_seed(0)
-    mel = torch.randn(3, 37, 8)
-    text = torch.randint(0, 32, (3, 11))
-    lens = torch.tensor([37, 29, 33])
-
-    torch.manual_seed(0)
-    prepared_tensor = cast(PreparedArgs, model._prepare_training_inputs(mel, text, lens))
-    loss_tensor, _cond_t, pred_tensor = model._run_loss_core(*prepared_tensor)
-
-    # Force the base-commit bool-flag path by disabling the tensor-flag capability on the
-    # transformer for this call only; restore it immediately after.
-    original = getattr(model.transformer, "supports_tensor_cfg_training_flags", False)
-    object.__setattr__(model.transformer, "supports_tensor_cfg_training_flags", False)
-    try:
-        torch.manual_seed(0)
-        prepared_bool = cast(PreparedArgs, model._prepare_training_inputs(mel, text, lens))
-        loss_bool, _cond_b, pred_bool = model._run_loss_core(*prepared_bool)
-    finally:
-        object.__setattr__(model.transformer, "supports_tensor_cfg_training_flags", original)
-
-    assert torch.equal(pred_tensor, pred_bool), "tensor CFG flags changed eager DiT predictions"
-    assert torch.equal(loss_tensor, loss_bool), "tensor CFG flags changed eager loss"
 
 
 def test_compiled_reduction_is_close_but_not_required_to_be_bitwise_equal():
