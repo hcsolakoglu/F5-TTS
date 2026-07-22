@@ -3075,8 +3075,8 @@ def test_max_padded_frames_vocos_cap_rejects_what_old_ceil_admitted():
 # ``get_frame_len`` budgets on the float ratio ``n_src * tgt / src / hop``, but
 # ``torchaudio.transforms.Resample`` emits ``ceil(n_src * tgt / src)`` samples -- up to
 # one sample more than the ratio. That extra sample can cross a hop boundary and add a
-# whole mel frame, so a ``floor(frame_len)``-based cap is violated on ~1.5% of resampled
-# clips. The fix uses ``ceil(frame_len)`` (bigvgan) / ``ceil(frame_len) + 1`` (vocos),
+# whole mel frame, so a ``floor(frame_len)``-based cap can be violated. The fix uses
+# ``ceil(frame_len)`` (bigvgan) / ``ceil(frame_len) + 1`` (vocos),
 # which absorbs the rounding. These tests run the *real* torchaudio resampler and mel
 # frontends as the oracle, not the sampler's own formula.
 
@@ -3085,7 +3085,7 @@ _RESAMPLE_CASES = [
     (5461, 16000),  # the reported case: 8191.5 -> 8192 samples, crosses a hop boundary
     (3333, 22050),  # 22.05k -> 24k, non-integer ratio
     (12345, 48000),  # 48k -> 24k, half-rate
-    (7000, 24000),  # same rate, no resampling -- bound must still hold (ceil == floor)
+    (7000, 24000),  # same rate, no resampling -- bound may conservatively exceed the width
 ]
 
 

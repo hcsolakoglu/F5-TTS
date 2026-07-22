@@ -181,11 +181,11 @@ def padded_mel_frames(frame_len: float, mel_spec_type: str) -> int:
     emits ``ceil(n_source * target_rate / source_rate)`` samples, which can be up to one
     sample more than the float ratio ``get_frame_len`` budgets on. That extra sample can
     cross a hop boundary and add a whole mel frame, so a ``floor(frame_len)``-based cap
-    is violated (empirically ~1.5% of resampled clips across common 16k/22.05k/48k ->
-    24k pairs). ``ceil(frame_len)`` absorbs the resampling rounding and is a tight,
+    can be violated. ``ceil(frame_len)`` absorbs the resampling rounding and is a tight,
     never-under estimate (max one frame of slack). At exact hop multiples
-    (``frame_len`` integral, including same-rate / direct-target-rate audio where no
-    resampling happens) ``ceil == floor`` so the bound is exact there.
+    (``frame_len`` integral) ``ceil == floor`` so the bound is exact. For same-rate
+    clips whose sample count is not a hop multiple, the bound may be one frame
+    conservative.
 
     vocos uses ``torchaudio.MelSpectrogram(center=True)``, whose output width is
     ``1 + floor(n_samples / hop_length)``; the bound is ``ceil(frame_len) + 1``.
