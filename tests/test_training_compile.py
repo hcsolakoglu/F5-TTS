@@ -2589,6 +2589,12 @@ def test_max_padded_frames_vocos_cap_rejects_what_old_ceil_admitted():
     assert any("max_padded_frames" in m and "dropped" in m for m in messages), messages
 
 
+def _upstream_reference_loss(pred, flow, rand_span_mask):
+    """Return the exact masked-mean reduction used by upstream commit 2ae2c9b."""
+    loss = torch.nn.functional.mse_loss(pred, flow, reduction="none")
+    return loss[rand_span_mask].mean()
+
+
 def _base_commit_forward(model, mel, text, lens):
     """Verbatim transcription of ``CFM.forward`` from base commit 2ae2c9b (compile-disabled).
 
