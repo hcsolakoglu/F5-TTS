@@ -774,6 +774,147 @@ def test_loss_sum_gradient_scaling_accounts_for_ddp_gradient_average():
         _assert_close(current_param.grad, correct_param.grad, "ddp_scaled_grad", atol=1e-6, rtol=1e-6)
 
 
+def test_scale_gradients_by_loss_denom_uses_python_float_not_grad_dtype():
+    """The normalisation scalar must not be pre-cast to the gradient dtype.
+
+    Under fp16 AMP, casting a small scale (e.g. 1e-6) to fp16 flushes it to a subnormal
+    with zero precision bits or to zero, corrupting the gradient. The fix applies the
+    scale as a Python float so the ATen kernel handles it at full precision and only the
+    result is rounded back to the tensor dtype.
+    """
+    from f5_tts.model.trainer import Trainer
+
+    # Simulate an fp16 gradient: use an fp16 model so .grad is naturally fp16.
+    model = torch.nn.Linear(4, 4, bias=False).half()
+    model.weight.grad = torch.full_like(model.weight, 1.0)  # fp16, matches param dtype
+    grad_before = model.weight.grad.clone()
+
+    trainer = Trainer.__new__(Trainer)
+    trainer.model = cast(Any, model)
+    trainer.grad_accumulation_steps = 1
+    trainer.accelerator = cast(Any, _FakeReduceAccelerator(num_processes=1))
+
+    # global_denom large enough that scale ~ 1e-6 would flush to fp16 subnormal/zero.
+    global_denom = torch.tensor(1_000_000.0)
+    trainer._scale_gradients_by_loss_denom(global_denom)
+
+    # If the scale were pre-cast to fp16, 1e-6 becomes a subnormal with ~0 precision,
+    # and the multiply could produce zero or a severely rounded result. With a Python
+    # float, the result is 1.0 * 1e-6 = 1e-6, stored back as fp16 (representable as
+    # subnormal ~9.98e-7, nonzero).
+    assert model.weight.grad is not None
+    assert torch.count_nonzero(model.weight.grad) > 0, "scale was flushed to zero by dtype pre-cast"
+    expected = grad_before.float() * (1.0 / 1_000_000.0)
+    _assert_close(model.weight.grad.float(), expected, "fp16_scaled_grad", atol=1e-7, rtol=1e-6)
+
+
+def test_global_masked_mean_rejects_deepspeed_zero():
+    """global_masked_mean=True must fail fast when a DeepSpeed/ZeRO plugin is active.
+
+    Post-backward per-parameter .grad scaling is a silent no-op under ZeRO-2/3 (partitioned
+   /freed .grad), so gradients would be applied ~global_denom/(G*W) times too large. The
+    guard must raise NotImplementedError at construction, not corrupt training silently.
+    """
+    from f5_tts.model.trainer import Trainer
+
+    trainer = Trainer.__new__(Trainer)
+
+    # Simulate a DeepSpeed plugin on the accelerator state.
+    class _FakeState:
+        deepspeed_plugin = object()  # non-None → DeepSpeed/ZeRO active
+
+    class _FakeAccelerator:
+        state = _FakeState()
+
+    trainer.accelerator = cast(Any, _FakeAccelerator())
+
+    with pytest.raises(NotImplementedError, match="DeepSpeed/ZeRO"):
+        trainer._reject_sharded_grad_backend_for_global_masked_mean()
+
+
+def test_global_masked_mean_allows_non_deepspeed_backend():
+    """global_masked_mean=True must be accepted when no DeepSpeed plugin is active."""
+    from f5_tts.model.trainer import Trainer
+
+    trainer = Trainer.__new__(Trainer)
+
+    class _FakeState:
+        deepspeed_plugin = None
+
+    class _FakeAccelerator:
+        state = _FakeState()
+
+    trainer.accelerator = cast(Any, _FakeAccelerator())
+
+    # Must not raise.
+    trainer._reject_sharded_grad_backend_for_global_masked_mean()
+
+
+def test_sync_compile_setup_ddp_uses_accelerator_reduce_max():
+    """_sync_compile_setup_ddp must use accelerator.reduce('max'), not torch.distributed.
+
+    This verifies the collective goes through Accelerate's dispatch layer (handles
+    DeepSpeed/FSDP process groups) and that the return value correctly reflects whether
+    any rank failed. Uses a fake accelerator to avoid real process groups.
+    """
+    from f5_tts.model.trainer import Trainer
+
+    class _FakeReduceAcceleratorMax:
+        def __init__(self, *, num_processes, reduced_flag):
+            self.num_processes = num_processes
+            self._reduced_flag = reduced_flag
+            self.reduce_calls: list[str] = []
+            self.device = torch.device("cpu")
+
+        def reduce(self, tensor, reduction="sum"):
+            self.reduce_calls.append(reduction)
+            return self._reduced_flag.to(tensor.device) if self._reduced_flag is not None else tensor
+
+        @property
+        def is_main_process(self):
+            return True
+
+    # Case 1: this rank failed (fallback mode), collective returns max=1.0 → any_failed=True.
+    fake = _FakeReduceAcceleratorMax(num_processes=2, reduced_flag=torch.tensor(1.0))
+    trainer = Trainer.__new__(Trainer)
+    trainer.accelerator = cast(Any, fake)
+    trainer.compile_fallback_active = True
+    trainer.compile_active = False
+    trainer._unwrapped_model = cast(Any, type("M", (), {"clear_training_compile": lambda self: None})())
+    any_failed = trainer._sync_compile_setup_ddp()
+    assert any_failed is True
+    assert fake.reduce_calls == ["max"], f"expected reduce('max'), got {fake.reduce_calls}"
+
+    # Case 2: no rank failed, collective returns max=0.0 → any_failed=False.
+    fake = _FakeReduceAcceleratorMax(num_processes=2, reduced_flag=torch.tensor(0.0))
+    trainer = Trainer.__new__(Trainer)
+    trainer.accelerator = cast(Any, fake)
+    trainer.compile_fallback_active = False
+    trainer.compile_active = True
+    any_failed = trainer._sync_compile_setup_ddp()
+    assert any_failed is False
+    assert fake.reduce_calls == ["max"]
+
+    # Case 3: strict-mode failure via local_failed (compile_fallback_active stays False).
+    fake = _FakeReduceAcceleratorMax(num_processes=2, reduced_flag=torch.tensor(1.0))
+    trainer = Trainer.__new__(Trainer)
+    trainer.accelerator = cast(Any, fake)
+    trainer.compile_fallback_active = False
+    trainer.compile_active = False
+    any_failed = trainer._sync_compile_setup_ddp(local_failed=True)
+    assert any_failed is True
+    assert fake.reduce_calls == ["max"]
+
+    # Case 4: single-process returns local flag directly, no collective.
+    fake = _FakeReduceAcceleratorMax(num_processes=1, reduced_flag=None)
+    trainer = Trainer.__new__(Trainer)
+    trainer.accelerator = cast(Any, fake)
+    trainer.compile_fallback_active = True
+    any_failed = trainer._sync_compile_setup_ddp()
+    assert any_failed is True
+    assert fake.reduce_calls == [], "single-process must not call reduce"
+
+
 def test_compiled_loss_core_handles_cfg_branches_and_empty_mask():
     model = _build_model()
     model.compile_training_core(backend="eager", fullgraph=False, dynamic=None)
@@ -2153,8 +2294,8 @@ def test_compile_guard_blocks_cuda_inductor_for_average_upsampling():
 # ---------------------------------------------------------------------------
 
 
-def test_trainer_global_masked_mean_defaults_false_and_gates_backward_path():
-    """Default preserves old per-microbatch mean backward; opt-in enables loss_sum path."""
+def test_trainer_global_masked_mean_defaults_false():
+    """The flag must default to False (opt-in, not default behaviour)."""
     import inspect
 
     from f5_tts.model.trainer import Trainer
@@ -2162,14 +2303,219 @@ def test_trainer_global_masked_mean_defaults_false_and_gates_backward_path():
     sig = inspect.signature(Trainer.__init__)
     assert sig.parameters["global_masked_mean"].default is False
 
-    source = inspect.getsource(Trainer.train)
-    # Opt-in path backprops loss_sum and rescales by global denominator.
-    assert "self.accelerator.backward(loss_sum)" in source
-    assert "self._scale_gradients_by_loss_denom(global_loss_denom)" in source
-    # Default path backprops the per-microbatch mean loss, not loss_sum.
-    assert "self.accelerator.backward(loss)" in source
-    # The branch is gated on the flag, not unconditional.
-    assert "if self.global_masked_mean:" in source
+
+class _TwoSampleDataset(torch.utils.data.Dataset):
+    """Four samples with different mel lengths so masked-frame denoms differ."""
+
+    def __init__(self):
+        gen = torch.Generator().manual_seed(2026)
+        self.lengths = [8, 12, 16, 20]
+        self.texts = ["ab", "cde", "abcdef", "long text"]
+        self.mels = [torch.randn(8, f, generator=gen) for f in self.lengths]
+
+    def __len__(self):
+        return len(self.mels)
+
+    def get_frame_len(self, index):
+        return self.lengths[index]
+
+    def __getitem__(self, index):
+        return {"mel_spec": self.mels[index], "text": self.texts[index]}
+
+
+def _run_trainer_one_update(global_masked_mean, tmp_path, monkeypatch):
+    """Run a real Trainer.train loop for two updates; return wiring + gradient evidence.
+
+    Uses 4 samples with batch_size=1 and grad_accumulation_steps=2 → 2 updates, which
+    avoids the LinearLR ZeroDivisionError that occurs with total_updates == warmup_updates.
+    Gradients are captured at each sync_gradients (before zero_grad clears them).
+    """
+    from f5_tts.model import trainer as trainer_module
+    from f5_tts.model.trainer import Trainer
+
+    monkeypatch.setattr(trainer_module, "tqdm", _SilentProgress)
+
+    torch.manual_seed(2026)
+    model = _build_model(vocab_size=256)
+    dataset = _TwoSampleDataset()
+
+    backward_vals: list[float] = []
+    scale_calls: list[float] = []
+    component_vals: list[tuple[float, float, float]] = []
+    captured_grads: list[list[torch.Tensor | None]] = []
+
+    trainer = Trainer(
+        model,
+        epochs=1,
+        learning_rate=0.0,
+        num_warmup_updates=1,
+        save_per_updates=10**9,
+        keep_last_n_checkpoints=0,
+        checkpoint_path=str(tmp_path / f"ckpt_{global_masked_mean}"),
+        batch_size_per_gpu=1,
+        batch_size_type="sample",
+        grad_accumulation_steps=2,
+        max_grad_norm=0.0,
+        logger=None,
+        log_samples=False,
+        last_per_updates=10**9,
+        compile_enabled=False,
+        global_masked_mean=global_masked_mean,
+    )
+
+    # Record what backward receives.
+    original_backward = trainer.accelerator.backward
+
+    def recording_backward(loss, **kwargs):
+        backward_vals.append(float(loss.detach().item()))
+        return original_backward(loss, **kwargs)
+
+    trainer.accelerator.backward = recording_backward
+
+    # Record loss components (only called on the return_loss_components=True path).
+    module = cast(Any, trainer._unwrapped_model)
+    original_run = module._run_loss_core_components
+
+    def recording_run(*args):
+        result = original_run(*args)
+        component_vals.append(
+            (float(result[0].detach().item()), float(result[1].detach().item()), float(result[2].detach().item()))
+        )
+        return result
+
+    object.__setattr__(module, "_run_loss_core_components", recording_run)
+
+    # Record scaler calls.
+    original_scale = trainer._scale_gradients_by_loss_denom
+
+    def recording_scale(global_loss_denom):
+        scale_calls.append(float(global_loss_denom.item()))
+        return original_scale(global_loss_denom)
+
+    trainer._scale_gradients_by_loss_denom = recording_scale
+
+    # Capture grads before zero_grad clears them (only at sync_gradients).
+    original_zero_grad = trainer.optimizer.zero_grad
+
+    def capturing_zero_grad(*args, **kwargs):
+        if trainer.accelerator.sync_gradients:
+            captured_grads.append(
+                [p.grad.detach().clone() if p.grad is not None else None for p in trainer._unwrapped_model.parameters()]
+            )
+        return original_zero_grad(*args, **kwargs)
+
+    trainer.optimizer.zero_grad = capturing_zero_grad
+
+    # Seed global RNG identically for both runs so forward passes match.
+    torch.manual_seed(42)
+    trainer.train(dataset, num_workers=0, resumable_with_seed=123)
+
+    return backward_vals, scale_calls, component_vals, captured_grads
+
+
+def test_trainer_train_global_masked_mean_wiring_through_real_loop(tmp_path, monkeypatch):
+    """Replace source-grep: drive a real Trainer.train loop and verify branch wiring.
+
+    With global_masked_mean=True the loop must backpropagate loss_sum and call
+    _scale_gradients_by_loss_denom at sync_gradients. With False it must backpropagate
+    the mean loss and never call the scaler. Gradients must differ between the two
+    paths (proving the flag changes the objective, not just the source text).
+    """
+    bw_true, scale_true, comp_true, grads_true = _run_trainer_one_update(True, tmp_path, monkeypatch)
+    bw_false, scale_false, _comp_false, grads_false = _run_trainer_one_update(False, tmp_path, monkeypatch)
+
+    # 4 microbatches (4 samples, batch_size=1) → 2 updates (grad_accum=2).
+    assert len(bw_true) == 4
+    assert len(bw_false) == 4
+
+    # True path: backward receives loss_sum (component[1]), not loss (component[0]).
+    assert len(comp_true) == 4, "_run_loss_core_components must be called on the True path"
+    for bw_val, (_loss, loss_sum, _denom) in zip(bw_true, comp_true, strict=True):
+        assert bw_val == loss_sum, f"True path should backprop loss_sum ({loss_sum}), got {bw_val}"
+
+    # False path: backward receives the mean loss (not loss_sum). The False path uses
+    # _forward_loss_core_upstream_exact (not _run_loss_core_components), so comp_false is
+    # empty; the scaler-not-called + gradient-difference assertions below cover this.
+    assert len(scale_false) == 0, "False path must not call _scale_gradients_by_loss_denom"
+
+    # True path calls scaler at each sync_gradients (2 updates → 2 calls); False never.
+    assert len(scale_true) == 2, "True path must call _scale_gradients_by_loss_denom at each sync"
+    assert len(scale_false) == 0
+
+    # Gradients captured at each sync (2 updates → 2 captures).
+    assert len(grads_true) == 2 and len(grads_false) == 2
+
+    # Gradients differ at the first update: the flag changes the objective.
+    any_differ = False
+    for g_true, g_false in zip(grads_true[0], grads_false[0], strict=True):
+        if g_true is not None and g_false is not None:
+            if not torch.allclose(g_true, g_false, atol=1e-6, rtol=1e-6):
+                any_differ = True
+                break
+    assert any_differ, (
+        "global_masked_mean=True and False produced identical gradients; "
+        "the flag has no behavioural effect"
+    )
+
+
+def test_trainer_train_global_masked_mean_true_gradients_match_global_mean_reference(tmp_path, monkeypatch):
+    """The True path through real Trainer.train produces grad(total_loss_sum/total_denom).
+
+    Replays the same forward passes (same seed, same data, same model weights) outside the
+    Trainer and compares gradients for the first update. This is the end-to-end integration
+    counterpart to the toy formula tests (test_loss_sum_gradient_scaling_*).
+    """
+    bw_true, scale_true, comp_true, grads_true = _run_trainer_one_update(True, tmp_path, monkeypatch)
+
+    # 4 microbatches → 2 updates; compare the first update (first 2 microbatches).
+    assert len(comp_true) == 4
+    assert len(scale_true) == 2
+    assert len(grads_true) == 2
+
+    # Rebuild the same model (same seed → same weights) and replay the forward passes
+    # with the same global RNG seed to get identical loss_sum/denom, then backprop the
+    # global mean reference for the first update: grad(total_loss_sum / total_denom).
+    torch.manual_seed(2026)
+    ref_model = _build_model(vocab_size=256)
+    # Match the Trainer's device (gradients were captured on the accelerator's device).
+    ref_device = next(g.device for g in grads_true[0] if g is not None)
+    ref_model = ref_model.to(ref_device)
+    ref_model.train()
+
+    # Match the Trainer's DataLoader: same dataset, same batch_size, same generator seed.
+    from torch.utils.data import DataLoader
+
+    from f5_tts.model.dataset import collate_fn
+
+    dataset = _TwoSampleDataset()
+    generator = torch.Generator()
+    generator.manual_seed(123)
+    ref_loader = DataLoader(
+        dataset, collate_fn=collate_fn, num_workers=0, batch_size=1, shuffle=True, generator=generator
+    )
+
+    torch.manual_seed(42)  # same seed as _run_trainer_one_update uses before trainer.train
+
+    # Replay only the first 2 microbatches (first update).
+    total_loss_sum = torch.zeros((), device=ref_device)
+    total_denom = torch.zeros((), device=ref_device)
+    for batch, _ in zip(ref_loader, range(2)):
+        mel_spec = batch["mel"].permute(0, 2, 1).to(ref_device)
+        mel_lengths = batch["mel_lengths"].to(ref_device)
+        _loss, loss_sum, denom, _cond, _pred = ref_model(
+            mel_spec, text=batch["text"], lens=mel_lengths, return_loss_components=True
+        )
+        total_loss_sum = total_loss_sum + loss_sum
+        total_denom = total_denom + denom.detach()
+
+    # Global mean reference: grad(total_loss_sum / total_denom).
+    ref_model.zero_grad(set_to_none=True)
+    (total_loss_sum / total_denom).backward()
+
+    # Compare Trainer's first-update gradients to the reference.
+    for g_trainer, ref_p in zip(grads_true[0], ref_model.parameters(), strict=True):
+        if g_trainer is not None and ref_p.grad is not None:
+            _assert_close(g_trainer, ref_p.grad, "global_mean_grad", atol=1e-5, rtol=1e-5)
 
 
 def test_default_loss_path_gradient_matches_average_of_means_not_global_mean():

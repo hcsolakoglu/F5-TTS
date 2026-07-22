@@ -90,6 +90,13 @@ class Trainer:
             **accelerate_kwargs,
         )
 
+        # global_masked_mean backpropagates raw loss_sum and rescales parameter.grad
+        # after backward (see _scale_gradients_by_loss_denom). DeepSpeed/ZeRO partitions
+        # or frees .grad after backward, making that per-parameter scaling a silent no-op
+        # and applying gradients ~global_denom/(G*W) times too large. Reject explicitly.
+        if global_masked_mean:
+            self._reject_sharded_grad_backend_for_global_masked_mean()
+
         self.logger = logger
         if self.logger == "wandb":
             if exists(wandb_resume_id):
@@ -171,6 +178,11 @@ class Trainer:
         # global masked-frame denominator across accumulation windows and DDP ranks, so
         # every masked frame is weighted equally. When disabled (default) the trainer
         # preserves the historical per-microbatch mean-loss backward (average-of-means).
+        # Incompatible with DeepSpeed/ZeRO (rejected at construction): post-backward
+        # per-parameter .grad scaling requires unpartitioned gradients. AMP-safe: the
+        # loss core accumulates in fp32 and the normalisation scalar is a Python float
+        # (not pre-cast to the gradient dtype), so fp16 subnormal flush cannot corrupt
+        # the scale.
         self.global_masked_mean = global_masked_mean
         # Optional cap on the padded batch rectangle for batch_size_type="frame".
         # 0 (default) keeps upstream batch composition exactly; see DynamicBatchSampler.
@@ -213,6 +225,24 @@ class Trainer:
 
     # ---- torch.compile support (optional, default-off) ----
 
+    def _reject_sharded_grad_backend_for_global_masked_mean(self):
+        """Reject DeepSpeed/ZeRO when global_masked_mean is enabled.
+
+        ``_scale_gradients_by_loss_denom`` iterates ``self.model.parameters()`` and
+        multiplies ``parameter.grad`` in-place after ``accelerator.backward``. DeepSpeed
+        ZeRO-2/3 partitions or frees ``.grad`` after backward, so the loop becomes a
+        silent no-op and gradients are applied ``global_denom / (G * world_size)`` times
+        too large. This must fail fast rather than corrupt training silently.
+        """
+        plugin = getattr(self.accelerator.state, "deepspeed_plugin", None)
+        if plugin is not None:
+            raise NotImplementedError(
+                "global_masked_mean=True is incompatible with DeepSpeed/ZeRO: "
+                "post-backward per-parameter .grad scaling requires unpartitioned "
+                "gradients, but DeepSpeed partitions/frees .grad after backward. "
+                "Use global_masked_mean=False (default) with DeepSpeed."
+            )
+
     def _configure_compile(self):
         """Set up torch.compile on the CFM loss core if enabled.
 
@@ -221,18 +251,28 @@ class Trainer:
         In DDP (num_processes > 1) runtime fallback is disabled: a per-rank eager fallback
         would desynchronise the gradient all-reduce. Setup-time fallback is still allowed
         and synchronised across ranks via ``_sync_compile_setup_ddp``.
+
+        Strict mode (``compile_fallback_to_eager=False``): a rank-local setup exception is
+        deferred until *every* rank has participated in the status collective
+        (``_sync_compile_setup_ddp``), then all ranks raise coherently -- the failing rank
+        re-raises its original exception, peers raise a collective-failure error. This
+        prevents a rank-divergent setup failure from stranding healthy ranks in an
+        unmatched collective. Single-process preserves the original immediate re-raise.
         """
         if not self.compile_enabled:
             return
 
         if not hasattr(torch, "compile"):
+            # torch.compile unavailable: participate in the collective before raising.
+            self.compile_active = False
             if self.compile_fallback_to_eager:
+                self.compile_fallback_active = True
                 if self.is_main:
                     print("torch.compile is unavailable; falling back to eager training.")
-                self.compile_fallback_active = True
-                self._sync_compile_setup_ddp()
-                return
-            raise RuntimeError("torch.compile is unavailable in this PyTorch build")
+            any_failed = self._sync_compile_setup_ddp(local_failed=True)
+            if not self.compile_fallback_to_eager:
+                raise RuntimeError("torch.compile is unavailable in this PyTorch build")
+            return
 
         compile_kwargs = {
             "backend": self.compile_backend,
@@ -246,6 +286,7 @@ class Trainer:
         # (collective-safe) instead of one rank silently going eager.
         runtime_fallback = self.compile_fallback_to_eager and self.accelerator.num_processes <= 1
 
+        setup_exc: Exception | None = None
         try:
             compile_fn = getattr(self._unwrapped_model, "compile_training_core", None)
             if compile_fn is None:
@@ -254,18 +295,28 @@ class Trainer:
             compile_fn(target=compile_target, runtime_fallback=runtime_fallback, **compile_kwargs)
             self.compile_active = True
         except Exception as exc:
-            if not self.compile_fallback_to_eager:
-                raise
-            if self.is_main:
-                print(f"torch.compile setup failed; falling back to eager training. Error: {exc}")
-            clear_fn = getattr(self._unwrapped_model, "clear_training_compile", None)
-            if clear_fn is not None:
-                clear_fn()
+            # Defer the strict-mode re-raise until after the collective so every rank
+            # participates before any rank raises. Store the exception; in fallback mode
+            # also mark/clear for eager continuation. In strict mode compile_fallback_active
+            # stays False (we are not falling back — we are about to raise).
+            setup_exc = exc
             self.compile_active = False
-            self.compile_fallback_active = True
+            if self.compile_fallback_to_eager:
+                self.compile_fallback_active = True
+                if self.is_main:
+                    print(f"torch.compile setup failed; falling back to eager training. Error: {exc}")
+                clear_fn = getattr(self._unwrapped_model, "clear_training_compile", None)
+                if clear_fn is not None:
+                    clear_fn()
 
-        # Synchronise setup-time fallback across DDP ranks (single all_reduce, all ranks).
-        self._sync_compile_setup_ddp()
+        # Every rank participates in the status exchange before any rank raises.
+        any_failed = self._sync_compile_setup_ddp(local_failed=setup_exc is not None)
+
+        # Strict mode: raise coherently on ALL ranks after the collective.
+        if any_failed and not self.compile_fallback_to_eager:
+            if setup_exc is not None:
+                raise setup_exc
+            raise RuntimeError("torch.compile setup failed on at least one rank; aborting (strict mode).")
 
         if self.compile_active and self.is_main:
             compile_target = getattr(self, "compile_target", "cfm_loss_core")
@@ -276,12 +327,21 @@ class Trainer:
             if self.accelerator.num_processes > 1 and self.compile_fallback_to_eager:
                 print("DDP detected: runtime compile fallback disabled (errors will raise on all ranks).")
 
-    def _sync_compile_setup_ddp(self):
-        """Synchronise *setup-time* compile fallback across DDP ranks.
+    def _sync_compile_setup_ddp(self, local_failed: bool = False) -> bool:
+        """Exchange setup-time compile status across DDP ranks via a single reduce.
 
-        If any rank failed to compile during setup, all ranks switch to eager so the
-        gradient all-reduce stays consistent. Uses a single all_reduce(MAX) collective in
-        which every rank participates; no rank-only collective that would hang the others.
+        Every rank participates before any rank raises, so a rank-divergent setup failure
+        cannot strand peers in an unmatched collective. ``local_failed`` carries strict-
+        mode failures (where ``compile_fallback_active`` is not set because we are about to
+        raise, not fall back). Returns ``True`` if any rank reported a setup failure. In
+        fallback mode, all ranks switch to eager so the gradient all-reduce stays
+        consistent. In strict mode the caller raises after this returns (see
+        ``_configure_compile``).
+
+        Uses ``accelerator.reduce(..., reduction='max')`` on a 0/1 flag rather than a raw
+        ``torch.distributed.all_reduce`` so the collective goes through Accelerate's
+        dispatch layer (handles DeepSpeed/FSDP process groups correctly). Single-process
+        returns the local flag directly with no collective.
 
         This covers setup only. A compile failure that first surfaces at *runtime* on a
         single rank is deliberately fatal for that rank (runtime fallback is disabled under
@@ -291,18 +351,22 @@ class Trainer:
         not a graceful, collective-safe recovery, and no per-step collective is added to
         make it one because that cost would be paid by every healthy step.
         """
+        failed = local_failed or self.compile_fallback_active
         if self.accelerator.num_processes <= 1:
-            return
-        flag = torch.tensor(1.0 if self.compile_fallback_active else 0.0, device=self.accelerator.device)
-        torch.distributed.all_reduce(flag, op=torch.distributed.ReduceOp.MAX)
-        if float(flag) > 0.0 and self.compile_active:
+            return failed
+        flag = torch.tensor(1.0 if failed else 0.0, device=self.accelerator.device)
+        flag = cast(torch.Tensor, self.accelerator.reduce(flag, reduction="max"))
+        any_failed = float(flag) > 0.0
+        if any_failed and self.compile_active:
             if self.is_main:
                 print("torch.compile setup failed on at least one rank; switching all ranks to eager.")
             clear_fn = getattr(self._unwrapped_model, "clear_training_compile", None)
             if clear_fn is not None:
                 clear_fn()
             self.compile_active = False
+        if any_failed:
             self.compile_fallback_active = True
+        return any_failed
 
     def _check_compile_runtime_fallback(self):
         """Detect a runtime compile failure surfaced by the CFM module and update trainer state."""
@@ -330,11 +394,32 @@ class Trainer:
         averages gradients across ranks. We backpropagate raw ``loss_sum`` values, then
         multiply the synced gradient buffer by ``G * world_size / global_denom`` so the
         effective gradient is ``grad(sum(loss_sum) / sum(denom))``.
+
+        The scale is computed as a Python float and applied via ``mul_(float)`` rather
+        than pre-casting to ``parameter.grad.dtype``. Under fp16 AMP (which Accelerate
+        1.14 can enable via ``prepare_model`` autocast wrapping), a small scale such as
+        1e-6 would flush to a subnormal with zero precision bits (or to zero) when cast
+        to fp16, corrupting the gradient. A Python float scalar is handled at full
+        precision by the ATen kernel -- only the result is rounded back to the tensor's
+        dtype, preserving the scale's magnitude.
+
+        Pre-backward power-of-two divisor (evaluated, NOT implemented):
+        Backpropagating ``loss_sum / 2**16`` per microbatch and folding ``2**16`` into
+        the final scale is mathematically exact (powers of two are representable in
+        fp32/fp16), but provides no benefit and can be harmful under AMP: the loss core
+        already accumulates in fp32 (cfm.py ``_forward_loss_core_components``), so
+        ``loss_sum`` cannot overflow fp16; and ``GradScaler`` multiplies the loss by its
+        own adaptive scale (default 2**16) before backward, so a 2**16 divisor exactly
+        cancels the default scaler and *doubles* the effective divisor when the scaler
+        has backed off (e.g. 2**15), causing fp16 gradient underflow. The raw-sum AMP
+        concern is therefore addressed by the fp32 loss core + python-float scale, not by
+        a pre-backward divisor.
         """
-        scale = (self.grad_accumulation_steps * self.accelerator.num_processes) / global_loss_denom
+        # Python float: avoids pre-casting the scale to the gradient dtype.
+        scale = (self.grad_accumulation_steps * self.accelerator.num_processes) / float(global_loss_denom.item())
         for parameter in self.model.parameters():
             if parameter.grad is not None:
-                parameter.grad.mul_(scale.to(device=parameter.grad.device, dtype=parameter.grad.dtype))
+                parameter.grad.mul_(scale)
 
     def save_checkpoint(self, update, last=False):
         self.accelerator.wait_for_everyone()
