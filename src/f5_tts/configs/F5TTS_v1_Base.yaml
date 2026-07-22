@@ -62,8 +62,18 @@ ckpts:
 compile:
   enabled: False  # optional torch.compile path; disabled by default
   target: dit_blocks  # dit_blocks | cfm_loss_core
+  # dit_blocks compiles each DiT block (training only); cfm_loss_core compiles the whole
+  # loss core. Measured on variable-length data: dit_blocks pays ~40% less cold compile and
+  # reaches a similar steady state, so it amortizes far sooner. cfm_loss_core covers 100% of
+  # parameters and edges ahead on steady-state throughput once warm, so prefer it only for
+  # very long runs. Both were ~1.1x eager steady-state with ~12% lower peak VRAM.
   backend: inductor  # requires triton on CUDA
   mode: null  # e.g. default, reduce-overhead, max-autotune (reduce-overhead/max-autotune need fixed shapes)
-  fullgraph: False
-  dynamic: null  # variable lengths may recompile; compare null/True/False or fixed shapes
+  fullgraph: False  # NOTE: with fullgraph the recompile limit is a HARD error, not a fall back to eager
+  dynamic: null  # null lets Dynamo auto-promote varying dims after the 2nd distinct value;
+  # True compiles one symbolic graph up front, which halves recompiles and cold-compile time.
+  # False specializes per shape and is catastrophic for variable-length training.
   fallback_to_eager: True  # fall back to eager if compile setup fails (runtime fallback disabled in DDP)
+  # Reproducibility note: with dropout > 0 (the default), Inductor uses its own RNG, so
+  # compiled dropout masks differ from eager. This is expected and statistically harmless.
+  # For eager-identical dropout, pass options={"fallback_random": True} to torch.compile.

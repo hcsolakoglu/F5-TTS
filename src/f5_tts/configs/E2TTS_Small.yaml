@@ -61,3 +61,6 @@ compile:
   fullgraph: False
   dynamic: null  # variable lengths may recompile; compare null/True/False or fixed shapes
   fallback_to_eager: True  # fall back to eager if compile setup fails (runtime fallback disabled in DDP)
+  # Reproducibility note: with dropout > 0 (the default), Inductor uses its own RNG, so
+  # compiled dropout masks differ from eager. This is expected and statistically harmless.
+  # For eager-identical dropout, pass options={"fallback_random": True} to torch.compile.

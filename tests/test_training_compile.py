@@ -872,6 +872,70 @@ def test_cuda_inductor_dit_blocks_matches_eager_with_variable_shapes():
     )
 
 
+def test_compiled_dropout_uses_its_own_rng_unless_fallback_random_is_set():
+    """Document the one place compiled training is NOT numerically equal to eager.
+
+    Inductor lowers nn.Dropout to its own Philox RNG, so with dropout > 0 -- which every
+    shipped config has (0.1) -- the compiled loss differs from eager by far more than
+    floating-point noise. This is expected torch.compile behaviour and statistically
+    harmless (a different random mask is still a valid mask), but it means the suite's
+    other parity tests, which all pin dropout=0.0, do not establish equality for the
+    production configuration. Users who need eager-identical dropout can pass
+    `options={"fallback_random": True}` through to torch.compile.
+
+    This test exists so the claim stays honest and so a future PyTorch change to either
+    behaviour is caught rather than silently altering training.
+    """
+    import pytest as _pytest
+
+    def build():
+        torch.manual_seed(7)
+        model = CFM(
+            transformer=DiT(
+                dim=32, depth=1, heads=2, dim_head=16, mel_dim=8, text_num_embeds=32, text_dim=16, dropout=0.3
+            ),
+            mel_spec_kwargs={"n_mel_channels": 8},
+            audio_drop_prob=0.0,
+            cond_drop_prob=0.0,
+        ).cpu()
+        # dropout only changes the output if the weights are not zero-initialized
+        for parameter in model.parameters():
+            if parameter.dim() > 1:
+                torch.nn.init.normal_(parameter, std=0.05)
+        model.train()
+        return model
+
+    def run(**compile_kwargs):
+        dynamo.reset()
+        model = build()
+        torch.manual_seed(3)
+        prepared = cast(
+            PreparedArgs,
+            model._prepare_training_inputs(
+                torch.randn(2, 40, 8), torch.randint(0, 32, (2, 11)), torch.tensor([40, 31])
+            ),
+        )
+        torch.manual_seed(999)
+        eager = model._forward_loss_core_components(*prepared)[0].item()
+        model.compile_training_core(target="cfm_loss_core", runtime_fallback=False, **compile_kwargs)
+        torch.manual_seed(999)
+        compiled = model._run_loss_core_components(*prepared)[0].item()
+        return eager, compiled
+
+    try:
+        eager, compiled = run(backend="inductor")
+    except Exception as exc:  # inductor needs a working compiler toolchain
+        _pytest.skip(f"inductor unavailable: {exc}")
+
+    assert abs(eager - compiled) > 1e-5, (
+        "compiled dropout unexpectedly matched eager; if PyTorch changed this, the "
+        "documentation and the fallback_random guidance below need updating"
+    )
+
+    eager_fr, compiled_fr = run(backend="inductor", options={"fallback_random": True})
+    assert abs(eager_fr - compiled_fr) < 1e-5, "fallback_random=True must restore eager RNG parity for dropout"
+
+
 def test_unett_bool_inference_cache_behavior_still_works():
     """Existing UNetT bool-flag inference + cache path must remain functional."""
     model = _build_unett_model()
