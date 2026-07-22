@@ -29,9 +29,6 @@ from f5_tts.model.modules import (
 )
 
 
-_NO_INSTANCE_FORWARD = object()
-
-
 # Text embedding
 
 
@@ -259,9 +256,12 @@ class DiT(nn.Module):
         self.checkpoint_activations = checkpoint_activations
 
         # Optional regional torch.compile state. These attributes intentionally stay out
-        # of nn.Module registration so checkpoint/state_dict keys are unchanged.
+        # of nn.Module registration so checkpoint/state_dict keys are unchanged. Compiled
+        # per-block callables live only on the owning DiT and are stripped on
+        # deepcopy/pickle (see __getstate__/__setstate__) so copies deserialize eager and
+        # never share the source model's compiled closures or parameters.
         object.__setattr__(self, "_dit_compile_target", None)
-        object.__setattr__(self, "_original_dit_block_forwards", None)
+        object.__setattr__(self, "_compiled_dit_block_forwards", None)
 
         self.initialize_weights()
 
@@ -319,12 +319,33 @@ class DiT(nn.Module):
             "target": self._dit_compile_target,
         }
 
+    # Compile-only state must not survive deepcopy/pickle: compiled callables are bound to
+    # the source model's parameters and are unpickleable (torch.compile internals). Copies
+    # and deserialized models must fall back to eager execution rather than silently share
+    # the source closure or crash on pickle. This mirrors nn.Module's own handling of
+    # ``_compiled_call_impl`` in __getstate__.
+    _DIT_COMPILE_ONLY_ATTRS = ("_dit_compile_target", "_compiled_dit_block_forwards")
+
+    def __getstate__(self):
+        state = super().__getstate__()
+        for attr in self._DIT_COMPILE_ONLY_ATTRS:
+            state.pop(attr, None)
+        return state
+
+    def __setstate__(self, state):
+        super().__setstate__(state)
+        for attr in self._DIT_COMPILE_ONLY_ATTRS:
+            object.__setattr__(self, attr, None)
+
     def compile_training_target(self, target: str, **compile_kwargs):
         """Compile a regional DiT training target without changing module ownership.
 
-        ``target='dit_blocks'`` compiles each existing ``DiTBlock.forward`` callable.
-        The ``ModuleList`` and parameter registration remain unchanged, avoiding
-        ``_orig_mod`` checkpoint keys and preserving Accelerate/DDP ownership.
+        ``target='dit_blocks'`` compiles each existing ``DiTBlock.forward`` callable and
+        stores the compiled callables on the owning DiT. The ``ModuleList`` and parameter
+        registration remain unchanged, avoiding ``_orig_mod`` checkpoint keys and
+        preserving Accelerate/DDP ownership. No ``block.forward`` is patched, so deep
+        copies, ``torch.save``, and multiprocessing spawn see ordinary pickleable modules
+        and deserialize to eager execution.
         """
         if target != "dit_blocks":
             raise ValueError("DiT regional compile target must be 'dit_blocks'")
@@ -342,61 +363,17 @@ class DiT(nn.Module):
 
     def clear_training_compile(self):
         """Restore eager DiT execution after regional compilation."""
-        originals = self.__dict__.get("_original_dit_block_forwards")
-        if originals is not None:
-            for block, original_forward_attr in originals:
-                if original_forward_attr is _NO_INSTANCE_FORWARD:
-                    if "forward" in block.__dict__:
-                        delattr(block, "forward")
-                else:
-                    block.forward = original_forward_attr
         object.__setattr__(self, "_dit_compile_target", None)
-        object.__setattr__(self, "_original_dit_block_forwards", None)
-
-    @staticmethod
-    def _training_only_forward(block, original_forward, compiled_forward):
-        """Route to the compiled block only while the module is training.
-
-        ``compile_training_target`` compiles a *training* target, but a patched
-        ``block.forward`` is shared with inference: ``CFM.sample`` runs the same blocks,
-        and ``Trainer`` calls it whenever ``log_samples=True``. Inference shapes differ
-        from training ones (``cfg_infer`` doubles the batch, the ODE solver sweeps
-        durations), and every distinct one consumes the same per-code-object recompile
-        budget. With ``dynamic=False`` that budget is 8 by default, so a handful of logged
-        samples can exhaust it and push genuinely new *training* shapes onto the eager path
-        while the trainer still reports compile as active. Dispatching on ``block.training``
-        keeps inference entirely out of the training compile cache.
-        """
-
-        def forward(*args, **kwargs):
-            if block.training:
-                return compiled_forward(*args, **kwargs)
-            return original_forward(*args, **kwargs)
-
-        return forward
+        object.__setattr__(self, "_compiled_dit_block_forwards", None)
 
     def _compile_each_dit_block(self, **compile_kwargs):
-        originals = []
-        compiled_forwards = []
-        try:
-            for block in self.transformer_blocks:
-                original_forward_attr = block.__dict__.get("forward", _NO_INSTANCE_FORWARD)
-                original_forward = block.forward
-                compiled_forward = torch.compile(original_forward, **compile_kwargs)
-                block.forward = self._training_only_forward(block, original_forward, compiled_forward)
-                originals.append((block, original_forward_attr))
-                compiled_forwards.append(compiled_forward)
-        except Exception:
-            for block, original_forward_attr in originals:
-                if original_forward_attr is _NO_INSTANCE_FORWARD:
-                    if "forward" in block.__dict__:
-                        delattr(block, "forward")
-                else:
-                    block.forward = original_forward_attr
-            raise
-
-        object.__setattr__(self, "_original_dit_block_forwards", tuple(originals))
-        return tuple(compiled_forwards)
+        # Compile every block first; only commit the tuple to instance state once the
+        # whole list succeeds, so a partial failure leaves no compiled state behind.
+        compiled_forwards = tuple(
+            torch.compile(block.forward, **compile_kwargs) for block in self.transformer_blocks
+        )
+        object.__setattr__(self, "_compiled_dit_block_forwards", compiled_forwards)
+        return compiled_forwards
 
     def _forward_block_range(self, x, t, mask, rope):
         for block in self.transformer_blocks:
@@ -408,6 +385,18 @@ class DiT(nn.Module):
             for block in self.transformer_blocks:
                 # https://pytorch.org/docs/stable/checkpoint.html#torch.utils.checkpoint.checkpoint
                 x = torch.utils.checkpoint.checkpoint(self.ckpt_wrapper(block), x, t, mask, rope, use_reentrant=False)
+            return x
+
+        # Regional compile dispatch: route through the compiled per-block callables only
+        # while training. Inference (CFM.sample, logged samples) uses the eager path so its
+        # distinct shapes (cfg_infer-doubled batch, swept durations) never consume the
+        # training compile cache's per-code-object recompile budget. Dispatch lives in the
+        # owner loop rather than on each block.forward so modules stay unpatched, deepcopy-
+        # safe, and pickleable.
+        compiled = self.__dict__.get("_compiled_dit_block_forwards")
+        if compiled is not None and self.training:
+            for compiled_forward in compiled:
+                x = compiled_forward(x, t, mask=mask, rope=rope)
             return x
 
         return self._forward_block_range(x, t, mask, rope)

@@ -1,5 +1,7 @@
 import copy
+import io
 import sys
+import types
 from pathlib import Path
 from typing import Any, cast
 from unittest.mock import patch
@@ -303,8 +305,7 @@ def test_regional_dit_blocks_matches_eager_loss_outputs_and_gradients():
     compiled_model.train()
     mel, text, lens = _sample_batch(batch_size=3, frames=12, text_len=7, lens=[12, 8, 5])
     transformer = cast(Any, compiled_model.transformer)
-    for block in transformer.transformer_blocks:
-        assert "forward" not in block.__dict__
+    assert transformer._compiled_dit_block_forwards is None
 
     prepared_args = cast(PreparedArgs, eager_model._prepare_training_inputs(mel.clone(), text.clone(), lens.clone()))
 
@@ -329,8 +330,12 @@ def test_regional_dit_blocks_matches_eager_loss_outputs_and_gradients():
     assert isinstance(compiled, tuple)
     compiled_forwards = cast(tuple[Any, ...], compiled)
     assert len(compiled_forwards) == len(transformer.transformer_blocks)
+    # Compiled callables live on the owning DiT, not on block.forward; modules stay
+    # unpatched so deepcopy/pickle produce eager modules.
+    assert transformer._compiled_dit_block_forwards is not None
+    assert len(transformer._compiled_dit_block_forwards) == len(transformer.transformer_blocks)
     for block in transformer.transformer_blocks:
-        assert "forward" in block.__dict__
+        assert "forward" not in block.__dict__
     assert compiled_model.training_compile_state == {
         "enabled": True,
         "target": "dit_blocks",
@@ -354,8 +359,7 @@ def test_regional_dit_blocks_matches_eager_loss_outputs_and_gradients():
         "fallback_active": False,
         "error": None,
     }
-    for block in transformer.transformer_blocks:
-        assert "forward" not in block.__dict__
+    assert transformer._compiled_dit_block_forwards is None
 
 
 def test_regional_dit_blocks_runtime_fallback_restores_eager_blocks():
@@ -365,21 +369,31 @@ def test_regional_dit_blocks_runtime_fallback_restores_eager_blocks():
     transformer = cast(Any, model.transformer)
     block = transformer.transformer_blocks[0]
 
-    assert "forward" not in block.__dict__
+    assert transformer._compiled_dit_block_forwards is None
     model.compile_training_core(target="dit_blocks", backend="eager", fullgraph=False, dynamic=None)
-    assert "forward" in block.__dict__
+    assert transformer._compiled_dit_block_forwards is not None
+    # Modules are never patched; the compiled callable is dispatched from the owner loop.
+    assert "forward" not in block.__dict__
 
     def raise_compile_error(*_args, **_kwargs):
         raise _synthetic_compiler_error("synthetic dit block compile failure")
 
-    block.forward = raise_compile_error
+    # Inject a failing callable into the compiled slot to simulate a runtime compile
+    # failure dispatched through the owner loop (not through block.forward).
+    compiled = transformer._compiled_dit_block_forwards
+    object.__setattr__(
+        transformer,
+        "_compiled_dit_block_forwards",
+        (raise_compile_error, *compiled[1:]),
+    )
+    model.train()
     loss, _, _ = model._run_loss_core(*prepared_args)
 
     assert torch.isfinite(loss)
     assert model.training_compile_state["enabled"] is False
     assert model.training_compile_state["fallback_active"] is True
     assert "synthetic dit block compile failure" in model.training_compile_state["error"]
-    assert "forward" not in block.__dict__
+    assert transformer._compiled_dit_block_forwards is None
 
 
 def _count_compiled_block_calls(monkeypatch):
@@ -433,6 +447,127 @@ def test_regional_dit_blocks_compile_is_training_only(monkeypatch):
     # and compile state is unaffected by the mode switching
     assert model.training_compile_state["enabled"] is True
     assert model.training_compile_state["fallback_active"] is False
+
+
+def test_compiled_dit_deepcopy_runs_eager_and_does_not_share_source_closure(monkeypatch):
+    """A deep-copied compiled DiT must execute its own parameters eagerly.
+
+    Regression for the monkey-patch design where the installed closure captured the source
+    block, so a copied model silently ran the source model's weights. Compiled state is
+    stripped on deepcopy; the copy dispatches eager and its outputs depend only on its own
+    parameters.
+    """
+    model = _build_model()
+    mel, text, lens = _sample_batch()
+    model.compile_training_core(target="dit_blocks", backend="eager", fullgraph=False, dynamic=None)
+    model.train()
+
+    copied = copy.deepcopy(model)
+    # Compile state is stripped: the copy is eager and pickleable.
+    assert cast(Any, copied.transformer)._compiled_dit_block_forwards is None
+    assert copied.training_compile_state["enabled"] is False
+
+    copied.train()
+    prepared = cast(PreparedArgs, copied._prepare_training_inputs(mel.clone(), text.clone(), lens.clone()))
+    loss, _, _ = copied._run_loss_core(*prepared)
+    assert torch.isfinite(loss)
+
+    # Mutating the source model's parameters must not change the copy's output: the copy
+    # runs its own parameters, not a shared closure over the source block.
+    with torch.no_grad():
+        for param in model.parameters():
+            param.add_(1.0)
+    loss_after, _, _ = copied._run_loss_core(*prepared)
+    assert torch.equal(loss.detach(), loss_after.detach()), (
+        "deep-copied model must not share the source model's parameter closure"
+    )
+
+
+def test_compiled_dit_model_is_pickleable_via_torch_save():
+    """A compiled DiT must survive torch.save/torch.load and deserialize eager.
+
+    Regression for the local-closure pickle failure: ``torch.save(model, ...)`` raised
+    ``AttributeError: Can't pickle local object`` while the monkey-patch was active.
+    __getstate__ now strips compiled callables; the loaded model runs eager.
+    """
+    model = _build_model()
+    mel, text, lens = _sample_batch()
+    model.compile_training_core(target="dit_blocks", backend="eager", fullgraph=False, dynamic=None)
+    model.train()
+
+    buf = io.BytesIO()
+    torch.save(model, buf)
+    buf.seek(0)
+    loaded = torch.load(buf, weights_only=False)
+
+    assert cast(Any, loaded.transformer)._compiled_dit_block_forwards is None
+    assert loaded.training_compile_state["enabled"] is False
+    loaded.train()
+    prepared = cast(PreparedArgs, loaded._prepare_training_inputs(mel.clone(), text.clone(), lens.clone()))
+    loss, _, _ = loaded._run_loss_core(*prepared)
+    assert torch.isfinite(loss)
+
+
+def test_clear_training_compile_after_deepcopy_leaves_forward_callable():
+    """clear_training_compile() on a deep-copied compiled DiT must not install a sentinel.
+
+    Regression for the identity-based sentinel restore: deepcopy produced a distinct
+    ``object()`` sentinel that failed the ``is _NO_INSTANCE_FORWARD`` check, so clear
+    installed a bare ``object`` as ``block.forward`` -> ``TypeError`` on next call. With
+    the monkey-patch removed, clear is a no-op on blocks and forward stays callable.
+    """
+    model = _build_model()
+    model.compile_training_core(target="dit_blocks", backend="eager", fullgraph=False, dynamic=None)
+    copied = copy.deepcopy(model)
+
+    copied.clear_training_compile()
+    transformer = cast(Any, copied.transformer)
+    assert transformer._compiled_dit_block_forwards is None
+    for block in transformer.transformer_blocks:
+        assert isinstance(block.forward, types.MethodType), "block.forward must remain a bound method"
+
+    mel, text, lens = _sample_batch()
+    copied.train()
+    prepared = cast(PreparedArgs, copied._prepare_training_inputs(mel.clone(), text.clone(), lens.clone()))
+    loss, _, _ = copied._run_loss_core(*prepared)
+    assert torch.isfinite(loss)
+
+
+def test_compiled_dit_state_dict_keys_unchanged_after_compile_and_deepcopy():
+    """Compile state must not leak into state_dict keys (no _orig_mod / compile keys)."""
+    model = _build_model()
+    keys_before = set(model.state_dict().keys())
+    model.compile_training_core(target="dit_blocks", backend="eager", fullgraph=False, dynamic=None)
+    keys_after_compile = set(model.state_dict().keys())
+    keys_after_deepcopy = set(copy.deepcopy(model).state_dict().keys())
+
+    assert keys_before == keys_after_compile == keys_after_deepcopy
+    assert not any("_orig_mod" in k or "compile" in k or "compiled" in k for k in keys_after_compile)
+
+
+def test_regional_dit_blocks_dispatch_uses_compiled_callable_in_train_mode(monkeypatch):
+    """The owner-loop dispatch must call the compiled callable, not block.forward, in train mode.
+
+    Guards against a regression where the dispatch bypasses the compiled callable (e.g. by
+    checking the wrong attribute or falling through to _forward_block_range in train mode).
+    """
+    calls = _count_compiled_block_calls(monkeypatch)
+    model = _build_model()
+    mel, text, lens = _sample_batch()
+    prepared = cast(PreparedArgs, model._prepare_training_inputs(mel.clone(), text.clone(), lens.clone()))
+
+    model.compile_training_core(target="dit_blocks", backend="eager", fullgraph=False, dynamic=None)
+    model.train()
+    model._run_loss_core(*prepared)
+    transformer = cast(Any, model.transformer)
+    assert calls["n"] >= len(transformer.transformer_blocks)
+
+    # A second distinct shape must also dispatch through the compiled callable.
+    mel2, text2, lens2 = _sample_batch(batch_size=2, frames=16, text_len=9, lens=[16, 10])
+    prepared2 = cast(PreparedArgs, model._prepare_training_inputs(mel2.clone(), text2.clone(), lens2.clone()))
+    before = calls["n"]
+    model._run_loss_core(*prepared2)
+    assert calls["n"] > before, "a new training shape must still dispatch through the compiled callable"
 
 
 def test_loss_core_components_preserve_public_forward_contract():
@@ -1551,11 +1686,20 @@ def test_compile_guard_average_upsampling_eager_forward_still_works():
     assert model.training_compile_state["enabled"] is False
 
 
-def test_dit_blocks_compile_target_allows_average_upsampling_outside_compiled_region():
+def test_dit_blocks_compile_target_allows_average_upsampling_outside_compiled_region(monkeypatch):
+    """dit_blocks compile must actually invoke the compiled blocks for average-upsampling.
+
+    The average-upsampling text-embedding path lives outside the compiled DiT-block region,
+    so target='dit_blocks' must accept it. This test must run in train mode and assert the
+    compiled callable is dispatched -- otherwise it only proves the eager eval path works
+    (the dispatch keys on Module.training and _build_model returns an eval-mode model).
+    """
+    calls = _count_compiled_block_calls(monkeypatch)
     model = _build_model(average_upsampling=True)
     mel, text, lens = _sample_batch(batch_size=2, frames=12, text_len=7, lens=[12, 8])
 
     model.compile_training_core(target="dit_blocks", backend="eager", fullgraph=False, dynamic=None)
+    model.train()
     loss, cond, pred = model(mel, text=text, lens=lens)
 
     assert torch.isfinite(loss)
@@ -1563,6 +1707,10 @@ def test_dit_blocks_compile_target_allows_average_upsampling_outside_compiled_re
     assert pred.shape == mel.shape
     assert model.training_compile_state["enabled"] is True
     assert model.training_compile_state["target"] == "dit_blocks"
+    transformer = cast(Any, model.transformer)
+    assert calls["n"] >= len(transformer.transformer_blocks), (
+        "train-mode forward must dispatch through every compiled block"
+    )
 
 
 def test_real_trainer_frame_dataset_dit_blocks_compile_runs_variable_shape_epoch(tmp_path, monkeypatch):
@@ -1643,6 +1791,154 @@ def test_real_trainer_frame_dataset_dit_blocks_compile_runs_variable_shape_epoch
     assert len({call["text_shape"] for call in seen_core_calls}) > 1
     assert all(call["drop_audio_cond"] and call["drop_text"] for call in seen_core_calls)
     _assert_clean_checkpoint_state_dict(tmp_path / "model_last.pt")
+
+
+def test_logged_samples_switch_to_eval_and_restore_train_mode(tmp_path, monkeypatch):
+    """Logged samples must run in eval mode and restore train mode afterward.
+
+    Regression for finding 11: the Trainer's sample-logging block must switch the unwrapped
+    model to eval so regional compile dispatch (which keys on Module.training) routes
+    inference through the eager path, and must restore the prior mode in a finally so an
+    exception during sampling/vocoding/saving does not leave the model in eval mode for
+    subsequent training steps (which would silently bypass compiled blocks).
+
+    Note: CFM.sample itself calls self.eval(), so the eval switch is belt-and-suspenders;
+    the critical fix is the try/finally restore around the entire sample block.
+    """
+    from f5_tts.model import dataset as dataset_module
+    from f5_tts.model import trainer as trainer_module
+    from f5_tts.model.trainer import Trainer
+
+    monkeypatch.setattr(trainer_module, "tqdm", _SilentProgress)
+    monkeypatch.setattr(dataset_module, "tqdm", _SilentProgress)
+
+    # Mock the vocoder so no download/decode is needed.
+    class _DummyVocoder:
+        def decode(self, mel):
+            return torch.zeros(1, 1, mel.shape[-1] * 256)
+
+    import f5_tts.infer.utils_infer as infer_utils
+
+    monkeypatch.setattr(infer_utils, "load_vocoder", lambda **kw: _DummyVocoder())
+    monkeypatch.setattr(trainer_module.torchaudio, "save", lambda *a, **kw: None)
+
+    torch.manual_seed(2026)
+    train_dataset = _PrecomputedMelDataset()
+    model = _build_model(audio_drop_prob=1.0, cond_drop_prob=1.0, vocab_size=256)
+
+    # Instrument DiT._run_transformer_blocks to record self.training at each call.
+    transformer = cast(Any, model.transformer)
+    original_run = transformer._run_transformer_blocks
+    training_flags: list[bool] = []
+
+    def recording_run(x, t, mask, rope):
+        training_flags.append(transformer.training)
+        return original_run(x, t, mask, rope)
+
+    object.__setattr__(transformer, "_run_transformer_blocks", recording_run)
+
+    trainer = Trainer(
+        model,
+        epochs=1,
+        learning_rate=1e-4,
+        num_warmup_updates=1,
+        save_per_updates=1,
+        keep_last_n_checkpoints=0,
+        checkpoint_path=str(tmp_path),
+        batch_size_per_gpu=20,
+        batch_size_type="frame",
+        max_samples=2,
+        grad_accumulation_steps=1,
+        max_grad_norm=1.0,
+        logger=None,
+        log_samples=True,
+        last_per_updates=10**9,
+        compile_enabled=True,
+        compile_backend="eager",
+        compile_target="dit_blocks",
+        compile_fullgraph=False,
+        compile_dynamic=None,
+        compile_fallback_to_eager=False,
+    )
+
+    trainer.train(train_dataset, num_workers=0, resumable_with_seed=123)
+
+    # Training steps must have run in train mode.
+    assert any(training_flags), "training steps must dispatch through _run_transformer_blocks"
+    assert all(flag for flag in training_flags[:1]), "first forward must be in train mode"
+    # At least one forward during sampling must have been in eval mode.
+    assert any(not flag for flag in training_flags), (
+        "sample-logging must switch the model to eval so inference bypasses compiled blocks"
+    )
+    # After train() returns, the model must be back in train mode.
+    assert trainer._unwrapped_model.training is True, (
+        "model must be restored to train mode after the sample-logging block"
+    )
+
+
+def test_logged_samples_restore_train_mode_on_exception(tmp_path, monkeypatch):
+    """The try/finally must restore train mode even if sampling raises.
+
+    Without the finally, an exception during the sample block leaves the model in eval mode
+    (CFM.sample calls self.eval() and never restores), so subsequent training steps would
+    silently bypass compiled blocks.
+    """
+    from f5_tts.model import dataset as dataset_module
+    from f5_tts.model import trainer as trainer_module
+    from f5_tts.model.trainer import Trainer
+
+    monkeypatch.setattr(trainer_module, "tqdm", _SilentProgress)
+    monkeypatch.setattr(dataset_module, "tqdm", _SilentProgress)
+
+    class _DummyVocoder:
+        def decode(self, mel):
+            return torch.zeros(1, 1, mel.shape[-1] * 256)
+
+    import f5_tts.infer.utils_infer as infer_utils
+
+    monkeypatch.setattr(infer_utils, "load_vocoder", lambda **kw: _DummyVocoder())
+
+    torch.manual_seed(2026)
+    train_dataset = _PrecomputedMelDataset()
+    model = _build_model(audio_drop_prob=1.0, cond_drop_prob=1.0, vocab_size=256)
+
+    # Force the sample block to raise by making torchaudio.save fail.
+    def _save_fail(*a, **kw):
+        raise RuntimeError("simulated save failure")
+
+    monkeypatch.setattr(trainer_module.torchaudio, "save", _save_fail)
+
+    trainer = Trainer(
+        model,
+        epochs=1,
+        learning_rate=1e-4,
+        num_warmup_updates=1,
+        save_per_updates=1,
+        keep_last_n_checkpoints=0,
+        checkpoint_path=str(tmp_path),
+        batch_size_per_gpu=20,
+        batch_size_type="frame",
+        max_samples=2,
+        grad_accumulation_steps=1,
+        max_grad_norm=1.0,
+        logger=None,
+        log_samples=True,
+        last_per_updates=10**9,
+        compile_enabled=True,
+        compile_backend="eager",
+        compile_target="dit_blocks",
+        compile_fullgraph=False,
+        compile_dynamic=None,
+        compile_fallback_to_eager=False,
+    )
+
+    with pytest.raises(RuntimeError, match="simulated save failure"):
+        trainer.train(train_dataset, num_workers=0, resumable_with_seed=123)
+
+    # Even though the sample block raised, the model must be back in train mode.
+    assert trainer._unwrapped_model.training is True, (
+        "try/finally must restore train mode even when the sample block raises"
+    )
 
 
 def test_compile_guard_default_off_path_still_compiles():

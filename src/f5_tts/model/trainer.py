@@ -625,32 +625,43 @@ class Trainer:
                         infer_text = [
                             text_inputs[0] + ([" "] if isinstance(text_inputs[0], list) else " ") + text_inputs[0]
                         ]
-                        with torch.inference_mode(), self.accelerator.autocast():
-                            generated, _ = self.accelerator.unwrap_model(self.model).sample(
-                                cond=mel_spec[0][:ref_audio_len].unsqueeze(0),
-                                text=infer_text,
-                                duration=ref_audio_len * 2,
-                                steps=nfe_step,
-                                cfg_strength=cfg_strength,
-                                sway_sampling_coef=sway_sampling_coef,
-                            )
-                            generated = generated.to(torch.float32)
-                            gen_mel_spec = generated[:, ref_audio_len:, :].permute(0, 2, 1).to(self.accelerator.device)
-                            ref_mel_spec = batch["mel"][0, :, :ref_audio_len].unsqueeze(0)
-                            if self.vocoder_name == "vocos":
-                                gen_audio = vocoder.decode(gen_mel_spec).cpu()
-                                ref_audio = vocoder.decode(ref_mel_spec).cpu()
-                            elif self.vocoder_name == "bigvgan":
-                                gen_audio = vocoder(gen_mel_spec).squeeze(0).cpu()
-                                ref_audio = vocoder(ref_mel_spec).squeeze(0).cpu()
+                        # Switch the unwrapped model to eval so regional compile dispatch
+                        # (which keys on Module.training) routes inference through the eager
+                        # path. Logged samples use cfg_infer-doubled batches and swept
+                        # durations; routing them through the training compile cache would
+                        # exhaust its per-code-object recompile budget and silently push new
+                        # training shapes back to eager while compile is still reported active.
+                        sample_model = self.accelerator.unwrap_model(self.model)
+                        was_training = sample_model.training
+                        sample_model.eval()
+                        try:
+                            with torch.inference_mode(), self.accelerator.autocast():
+                                generated, _ = sample_model.sample(
+                                    cond=mel_spec[0][:ref_audio_len].unsqueeze(0),
+                                    text=infer_text,
+                                    duration=ref_audio_len * 2,
+                                    steps=nfe_step,
+                                    cfg_strength=cfg_strength,
+                                    sway_sampling_coef=sway_sampling_coef,
+                                )
+                                generated = generated.to(torch.float32)
+                                gen_mel_spec = generated[:, ref_audio_len:, :].permute(0, 2, 1).to(self.accelerator.device)
+                                ref_mel_spec = batch["mel"][0, :, :ref_audio_len].unsqueeze(0)
+                                if self.vocoder_name == "vocos":
+                                    gen_audio = vocoder.decode(gen_mel_spec).cpu()
+                                    ref_audio = vocoder.decode(ref_mel_spec).cpu()
+                                elif self.vocoder_name == "bigvgan":
+                                    gen_audio = vocoder(gen_mel_spec).squeeze(0).cpu()
+                                    ref_audio = vocoder(ref_mel_spec).squeeze(0).cpu()
 
-                        torchaudio.save(
-                            f"{log_samples_path}/update_{global_update}_gen.wav", gen_audio, target_sample_rate
-                        )
-                        torchaudio.save(
-                            f"{log_samples_path}/update_{global_update}_ref.wav", ref_audio, target_sample_rate
-                        )
-                        self.model.train()
+                            torchaudio.save(
+                                f"{log_samples_path}/update_{global_update}_gen.wav", gen_audio, target_sample_rate
+                            )
+                            torchaudio.save(
+                                f"{log_samples_path}/update_{global_update}_ref.wav", ref_audio, target_sample_rate
+                            )
+                        finally:
+                            sample_model.train(was_training)
 
         self.save_checkpoint(global_update, last=True)
 
