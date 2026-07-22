@@ -3255,7 +3255,6 @@ def test_post_fallback_global_masked_mean_components_path_still_fp32():
     """
     model = _build_model()
     mel, text, lens = _sample_batch()
-    prepared = cast(PreparedArgs, model._prepare_training_inputs(mel.clone(), text.clone(), lens.clone()))
 
     model.compile_training_core(backend="eager", fullgraph=False, dynamic=None)
 
