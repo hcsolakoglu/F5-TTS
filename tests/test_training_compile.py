@@ -1700,6 +1700,7 @@ def test_trainer_uses_persistent_workers_only_when_workers_are_enabled(monkeypat
     trainer.batch_size_per_gpu = 2
     trainer.max_samples = 2
     trainer.max_padded_frames = 0
+    trainer.vocoder_name = "vocos"
     cast(Any, trainer).accelerator = DummyAccelerator()
     dataset = DummyDataset()
 
@@ -2299,7 +2300,7 @@ class _IndexSampler:
         return len(self.data_source)
 
 
-def _build_batches(frame_lens, threshold, *, max_samples=0, max_padded_frames=0):
+def _build_batches(frame_lens, threshold, *, max_samples=0, max_padded_frames=0, mel_spec_type="vocos"):
     from f5_tts.model.dataset import DynamicBatchSampler
 
     dataset = _FrameLenDataset(frame_lens)
@@ -2310,6 +2311,7 @@ def _build_batches(frame_lens, threshold, *, max_samples=0, max_padded_frames=0)
         random_seed=None,
         drop_residual=False,
         max_padded_frames=max_padded_frames,
+        mel_spec_type=mel_spec_type,
     )
     return sampler.batches, dataset
 
@@ -2329,8 +2331,14 @@ def test_max_padded_frames_bounds_the_padded_rectangle_on_bimodal_data():
     one, so the allocated rectangle len(batch)*max_len can far exceed the requested
     budget. Measured worst case on a bimodal corpus at N=100k is 1.82x. With the guard set,
     no batch may exceed it.
+
+    The expected rectangle is computed with the frontend-aware ``padded_mel_frames``
+    helper (the same one the sampler uses), not a re-derived ceil formula, so this test
+    asserts the guard's own invariant rather than a tautological copy of an old formula.
+    The non-tautological end-to-end check against real mel tensor widths lives in
+    ``test_max_padded_frames_cap_holds_against_real_frontend_mel_width``.
     """
-    import math
+    from f5_tts.model.dataset import padded_mel_frames
 
     rng = torch.Generator().manual_seed(11)
     short = (torch.rand(400, generator=rng) * 140 + 94).tolist()
@@ -2339,30 +2347,42 @@ def test_max_padded_frames_bounds_the_padded_rectangle_on_bimodal_data():
 
     threshold = 4000
     unguarded, dataset = _build_batches(frame_lens, threshold, max_samples=64)
-    worst = max(len(b) * math.ceil(max(dataset.get_frame_len(i) for i in b)) for b in unguarded)
+    worst = max(
+        len(b) * max(padded_mel_frames(dataset.get_frame_len(i), "vocos") for i in b) for b in unguarded
+    )
     assert worst > threshold, "expected the frame-sum budget to overshoot the padded rectangle here"
 
     guarded, dataset = _build_batches(frame_lens, threshold, max_samples=64, max_padded_frames=threshold)
     for batch in guarded:
-        padded = len(batch) * math.ceil(max(dataset.get_frame_len(i) for i in batch))
+        padded = len(batch) * max(padded_mel_frames(dataset.get_frame_len(i), "vocos") for i in batch)
         assert padded <= threshold, f"padded rectangle {padded} exceeds cap {threshold}"
 
 
-def test_max_padded_frames_at_frames_threshold_never_drops_samples():
-    """The recommended setting (cap == frames_threshold) must be data-lossless.
+@pytest.mark.parametrize("mel_spec_type", ["vocos", "bigvgan"])
+def test_max_padded_frames_at_recommended_value_never_drops_samples(mel_spec_type):
+    """The per-frontend recommended cap must be data-lossless.
 
     A padded rectangle is never smaller than the frame sum, so any sample admitted by
-    frames_threshold also fits a cap of the same size. This is what makes the recommended
-    value safe to enable without auditing the corpus first.
+    frames_threshold also fits a cap of the recommended size. For bigvgan that is
+    ``frames_threshold`` (padded width == floor(frame_len)); for vocos it is
+    ``frames_threshold + 1`` (center=True adds one frame, so a clip exactly at the
+    threshold has padded width threshold+1). This is what makes the recommended value
+    safe to enable without auditing the corpus first.
     """
     import warnings as _warnings
 
+    from f5_tts.model.dataset import padded_mel_frames
+
     threshold = 3000
+    # The cap is the padded width of a clip whose frame_len == threshold.
+    cap = padded_mel_frames(threshold, mel_spec_type)
     frame_lens = [94, 500, 1200, 2999, 3000, 1500, 700, 2400]
-    baseline, _ = _build_batches(frame_lens, threshold, max_samples=64)
+    baseline, _ = _build_batches(frame_lens, threshold, max_samples=64, mel_spec_type=mel_spec_type)
     with _warnings.catch_warnings():
         _warnings.simplefilter("error")  # any drop warning becomes a failure
-        guarded, _ = _build_batches(frame_lens, threshold, max_samples=64, max_padded_frames=threshold)
+        guarded, _ = _build_batches(
+            frame_lens, threshold, max_samples=64, max_padded_frames=cap, mel_spec_type=mel_spec_type
+        )
 
     assert sorted(i for b in baseline for i in b) == sorted(i for b in guarded for i in b)
 
@@ -2464,44 +2484,250 @@ def test_trainer_accepts_nonzero_max_padded_frames_with_frame_batching():
     assert trainer.batch_size_type == "frame"
 
 
-def _upstream_reference_loss(pred, flow, rand_span_mask):
-    """The exact pre-compile upstream reduction, transcribed from SWivid/F5-TTS 2ae2c9b.
+def _real_mel_widths(sample_counts, mel_spec_type, *, hop_length=256, n_fft=1024, n_mel_channels=8):
+    """Run the actual mel frontend and return each clip's real output width.
+
+    This is the independent oracle: instead of reusing the sampler's own frame-count
+    formula (which made the old bound assertions tautological), we run the same
+    ``get_vocos_mel_spectrogram`` / ``get_bigvgan_mel_spectrogram`` the dataset uses and
+    read the tensor's last dimension.
+    """
+    from f5_tts.model.modules import get_bigvgan_mel_spectrogram, get_vocos_mel_spectrogram
+
+    extractor = get_vocos_mel_spectrogram if mel_spec_type == "vocos" else get_bigvgan_mel_spectrogram
+    widths = []
+    for n in sample_counts:
+        wav = torch.zeros(1, n)
+        mel = extractor(
+            wav, n_fft=n_fft, n_mel_channels=n_mel_channels, hop_length=hop_length, win_length=n_fft
+        )
+        widths.append(mel.shape[-1])
+    return widths
+
+
+@pytest.mark.parametrize("mel_spec_type", ["vocos", "bigvgan"])
+def test_padded_mel_frames_matches_real_frontend_width_at_exact_hop_multiples(mel_spec_type):
+    """The cap's frame-count helper must equal the real mel tensor width, not ceil.
+
+    At exact hop multiples the old ``ceil(frame_len)`` was one short for vocos
+    (``center=True`` adds a frame) and one loose for bigvgan (``center=False``).
+    This is the off-by-one finding 13 reports: feed sample counts that are exact
+    multiples of hop_length (so frame_len is integral) and compare the helper against
+    the actual frontend output width.
+    """
+    from f5_tts.model.dataset import padded_mel_frames
+
+    hop = 256
+    # Multiples of hop that are >= n_fft so both frontends produce a valid STFT.
+    sample_counts = [4 * hop, 5 * hop, 6 * hop, 8 * hop, 10 * hop, 16 * hop]
+    widths = _real_mel_widths(sample_counts, mel_spec_type, hop_length=hop)
+    for n, w in zip(sample_counts, widths):
+        frame_len = n / hop  # exactly integral
+        assert padded_mel_frames(frame_len, mel_spec_type) == w, (
+            f"{mel_spec_type}: n={n} frame_len={frame_len} helper={padded_mel_frames(frame_len, mel_spec_type)} "
+            f"real_width={w}"
+        )
+
+
+@pytest.mark.parametrize("mel_spec_type", ["vocos", "bigvgan"])
+def test_max_padded_frames_cap_holds_against_real_frontend_mel_width(mel_spec_type):
+    """The cap must hold against the *actual* mel tensor width, not the sampler's formula.
+
+    Builds batches from integral frame_lens (exact hop multiples) with the cap set to a
+    value the old ``ceil`` formula admitted but the true vocos width violates, then
+    checks every batch rectangle against the independently computed real frontend width.
+    This fails on the pre-fix code for vocos and passes after the frontend-aware fix.
+    """
+    hop = 256
+    sample_counts = [4 * hop, 6 * hop, 8 * hop, 10 * hop, 12 * hop]
+    frame_lens = [n / hop for n in sample_counts]  # integral: 4, 6, 8, 10, 12
+    widths = _real_mel_widths(sample_counts, mel_spec_type, hop_length=hop)
+    width_by_idx = {i: w for i, w in enumerate(widths)}
+
+    # Cap chosen so the max clip's real width fits exactly once (cap == max real width).
+    # For vocos the max real width is 12+1=13; for bigvgan it is 12.
+    cap = max(widths)
+    batches, dataset = _build_batches(
+        frame_lens, 10_000, max_samples=64, max_padded_frames=cap, mel_spec_type=mel_spec_type
+    )
+    assert batches, "expected at least one batch"
+    for batch in batches:
+        real_padded = len(batch) * max(width_by_idx[i] for i in batch)
+        assert real_padded <= cap, (
+            f"{mel_spec_type}: real padded rectangle {real_padded} exceeds cap {cap} "
+            f"(batch={batch}, widths={[width_by_idx[i] for i in batch]})"
+        )
+
+
+def test_max_padded_frames_vocos_cap_rejects_what_old_ceil_admitted():
+    """Regression guard for the exact off-by-one finding 13 reports.
+
+    A single clip whose frame_len is integral (e.g. 10) has vocos real width 11 but
+    old ``ceil`` width 10. With ``max_padded_frames=10`` the old code admitted the
+    clip (ceil(10)=10 <= 10) while the real tensor is 11 frames wide; the frontend-aware
+    code must reject it (dropping it with the cap-drop warning, since it cannot fit
+    alone). This pins the behavioural difference.
+    """
+    import warnings as _warnings
+
+    from f5_tts.model.dataset import padded_mel_frames
+
+    hop = 256
+    n = 10 * hop
+    frame_len = n / hop  # 10.0, integral
+    assert padded_mel_frames(frame_len, "vocos") == 11  # floor(10)+1
+    assert padded_mel_frames(frame_len, "bigvgan") == 10  # floor(10)
+
+    with _warnings.catch_warnings(record=True) as caught:
+        _warnings.simplefilter("always")
+        batches, _ = _build_batches(
+            [frame_len], 10_000, max_samples=64, max_padded_frames=10, mel_spec_type="vocos"
+        )
+    # The clip's real vocos width (11) exceeds the cap (10), so it is dropped, not batched.
+    assert batches == [], "vocos clip of width 11 must not fit a cap of 10"
+    messages = [str(w.message) for w in caught if issubclass(w.category, RuntimeWarning)]
+    assert any("max_padded_frames" in m and "dropped" in m for m in messages), messages
+
+
+def _base_commit_forward(model, mel, text, lens):
+    """Verbatim transcription of ``CFM.forward`` from base commit 2ae2c9b (compile-disabled).
+
+    Pinned to SWivid/F5-TTS 2ae2c9b ``src/f5_tts/model/cfm.py`` lines 231-302. This is the
+    behaviour users who never enabled compile must reproduce bit-for-bit. Any divergence
+    between this and the current default path is a real parity regression.
+
+    Differences from the current ``_prepare_training_inputs`` + ``_run_loss_core`` path
+    that this transcription preserves:
+      * Bool CFG drop flags (base) vs 0-D bool tensors (current DiT path).
+      * Inline stochastic preparation with no compile-friendly split.
+      * ``loss[rand_span_mask].mean()`` reduction (no masked-multiply reassociation).
+
+    No git-history runtime dependence: the body is straight-line code kept in lockstep
+    with the named commit. If the base forward ever changes, update this transcription
+    deliberately and record the new pinned SHA.
+    """
+    import torch.nn.functional as F
+    from random import random
+
+    from f5_tts.model.utils import exists, lens_to_mask, list_str_to_idx, list_str_to_tensor, mask_from_frac_lengths
+
+    inp = mel  # test passes mel directly; base raw-wave branch omitted (not exercised)
+    batch, seq_len, dtype, device = *inp.shape[:2], inp.dtype, model.device
+
+    if isinstance(text, list):
+        if exists(model.vocab_char_map):
+            text = list_str_to_idx(text, model.vocab_char_map).to(device)
+        else:
+            text = list_str_to_tensor(text).to(device)
+        assert text.shape[0] == batch
+
+    if not exists(lens):
+        lens = torch.full((batch,), seq_len, device=device)
+    mask = lens_to_mask(lens, length=seq_len)
+
+    frac_lengths = torch.zeros((batch,), device=model.device).float().uniform_(*model.frac_lengths_mask)
+    rand_span_mask = mask_from_frac_lengths(lens, frac_lengths)
+    if exists(mask):
+        rand_span_mask &= mask
+
+    x1 = inp
+    x0 = torch.randn_like(x1)
+    time = torch.rand((batch,), dtype=dtype, device=model.device)
+
+    t = time.unsqueeze(-1).unsqueeze(-1)
+    phi = (1 - t) * x0 + t * x1
+    flow = x1 - x0
+
+    cond = torch.where(rand_span_mask[..., None], torch.zeros_like(x1), x1)
+
+    drop_audio_cond = random() < model.audio_drop_prob
+    if random() < model.cond_drop_prob:
+        drop_audio_cond = True
+        drop_text = True
+    else:
+        drop_text = False
+
+    pred = model.transformer(
+        x=phi, cond=cond, text=text, time=time,
+        drop_audio_cond=drop_audio_cond, drop_text=drop_text, mask=mask,
+    )
 
     loss = F.mse_loss(pred, flow, reduction="none")
     loss = loss[rand_span_mask]
-    return loss.mean(), cond, pred
-    """
-    loss = torch.nn.functional.mse_loss(pred, flow, reduction="none")
-    return loss[rand_span_mask].mean()
+    return loss.mean(), cond, pred, rand_span_mask
 
 
-def test_default_path_loss_is_bitwise_identical_to_upstream():
-    """With compile disabled, the loss must be bit-for-bit upstream's -- not merely close.
+def test_default_path_matches_base_commit_forward_end_to_end():
+    """The compile-disabled default path must be bit-for-bit identical to base 2ae2c9b.
 
-    The compile-friendly reduction `(loss * mask).sum() / denom` is algebraically equal to
-    upstream's `loss[mask].mean()` but reassociates the summation, so it differs by ~1 ULP
-    on roughly 40% of inputs. Training is chaotic: a 1-ULP loss difference compounds into a
-    visibly different trajectory, so users who never enabled compile would silently stop
-    reproducing their previous runs. This test fails if the default path ever adopts the
-    compiled reduction.
+    The previous parity test compared the new path's prediction against itself (it fed the
+    same ``pred`` into a reduction helper), so changes to TextEmbedding, InputEmbedding,
+    CFG handling, or stochastic input preparation could alter predictions while the test
+    stayed green. This replacement runs a transcribed base-commit forward and the current
+    default path (``_prepare_training_inputs`` + ``_run_loss_core``) from identical model
+    state and RNG state, then asserts bitwise equality of predictions, conditioning, loss,
+    and the span mask end-to-end.
+
+    With ``audio_drop_prob=cond_drop_prob=0`` the Python ``random()`` drop decisions are
+    deterministic, so the only behavioural difference between the two paths is bool vs
+    0-D-tensor CFG flags -- exactly the surface this test is meant to verify.
     """
     model = _build_model()
-    mismatches = 0
-    for seed in range(25):
+    for seed in range(8):
         torch.manual_seed(seed)
         mel = torch.randn(3, 37, 8)
         text = torch.randint(0, 32, (3, 11))
         lens = torch.tensor([37, 29, 33])
+
+        # Base-commit forward from a cloned model so weights are identical to the new path.
+        torch.manual_seed(seed)
+        base_model = copy.deepcopy(model)
+        base_loss, base_cond, base_pred, base_mask = _base_commit_forward(base_model, mel, text, lens)
+
+        # Current default path (compile-disabled) from the same seed/state.
+        torch.manual_seed(seed)
         prepared = cast(PreparedArgs, model._prepare_training_inputs(mel, text, lens))
-        x1, _text, _mask, rand_span_mask, x0, _time, _dac, _dt = prepared
+        new_loss, new_cond, new_pred = model._run_loss_core(*prepared)
+        _, _, _, new_mask, _, _, _, _ = prepared
 
-        loss, _cond, pred = model._run_loss_core(*prepared)
-        reference = _upstream_reference_loss(pred, x1 - x0, rand_span_mask)
+        assert torch.equal(new_mask, base_mask), f"seed {seed}: rand_span_mask diverged"
+        assert torch.equal(new_pred, base_pred), f"seed {seed}: pred diverged"
+        assert torch.equal(new_cond, base_cond), f"seed {seed}: cond diverged"
+        assert torch.equal(new_loss, base_loss), f"seed {seed}: loss diverged"
 
-        assert loss.dtype == reference.dtype
-        if loss.item() != reference.item():
-            mismatches += 1
-    assert mismatches == 0, f"default loss diverged from upstream on {mismatches}/25 seeds"
+
+def test_default_path_tensor_cfg_flags_match_bool_flags_eager():
+    """The tensor CFG flag conversion must not change eager DiT behaviour.
+
+    The current default path converts bool drop flags to 0-D bool tensors for DiT
+    (``supports_tensor_cfg_training_flags``) so torch.compile sees branchless inputs.
+    In eager mode this must be observationally identical to the base-commit bool flags.
+    This isolates that one difference from the end-to-end test above by forcing the new
+    path to use bool flags and comparing against the tensor-flag default.
+    """
+    model = _build_model()
+    torch.manual_seed(0)
+    mel = torch.randn(3, 37, 8)
+    text = torch.randint(0, 32, (3, 11))
+    lens = torch.tensor([37, 29, 33])
+
+    torch.manual_seed(0)
+    prepared_tensor = cast(PreparedArgs, model._prepare_training_inputs(mel, text, lens))
+    loss_tensor, _cond_t, pred_tensor = model._run_loss_core(*prepared_tensor)
+
+    # Force the base-commit bool-flag path by disabling the tensor-flag capability on the
+    # transformer for this call only; restore it immediately after.
+    original = getattr(model.transformer, "supports_tensor_cfg_training_flags", False)
+    object.__setattr__(model.transformer, "supports_tensor_cfg_training_flags", False)
+    try:
+        torch.manual_seed(0)
+        prepared_bool = cast(PreparedArgs, model._prepare_training_inputs(mel, text, lens))
+        loss_bool, _cond_b, pred_bool = model._run_loss_core(*prepared_bool)
+    finally:
+        object.__setattr__(model.transformer, "supports_tensor_cfg_training_flags", original)
+
+    assert torch.equal(pred_tensor, pred_bool), "tensor CFG flags changed eager DiT predictions"
+    assert torch.equal(loss_tensor, loss_bool), "tensor CFG flags changed eager loss"
 
 
 def test_compiled_reduction_is_close_but_not_required_to_be_bitwise_equal():

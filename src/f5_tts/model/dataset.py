@@ -168,6 +168,31 @@ class CustomDataset(Dataset):
         }
 
 
+def padded_mel_frames(frame_len: float, mel_spec_type: str) -> int:
+    """Exact padded mel-frame count for one clip, per mel frontend.
+
+    ``frame_len`` is the float returned by ``get_frame_len`` (resampled samples /
+    hop_length). ``collate_fn`` pads every clip in a batch to the batch max of this
+    count, so the padded rectangle the GPU allocates is
+    ``len(batch) * max(padded_mel_frames(frame_len_i, mel_spec_type))``.
+
+    vocos uses ``torchaudio.MelSpectrogram(center=True)``, whose output width is
+    ``1 + floor(n_samples / hop_length)`` == ``floor(frame_len) + 1``. The previous
+    ``ceil(frame_len)`` was correct for non-integral frame_len (where ceil == floor+1)
+    but one frame short at exact hop multiples (where ceil == floor), so the cap was
+    violated by up to ``len(batch)`` frames.
+
+    bigvgan uses ``center=False`` with symmetric ``(n_fft - hop_length)//2`` reflect
+    padding, whose output width is ``floor(n_samples / hop_length)`` ==
+    ``floor(frame_len)``; ``ceil`` was already a safe (loose) upper bound there.
+    """
+    if mel_spec_type == "vocos":
+        return math.floor(frame_len) + 1
+    if mel_spec_type == "bigvgan":
+        return math.floor(frame_len)
+    raise ValueError(f"unsupported mel_spec_type for padded-frame cap: {mel_spec_type!r}")
+
+
 # Dynamic Batch Sampler
 class DynamicBatchSampler(Sampler[list[int]]):
     """Extension of Sampler that will do the following:
@@ -186,6 +211,7 @@ class DynamicBatchSampler(Sampler[list[int]]):
         random_seed=None,
         drop_residual: bool = False,
         max_padded_frames: int = 0,
+        mel_spec_type: str = "vocos",
     ):
         """``max_padded_frames`` optionally bounds the *padded* batch rectangle.
 
@@ -205,12 +231,13 @@ class DynamicBatchSampler(Sampler[list[int]]):
         Choosing a value (cost measured on the same workload):
 
             0                      off; batch composition byte-identical to upstream. DEFAULT.
-            == frames_threshold    RECOMMENDED when enabling. Bounds the rectangle to exactly
-                                   the budget already requested. Costs +1 to +2 batches out of
-                                   3177/1945/2229/4196 (<=0.06%), keeps 100% of samples, and
-                                   leaves total padded frames unchanged -- i.e. throughput is
-                                   the same, the guard only repartitions the few offending
-                                   batches. Turns bimodal's 1.82x into 1.00x.
+            == frames_threshold    RECOMMENDED for bigvgan. Bounds the rectangle to exactly
+                                   the budget already requested. For vocos (center=True) the
+                                   longest clip's padded width is ``floor(frame_len)+1``, so a
+                                   clip exactly at frames_threshold is one frame over and is
+                                   dropped; use ``frames_threshold + 1`` for vocos to keep it.
+            == frames_threshold+1  RECOMMENDED for vocos. Same bound as above while accounting
+                                   for the center=True +1 frame, so no admitted sample is dropped.
             >  frames_threshold    deliberate slack. Only has any effect on bimodal-style data,
                                    where it permits proportional overshoot (1.5x cap -> 1.47x
                                    observed). Use if the recommended value costs you throughput
@@ -232,6 +259,7 @@ class DynamicBatchSampler(Sampler[list[int]]):
         self.max_samples = max_samples
         self.random_seed = random_seed
         self.max_padded_frames = max_padded_frames
+        self.mel_spec_type = mel_spec_type
         self.epoch = 0
 
         indices, batches = [], []
@@ -253,10 +281,11 @@ class DynamicBatchSampler(Sampler[list[int]]):
             # the batch maximum and the padded rectangle is exactly (len(batch)+1)*frame_len.
             # get_frame_len returns a float (duration * sample_rate / hop_length) but collate_fn
             # pads to a whole number of mel frames, so the cap must be checked against the
-            # rounded-up length -- budgeting on the float lets e.g. 19 * 210.5 pass while the
-            # tensor actually allocated is 19 * 211.
+            # frontend-specific mel-frame count (vocos center=True adds one frame at exact hop
+            # multiples; see ``padded_mel_frames``), not the raw float.
             padded_fits = (
-                self.max_padded_frames == 0 or (len(batch) + 1) * math.ceil(frame_len) <= self.max_padded_frames
+                self.max_padded_frames == 0
+                or (len(batch) + 1) * padded_mel_frames(frame_len, self.mel_spec_type) <= self.max_padded_frames
             )
             if (
                 batch_frames + frame_len <= self.frames_threshold
@@ -271,7 +300,10 @@ class DynamicBatchSampler(Sampler[list[int]]):
                 # A sample that cannot fit alone is dropped, matching the existing
                 # frames_threshold behaviour rather than emitting an over-budget batch.
                 fits_threshold = frame_len <= self.frames_threshold
-                fits_cap = self.max_padded_frames == 0 or math.ceil(frame_len) <= self.max_padded_frames
+                fits_cap = (
+                    self.max_padded_frames == 0
+                    or padded_mel_frames(frame_len, self.mel_spec_type) <= self.max_padded_frames
+                )
                 if fits_threshold and fits_cap:
                     batch = [idx]
                     batch_frames = frame_len

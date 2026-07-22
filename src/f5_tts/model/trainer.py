@@ -491,6 +491,7 @@ class Trainer:
                 random_seed=resumable_with_seed,  # This enables reproducible shuffling
                 drop_residual=False,
                 max_padded_frames=self.max_padded_frames,
+                mel_spec_type=self.vocoder_name,
             )
             train_dataloader = DataLoader(
                 train_dataset,
