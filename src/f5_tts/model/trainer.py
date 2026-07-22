@@ -67,6 +67,7 @@ class Trainer:
         compile_dynamic: bool | None = None,
         compile_fallback_to_eager: bool = True,
         global_masked_mean: bool = False,
+        max_padded_frames: int = 0,
     ):
         ddp_kwargs = DistributedDataParallelKwargs(find_unused_parameters=True)
 
@@ -163,6 +164,9 @@ class Trainer:
         # every masked frame is weighted equally. When disabled (default) the trainer
         # preserves the historical per-microbatch mean-loss backward (average-of-means).
         self.global_masked_mean = global_masked_mean
+        # Optional cap on the padded batch rectangle for batch_size_type="frame".
+        # 0 (default) keeps upstream batch composition exactly; see DynamicBatchSampler.
+        self.max_padded_frames = max_padded_frames
         self.compile_active = False
         self.compile_fallback_active = False
         self._unwrapped_model = None  # cached after accelerator.prepare
@@ -467,6 +471,7 @@ class Trainer:
                 max_samples=self.max_samples,
                 random_seed=resumable_with_seed,  # This enables reproducible shuffling
                 drop_residual=False,
+                max_padded_frames=self.max_padded_frames,
             )
             train_dataloader = DataLoader(
                 train_dataset,

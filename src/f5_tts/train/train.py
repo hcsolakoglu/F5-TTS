@@ -81,6 +81,7 @@ def main(model_cfg):
         compile_dynamic=compile_cfg.get("dynamic", None),
         compile_fallback_to_eager=compile_cfg.get("fallback_to_eager", True),
         global_masked_mean=model_cfg.optim.get("global_masked_mean", False),
+        max_padded_frames=model_cfg.optim.get("max_padded_frames", 0),
     )
 
     train_dataset = load_dataset(model_cfg.datasets.name, tokenizer, mel_spec_kwargs=model_cfg.model.mel_spec)

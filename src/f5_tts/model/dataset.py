@@ -1,4 +1,5 @@
 import json
+import math
 from importlib.resources import files
 
 import torch
@@ -177,12 +178,34 @@ class DynamicBatchSampler(Sampler[list[int]]):
     """
 
     def __init__(
-        self, sampler: Sampler[int], frames_threshold: int, max_samples=0, random_seed=None, drop_residual: bool = False
+        self,
+        sampler: Sampler[int],
+        frames_threshold: int,
+        max_samples=0,
+        random_seed=None,
+        drop_residual: bool = False,
+        max_padded_frames: int = 0,
     ):
+        """``max_padded_frames`` optionally bounds the *padded* batch rectangle.
+
+        ``frames_threshold`` budgets the sum of raw frame lengths, but the tensor the GPU
+        actually allocates is ``len(batch) * max(frame_len)`` -- padding included. Because
+        batches are built from length-sorted indices those two are usually within a
+        rounding error of each other (measured max overshoot 1.00x on LibriSpeech-,
+        Emilia- and uniform-shaped duration distributions at N=100k).
+
+        They diverge on bimodal corpora, where a short-utterance batch can be closed out by
+        a much longer one: the same measurement gives a worst case of 1.82x the requested
+        budget (B=31, L=2251, threshold 38400). That is a real out-of-memory risk for anyone
+        mixing, say, short commands with long-form audiobook audio.
+
+        Default 0 disables the check, leaving batch composition byte-identical to upstream.
+        """
         self.sampler = sampler
         self.frames_threshold = frames_threshold
         self.max_samples = max_samples
         self.random_seed = random_seed
+        self.max_padded_frames = max_padded_frames
         self.epoch = 0
 
         indices, batches = [], []
@@ -199,13 +222,31 @@ class DynamicBatchSampler(Sampler[list[int]]):
         for idx, frame_len in tqdm(
             indices, desc=f"Creating dynamic batches with {frames_threshold} audio frames per gpu"
         ):
-            if batch_frames + frame_len <= self.frames_threshold and (max_samples == 0 or len(batch) < max_samples):
+            # `indices` is sorted ascending by frame_len, so the incoming element is always
+            # the batch maximum and the padded rectangle is exactly (len(batch)+1)*frame_len.
+            # get_frame_len returns a float (duration * sample_rate / hop_length) but collate_fn
+            # pads to a whole number of mel frames, so the cap must be checked against the
+            # rounded-up length -- budgeting on the float lets e.g. 19 * 210.5 pass while the
+            # tensor actually allocated is 19 * 211.
+            padded_fits = (
+                self.max_padded_frames == 0 or (len(batch) + 1) * math.ceil(frame_len) <= self.max_padded_frames
+            )
+            if (
+                batch_frames + frame_len <= self.frames_threshold
+                and (max_samples == 0 or len(batch) < max_samples)
+                and padded_fits
+            ):
                 batch.append(idx)
                 batch_frames += frame_len
             else:
                 if len(batch) > 0:
                     batches.append(batch)
-                if frame_len <= self.frames_threshold:
+                # A sample that cannot fit alone is dropped, matching the existing
+                # frames_threshold behaviour rather than emitting an over-budget batch.
+                fits_alone = frame_len <= self.frames_threshold and (
+                    self.max_padded_frames == 0 or frame_len <= self.max_padded_frames
+                )
+                if fits_alone:
                     batch = [idx]
                     batch_frames = frame_len
                 else:

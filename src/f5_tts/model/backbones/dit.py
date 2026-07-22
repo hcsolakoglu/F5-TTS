@@ -353,6 +353,28 @@ class DiT(nn.Module):
         object.__setattr__(self, "_dit_compile_target", None)
         object.__setattr__(self, "_original_dit_block_forwards", None)
 
+    @staticmethod
+    def _training_only_forward(block, original_forward, compiled_forward):
+        """Route to the compiled block only while the module is training.
+
+        ``compile_training_target`` compiles a *training* target, but a patched
+        ``block.forward`` is shared with inference: ``CFM.sample`` runs the same blocks,
+        and ``Trainer`` calls it whenever ``log_samples=True``. Inference shapes differ
+        from training ones (``cfg_infer`` doubles the batch, the ODE solver sweeps
+        durations), and every distinct one consumes the same per-code-object recompile
+        budget. With ``dynamic=False`` that budget is 8 by default, so a handful of logged
+        samples can exhaust it and push genuinely new *training* shapes onto the eager path
+        while the trainer still reports compile as active. Dispatching on ``block.training``
+        keeps inference entirely out of the training compile cache.
+        """
+
+        def forward(*args, **kwargs):
+            if block.training:
+                return compiled_forward(*args, **kwargs)
+            return original_forward(*args, **kwargs)
+
+        return forward
+
     def _compile_each_dit_block(self, **compile_kwargs):
         originals = []
         compiled_forwards = []
@@ -361,7 +383,7 @@ class DiT(nn.Module):
                 original_forward_attr = block.__dict__.get("forward", _NO_INSTANCE_FORWARD)
                 original_forward = block.forward
                 compiled_forward = torch.compile(original_forward, **compile_kwargs)
-                block.forward = compiled_forward
+                block.forward = self._training_only_forward(block, original_forward, compiled_forward)
                 originals.append((block, original_forward_attr))
                 compiled_forwards.append(compiled_forward)
         except Exception:

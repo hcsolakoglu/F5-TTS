@@ -103,6 +103,15 @@ def parse_args():
         help="Opt-in: weight every masked frame equally across gradient accumulation and DDP "
         "(default off preserves the historical per-microbatch mean loss)",
     )
+    parser.add_argument(
+        "--max_padded_frames",
+        type=int,
+        default=0,
+        help="Opt-in cap on the padded batch rectangle (batch_size * max_frames) for "
+        "batch_size_type=frame. --batch_size_per_gpu budgets the sum of raw frame lengths, "
+        "which can under-count the tensor actually allocated on bimodal corpora "
+        "(measured worst case 1.82x). 0 (default) keeps upstream batch composition.",
+    )
 
     return parser.parse_args()
 
@@ -244,6 +253,7 @@ def main():
         compile_dynamic=compile_dynamic,
         compile_fallback_to_eager=not args.compile_no_fallback,
         global_masked_mean=args.global_masked_mean,
+        max_padded_frames=args.max_padded_frames,
     )
 
     train_dataset = load_dataset(args.dataset_name, tokenizer, mel_spec_kwargs=mel_spec_kwargs)

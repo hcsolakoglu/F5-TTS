@@ -45,6 +45,43 @@ def _synthetic_compiler_error(message="synthetic compile failure"):
     return BackendCompilerFailed(lambda: None, RuntimeError(message), None)
 
 
+def _randomize_zero_init_(model, *, seed=0, std=0.05):
+    """Move a freshly built DiT out of its identity-initialized state.
+
+    DiT.initialize_weights zero-initializes the AdaLN gates (`block.attn_norm.linear`)
+    and the output projection. That is correct for training -- the residual branches start
+    as no-ops -- but it makes an as-built model useless for eager-vs-compiled comparison:
+    `pred` is identically zero and only proj_out receives a gradient (2 of 29 parameters on
+    the tiny test model), so a completely broken attention or feed-forward inside the
+    compiled region still compares equal. Every parity test must run through this first,
+    and then assert non-vacuity with _assert_parity_is_meaningful.
+    """
+    generator = torch.Generator().manual_seed(seed)
+    with torch.no_grad():
+        for parameter in model.parameters():
+            if parameter.abs().sum() == 0:
+                noise = torch.empty_like(parameter).normal_(0.0, std, generator=generator)
+                parameter.copy_(noise)
+    return model
+
+
+def _assert_parity_is_meaningful(pred, model, *, min_grad_fraction=0.5):
+    """Fail if a parity comparison could pass on a broken implementation.
+
+    Guards against the zero-initialization trap above and against silently comparing
+    all-zero tensors: the prediction must be non-trivial and most parameters must carry
+    gradient, otherwise the surrounding assertions prove nothing about the compiled region.
+    """
+    assert torch.count_nonzero(pred) > 0, "prediction is identically zero; parity assertions would be vacuous"
+    parameters = list(model.parameters())
+    with_grad = sum(1 for p in parameters if p.grad is not None and torch.count_nonzero(p.grad) > 0)
+    fraction = with_grad / max(len(parameters), 1)
+    assert fraction >= min_grad_fraction, (
+        f"only {with_grad}/{len(parameters)} parameters received a nonzero gradient "
+        f"({fraction:.0%} < {min_grad_fraction:.0%}); the compiled region is barely exercised"
+    )
+
+
 def _build_model(
     *,
     audio_drop_prob=0.0,
@@ -220,7 +257,7 @@ def test_forward_api_remains_tuple_and_state_dict_stays_clean():
 
 
 def test_compiled_loss_core_matches_eager_loss_outputs_and_gradients():
-    eager_model = _build_model()
+    eager_model = _randomize_zero_init_(_build_model())
     compiled_model = copy.deepcopy(eager_model)
     mel, text, lens = _sample_batch(batch_size=3, frames=12, text_len=7, lens=[12, 8, 5])
 
@@ -243,6 +280,7 @@ def test_compiled_loss_core_matches_eager_loss_outputs_and_gradients():
         param.grad.detach().clone() if param.grad is not None else None for param in compiled_model.parameters()
     ]
 
+    _assert_parity_is_meaningful(eager_pred, eager_model)
     _assert_close(compiled_loss.detach(), eager_loss.detach(), "loss")
     _assert_close(compiled_cond.detach(), eager_cond.detach(), "cond")
     _assert_close(compiled_pred.detach(), eager_pred.detach(), "pred")
@@ -256,8 +294,13 @@ def test_compiled_loss_core_matches_eager_loss_outputs_and_gradients():
 
 
 def test_regional_dit_blocks_matches_eager_loss_outputs_and_gradients():
-    eager_model = _build_model()
+    eager_model = _randomize_zero_init_(_build_model())
     compiled_model = copy.deepcopy(eager_model)
+    # dit_blocks compile is training-only by design, so both models must be in train mode
+    # or the compiled callable is bypassed and this compares eager against eager.
+    # _build_model pins dropout=0.0, so train mode stays deterministic.
+    eager_model.train()
+    compiled_model.train()
     mel, text, lens = _sample_batch(batch_size=3, frames=12, text_len=7, lens=[12, 8, 5])
     transformer = cast(Any, compiled_model.transformer)
     for block in transformer.transformer_blocks:
@@ -282,6 +325,7 @@ def test_regional_dit_blocks_matches_eager_loss_outputs_and_gradients():
         param.grad.detach().clone() if param.grad is not None else None for param in compiled_model.parameters()
     ]
 
+    _assert_parity_is_meaningful(eager_pred, eager_model)
     assert isinstance(compiled, tuple)
     compiled_forwards = cast(tuple[Any, ...], compiled)
     assert len(compiled_forwards) == len(transformer.transformer_blocks)
@@ -336,6 +380,59 @@ def test_regional_dit_blocks_runtime_fallback_restores_eager_blocks():
     assert model.training_compile_state["fallback_active"] is True
     assert "synthetic dit block compile failure" in model.training_compile_state["error"]
     assert "forward" not in block.__dict__
+
+
+def _count_compiled_block_calls(monkeypatch):
+    """Wrap torch.compile so tests can assert the compiled callable actually ran.
+
+    Asserting on `training_compile_state` only proves setup succeeded; it cannot detect a
+    dispatch that silently bypasses the compiled block.
+    """
+    calls = {"n": 0}
+    real_compile = torch.compile
+
+    def counting_compile(fn, **kwargs):
+        inner = real_compile(fn, **kwargs)
+
+        def wrapper(*args, **inner_kwargs):
+            calls["n"] += 1
+            return inner(*args, **inner_kwargs)
+
+        return wrapper
+
+    monkeypatch.setattr(torch, "compile", counting_compile)
+    return calls
+
+
+def test_regional_dit_blocks_compile_is_training_only(monkeypatch):
+    """Inference must not run through the compiled training blocks.
+
+    `CFM.sample` shares `DiTBlock.forward` with training, and Trainer calls it whenever
+    log_samples=True. Inference shapes (cfg_infer doubles the batch, the ODE solver sweeps
+    durations) would otherwise consume the same per-code-object recompile budget as
+    training -- default 8 -- and push new training shapes back to eager while the trainer
+    still reports compile as active.
+    """
+    calls = _count_compiled_block_calls(monkeypatch)
+    model = _build_model()
+    mel, text, lens = _sample_batch()
+    prepared_args = cast(PreparedArgs, model._prepare_training_inputs(mel.clone(), text.clone(), lens.clone()))
+    model.compile_training_core(target="dit_blocks", backend="eager", fullgraph=False, dynamic=None)
+
+    model.eval()
+    model._run_loss_core(*prepared_args)
+    assert calls["n"] == 0, "eval-mode forward must bypass the compiled training blocks"
+
+    model.train()
+    loss, _, _ = model._run_loss_core(*prepared_args)
+    assert torch.isfinite(loss)
+    assert calls["n"] >= len(cast(Any, model.transformer).transformer_blocks), (
+        "train-mode forward must dispatch through every compiled block"
+    )
+
+    # and compile state is unaffected by the mode switching
+    assert model.training_compile_state["enabled"] is True
+    assert model.training_compile_state["fallback_active"] is False
 
 
 def test_loss_core_components_preserve_public_forward_contract():
@@ -715,8 +812,63 @@ def test_unett_compiled_loss_core_handles_tensor_cfg_flags_without_fallback():
         model._run_loss_core(*core_args, drop_audio_cond_tensor, drop_text_tensor)
     tensor_unique_graphs = int(torch._dynamo.utils.counters.get("stats", {}).get("unique_graphs", 0))
 
+    # Without this the whole assertion passes vacuously as 0 <= 0 whenever the Dynamo
+    # counters are unavailable, renamed, or simply never populated.
+    assert bool_unique_graphs > 0, "Dynamo captured no graphs; the comparison below proves nothing"
+    assert tensor_unique_graphs > 0, "Dynamo captured no graphs for the tensor-flag path"
     assert tensor_unique_graphs <= bool_unique_graphs, (
         f"UNetT tensor CFG unique graphs ({tensor_unique_graphs}) should be <= bool ({bool_unique_graphs})"
+    )
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required for the inductor dit_blocks test")
+def test_cuda_inductor_dit_blocks_matches_eager_with_variable_shapes():
+    """The shipped default target for F5 configs, through the backend it actually uses.
+
+    Every other dit_blocks test compiles with backend="eager", and every Inductor/CUDA test
+    compiles the *other* target (cfm_loss_core), so an Inductor-only defect in regional
+    block compilation -- in the patched callable, the compiled backward, or dynamic-shape
+    handling inside DiTBlock -- would not be caught anywhere. F5TTS_Base, F5TTS_Small,
+    F5TTS_v1_Base and F5TTS_v1_Small all ship `target: dit_blocks`.
+    """
+    device = torch.device("cuda")
+    dynamo.reset()
+    eager_model = _randomize_zero_init_(_build_real_config_model()).to(device)
+    compiled_model = copy.deepcopy(eager_model)
+    eager_model.train()
+    compiled_model.train()
+    compiled_model.compile_training_core(target="dit_blocks", backend="inductor", fullgraph=False, dynamic=None)
+
+    # more than one shape, so the compiled region must survive a dynamic-shape recompile
+    for frames, text_len, lens in ((16, 9, [16, 11]), (24, 13, [24, 19])):
+        mel, text, lens_tensor = _sample_batch(batch_size=2, frames=frames, text_len=text_len, lens=lens)
+        prepared = cast(
+            PreparedArgs,
+            eager_model._prepare_training_inputs(mel.to(device), text.to(device), lens_tensor.to(device)),
+        )
+        eager_loss, _cond, eager_pred = eager_model._forward_loss_core(*prepared)
+        eager_loss.backward()
+        _assert_parity_is_meaningful(eager_pred, eager_model)
+
+        compiled_args = cast(PreparedArgs, tuple(a.detach().clone() if torch.is_tensor(a) else a for a in prepared))
+        compiled_loss, _cond2, compiled_pred = compiled_model._run_loss_core(*compiled_args)
+        compiled_loss.backward()
+
+        _assert_close(compiled_loss.detach(), eager_loss.detach(), "inductor_blocks_loss", atol=1e-4, rtol=1e-4)
+        _assert_close(compiled_pred.detach(), eager_pred.detach(), "inductor_blocks_pred", atol=1e-3, rtol=1e-3)
+
+        for name, eager_param in eager_model.named_parameters():
+            compiled_param = dict(compiled_model.named_parameters())[name]
+            if eager_param.grad is None or compiled_param.grad is None:
+                assert eager_param.grad is None and compiled_param.grad is None, name
+                continue
+            _assert_close(compiled_param.grad, eager_param.grad, f"inductor_blocks_grad_{name}", atol=1e-3, rtol=1e-3)
+
+        eager_model.zero_grad(set_to_none=True)
+        compiled_model.zero_grad(set_to_none=True)
+
+    assert compiled_model.training_compile_state["fallback_active"] is False, (
+        "inductor regional compile silently fell back to eager"
     )
 
 
@@ -793,7 +945,7 @@ def test_fullgraph_compile_handles_ragged_lens_without_text_embedding_graph_brea
 
 def test_real_config_compiled_loss_core_matches_eager():
     """CPU parity for production DiT knobs that the tiny default model misses."""
-    eager_model = _build_real_config_model()
+    eager_model = _randomize_zero_init_(_build_real_config_model())
     compiled_model = copy.deepcopy(eager_model)
     mel, text, lens = _sample_batch(batch_size=2, frames=12, text_len=7, lens=[12, 8])
 
@@ -815,6 +967,7 @@ def test_real_config_compiled_loss_core_matches_eager():
         param.grad.detach().clone() if param.grad is not None else None for param in compiled_model.parameters()
     ]
 
+    _assert_parity_is_meaningful(eager_pred, eager_model)
     _assert_close(compiled_loss.detach(), eager_loss.detach(), "real_config_loss")
     _assert_close(compiled_cond.detach(), eager_cond.detach(), "real_config_cond")
     _assert_close(compiled_pred.detach(), eager_pred.detach(), "real_config_pred")
@@ -827,7 +980,7 @@ def test_real_config_compiled_loss_core_matches_eager():
 
 def test_unett_compiled_loss_core_matches_eager():
     """CPU parity for E2TTS/UNetT, whose text embedding path differs from DiT."""
-    eager_model = _build_unett_model()
+    eager_model = _randomize_zero_init_(_build_unett_model())
     compiled_model = copy.deepcopy(eager_model)
     mel, text, lens = _sample_batch(batch_size=2, frames=12, text_len=7, lens=[12, 8])
 
@@ -849,6 +1002,7 @@ def test_unett_compiled_loss_core_matches_eager():
         param.grad.detach().clone() if param.grad is not None else None for param in compiled_model.parameters()
     ]
 
+    _assert_parity_is_meaningful(eager_pred, eager_model)
     _assert_close(compiled_loss.detach(), eager_loss.detach(), "unett_loss")
     _assert_close(compiled_cond.detach(), eager_cond.detach(), "unett_cond")
     _assert_close(compiled_pred.detach(), eager_pred.detach(), "unett_pred")
@@ -913,7 +1067,7 @@ def test_cuda_inductor_real_config_smoke():
 def test_cuda_inductor_real_config_matches_eager_across_compile_knobs(compile_kwargs):
     """CUDA inductor vs eager numerical parity for real-config knobs and compile knobs."""
     device = torch.device("cuda")
-    eager_model = _build_real_config_model().to(device)
+    eager_model = _randomize_zero_init_(_build_real_config_model()).to(device)
     compiled_model = copy.deepcopy(eager_model)
     mel, text, lens = _sample_batch(batch_size=2, frames=12, text_len=7, lens=[12, 8])
     mel = mel.to(device)
@@ -939,6 +1093,7 @@ def test_cuda_inductor_real_config_matches_eager_across_compile_knobs(compile_kw
         param.grad.detach().clone() if param.grad is not None else None for param in compiled_model.parameters()
     ]
 
+    _assert_parity_is_meaningful(eager_pred, eager_model)
     _assert_close(compiled_loss.detach(), eager_loss.detach(), "cuda_real_config_loss", atol=1e-4, rtol=1e-4)
     _assert_close(compiled_cond.detach(), eager_cond.detach(), "cuda_real_config_cond", atol=1e-4, rtol=1e-4)
     _assert_close(compiled_pred.detach(), eager_pred.detach(), "cuda_real_config_pred", atol=1e-3, rtol=1e-3)
@@ -985,7 +1140,7 @@ def test_cuda_inductor_training_loss_core_smoke():
 @pytest.mark.parametrize("compile_kwargs", CUDA_INDUCTOR_EQUIVALENCE_KWARGS)
 def test_cuda_inductor_matches_eager_loss_outputs_and_gradients_across_compile_knobs(compile_kwargs):
     device = torch.device("cuda")
-    eager_model = _build_model().to(device)
+    eager_model = _randomize_zero_init_(_build_model()).to(device)
     compiled_model = copy.deepcopy(eager_model)
     mel, text, lens = _sample_batch(batch_size=2, frames=12, text_len=7, lens=[12, 8])
     mel = mel.to(device)
@@ -1011,6 +1166,7 @@ def test_cuda_inductor_matches_eager_loss_outputs_and_gradients_across_compile_k
         param.grad.detach().clone() if param.grad is not None else None for param in compiled_model.parameters()
     ]
 
+    _assert_parity_is_meaningful(eager_pred, eager_model)
     _assert_close(compiled_loss.detach(), eager_loss.detach(), "cuda_loss", atol=1e-4, rtol=1e-4)
     _assert_close(compiled_cond.detach(), eager_cond.detach(), "cuda_cond", atol=1e-4, rtol=1e-4)
     _assert_close(compiled_pred.detach(), eager_pred.detach(), "cuda_pred", atol=1e-3, rtol=1e-3)
@@ -1213,10 +1369,15 @@ def test_trainer_uses_persistent_workers_only_when_workers_are_enabled(monkeypat
     monkeypatch.setattr(trainer_module, "DataLoader", fake_dataloader)
     monkeypatch.setattr(trainer_module, "DynamicBatchSampler", DummyBatchSampler)
 
+    # NOTE: this bypasses Trainer.__init__ and hand-sets only the attributes train()
+    # happens to touch, so it breaks whenever Trainer gains a field. Kept because it is
+    # the cheapest way to intercept DataLoader construction, but the defaults below must
+    # be updated alongside Trainer.__init__.
     trainer = object.__new__(Trainer)
     trainer.log_samples = False
     trainer.batch_size_per_gpu = 2
     trainer.max_samples = 2
+    trainer.max_padded_frames = 0
     cast(Any, trainer).accelerator = DummyAccelerator()
     dataset = DummyDataset()
 
@@ -1616,6 +1777,88 @@ def test_trainer_requests_fused_adamw_for_its_accelerator_device():
     )
     expected = trainer.accelerator.device.type in FUSED_ADAMW_DEVICE_TYPES
     assert trainer.optimizer.param_groups[0].get("fused", False) is expected
+
+
+class _FrameLenDataset:
+    """Minimal dataset exposing only what DynamicBatchSampler consumes."""
+
+    def __init__(self, frame_lens):
+        self.frame_lens = list(frame_lens)
+
+    def get_frame_len(self, index):
+        return float(self.frame_lens[index])
+
+    def __len__(self):
+        return len(self.frame_lens)
+
+
+class _IndexSampler:
+    def __init__(self, data_source):
+        self.data_source = data_source
+
+    def __iter__(self):
+        return iter(range(len(self.data_source)))
+
+    def __len__(self):
+        return len(self.data_source)
+
+
+def _build_batches(frame_lens, threshold, *, max_samples=0, max_padded_frames=0):
+    from f5_tts.model.dataset import DynamicBatchSampler
+
+    dataset = _FrameLenDataset(frame_lens)
+    sampler = DynamicBatchSampler(
+        _IndexSampler(dataset),
+        threshold,
+        max_samples=max_samples,
+        random_seed=None,
+        drop_residual=False,
+        max_padded_frames=max_padded_frames,
+    )
+    return sampler.batches, dataset
+
+
+def test_max_padded_frames_defaults_to_upstream_batch_composition():
+    """Default (0) must not change a single batch; this is the backward-compat contract."""
+    frame_lens = [94, 120, 300, 301, 500, 900, 2100, 2200, 2800, 2810]
+    baseline, _ = _build_batches(frame_lens, 3000, max_samples=8)
+    guarded, _ = _build_batches(frame_lens, 3000, max_samples=8, max_padded_frames=0)
+    assert guarded == baseline
+
+
+def test_max_padded_frames_bounds_the_padded_rectangle_on_bimodal_data():
+    """The adversarial case the guard exists for.
+
+    A frame-sum budget lets a batch of short utterances be closed out by a much longer
+    one, so the allocated rectangle len(batch)*max_len can far exceed the requested
+    budget. Measured worst case on a bimodal corpus at N=100k is 1.82x. With the guard set,
+    no batch may exceed it.
+    """
+    import math
+
+    rng = torch.Generator().manual_seed(11)
+    short = (torch.rand(400, generator=rng) * 140 + 94).tolist()
+    long = (torch.rand(400, generator=rng) * 560 + 2250).tolist()
+    frame_lens = short + long
+
+    threshold = 4000
+    unguarded, dataset = _build_batches(frame_lens, threshold, max_samples=64)
+    worst = max(len(b) * math.ceil(max(dataset.get_frame_len(i) for i in b)) for b in unguarded)
+    assert worst > threshold, "expected the frame-sum budget to overshoot the padded rectangle here"
+
+    guarded, dataset = _build_batches(frame_lens, threshold, max_samples=64, max_padded_frames=threshold)
+    for batch in guarded:
+        padded = len(batch) * math.ceil(max(dataset.get_frame_len(i) for i in batch))
+        assert padded <= threshold, f"padded rectangle {padded} exceeds cap {threshold}"
+
+
+def test_max_padded_frames_keeps_every_usable_sample():
+    """The guard may repartition batches but must not silently drop fitting samples."""
+    frame_lens = [94, 120, 300, 301, 500, 900, 1100, 1200]
+    baseline, _ = _build_batches(frame_lens, 3000, max_samples=8)
+    guarded, _ = _build_batches(frame_lens, 3000, max_samples=8, max_padded_frames=2400)
+
+    assert sorted(i for b in baseline for i in b) == sorted(i for b in guarded for i in b)
 
 
 def _upstream_reference_loss(pred, flow, rand_span_mask):

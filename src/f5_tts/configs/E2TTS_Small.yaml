@@ -17,6 +17,7 @@ optim:
   max_grad_norm: 1.0
   bnb_optimizer: False  
   global_masked_mean: False  # opt-in: equal-weight every masked frame across accumulation/DDP (default preserves per-microbatch mean)
+  max_padded_frames: 0  # opt-in cap on padded batch rectangle B*L (0 = upstream behaviour)
 
 model:
   name: E2TTS_Small
