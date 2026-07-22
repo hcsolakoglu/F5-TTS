@@ -1,5 +1,6 @@
 import json
 import math
+import warnings
 from importlib.resources import files
 
 import torch
@@ -190,16 +191,41 @@ class DynamicBatchSampler(Sampler[list[int]]):
 
         ``frames_threshold`` budgets the sum of raw frame lengths, but the tensor the GPU
         actually allocates is ``len(batch) * max(frame_len)`` -- padding included. Because
-        batches are built from length-sorted indices those two are usually within a
-        rounding error of each other (measured max overshoot 1.00x on LibriSpeech-,
-        Emilia- and uniform-shaped duration distributions at N=100k).
+        batches are built from length-sorted indices those two are usually within a rounding
+        error of each other, so this is not a general problem. They diverge when a batch of
+        short utterances gets closed out by a much longer one, which happens on bimodal
+        corpora (short prompts mixed with long-form audio).
 
-        They diverge on bimodal corpora, where a short-utterance batch can be closed out by
-        a much longer one: the same measurement gives a worst case of 1.82x the requested
-        budget (B=31, L=2251, threshold 38400). That is a real out-of-memory risk for anyone
-        mixing, say, short commands with long-form audiobook audio.
+        Measured at N=100k, frames_threshold=38400, max_samples=64 -- worst-case padded
+        rectangle as a multiple of the requested budget:
 
-        Default 0 disables the check, leaving batch composition byte-identical to upstream.
+            LibriSpeech-shaped  1.00x      Emilia-shaped  1.00x
+            uniform 1-15s       1.00x      bimodal        1.82x   <-- the case this exists for
+
+        Choosing a value (cost measured on the same workload):
+
+            0                      off; batch composition byte-identical to upstream. DEFAULT.
+            == frames_threshold    RECOMMENDED when enabling. Bounds the rectangle to exactly
+                                   the budget already requested. Costs +1 to +2 batches out of
+                                   3177/1945/2229/4196 (<=0.06%), keeps 100% of samples, and
+                                   leaves total padded frames unchanged -- i.e. throughput is
+                                   the same, the guard only repartitions the few offending
+                                   batches. Turns bimodal's 1.82x into 1.00x.
+            >  frames_threshold    deliberate slack. Only has any effect on bimodal-style data,
+                                   where it permits proportional overshoot (1.5x cap -> 1.47x
+                                   observed). Use if the recommended value costs you throughput
+                                   on a corpus not represented above.
+            <  frames_threshold    NOT RECOMMENDED. A padded rectangle is never smaller than the
+                                   frame sum, so this makes frames_threshold dead and simply
+                                   shrinks batches: at 0.5x, batch count roughly doubles and mean
+                                   batch size halves for no memory benefit you could not get by
+                                   lowering frames_threshold itself. It can also discard every
+                                   sample longer than the cap; that emits a RuntimeWarning.
+
+        This is a memory-safety guard and is unrelated to torch.compile: compile behaviour is
+        driven by dynamic-shape promotion, not by shape count, and compiled runs measured ~12%
+        *lower* peak VRAM than eager. Enable it based on the shape of your corpus, not on
+        whether compile is on.
         """
         self.sampler = sampler
         self.frames_threshold = frames_threshold
@@ -219,6 +245,7 @@ class DynamicBatchSampler(Sampler[list[int]]):
 
         batch = []
         batch_frames = 0
+        dropped_by_cap = 0
         for idx, frame_len in tqdm(
             indices, desc=f"Creating dynamic batches with {frames_threshold} audio frames per gpu"
         ):
@@ -243,18 +270,33 @@ class DynamicBatchSampler(Sampler[list[int]]):
                     batches.append(batch)
                 # A sample that cannot fit alone is dropped, matching the existing
                 # frames_threshold behaviour rather than emitting an over-budget batch.
-                fits_alone = frame_len <= self.frames_threshold and (
-                    self.max_padded_frames == 0 or frame_len <= self.max_padded_frames
-                )
-                if fits_alone:
+                fits_threshold = frame_len <= self.frames_threshold
+                fits_cap = self.max_padded_frames == 0 or math.ceil(frame_len) <= self.max_padded_frames
+                if fits_threshold and fits_cap:
                     batch = [idx]
                     batch_frames = frame_len
                 else:
+                    # Only the cap rejecting a sample that frames_threshold would have kept
+                    # is new data loss introduced by this option, so count that case alone.
+                    if fits_threshold and not fits_cap:
+                        dropped_by_cap += 1
                     batch = []
                     batch_frames = 0
 
         if not drop_residual and len(batch) > 0:
             batches.append(batch)
+
+        if dropped_by_cap:
+            # Never silent: max_padded_frames < frames_threshold discards every sample
+            # between the two, which is almost always a misconfiguration rather than intent.
+            warnings.warn(
+                f"max_padded_frames={self.max_padded_frames} dropped {dropped_by_cap} sample(s) that "
+                f"frames_threshold={self.frames_threshold} would have kept. Set max_padded_frames >= "
+                f"frames_threshold (a padded rectangle is never smaller than the frame sum) to bound "
+                f"batch memory without discarding data.",
+                RuntimeWarning,
+                stacklevel=2,
+            )
 
         del indices
         self.batches = batches

@@ -1916,6 +1916,45 @@ def test_max_padded_frames_bounds_the_padded_rectangle_on_bimodal_data():
         assert padded <= threshold, f"padded rectangle {padded} exceeds cap {threshold}"
 
 
+def test_max_padded_frames_at_frames_threshold_never_drops_samples():
+    """The recommended setting (cap == frames_threshold) must be data-lossless.
+
+    A padded rectangle is never smaller than the frame sum, so any sample admitted by
+    frames_threshold also fits a cap of the same size. This is what makes the recommended
+    value safe to enable without auditing the corpus first.
+    """
+    import warnings as _warnings
+
+    threshold = 3000
+    frame_lens = [94, 500, 1200, 2999, 3000, 1500, 700, 2400]
+    baseline, _ = _build_batches(frame_lens, threshold, max_samples=64)
+    with _warnings.catch_warnings():
+        _warnings.simplefilter("error")  # any drop warning becomes a failure
+        guarded, _ = _build_batches(frame_lens, threshold, max_samples=64, max_padded_frames=threshold)
+
+    assert sorted(i for b in baseline for i in b) == sorted(i for b in guarded for i in b)
+
+
+def test_max_padded_frames_below_threshold_warns_about_dropped_samples():
+    """The one genuinely dangerous setting must never fail silently.
+
+    cap < frames_threshold discards every sample between the two. That is almost always a
+    misconfiguration -- the same memory bound is better expressed by lowering
+    frames_threshold -- so it must be loud.
+    """
+    import warnings as _warnings
+
+    frame_lens = [100, 200, 900, 1800, 2500]  # 1800 and 2500 exceed the cap but not the threshold
+    with _warnings.catch_warnings(record=True) as caught:
+        _warnings.simplefilter("always")
+        batches, _ = _build_batches(frame_lens, 3000, max_samples=64, max_padded_frames=1000)
+
+    messages = [str(w.message) for w in caught if issubclass(w.category, RuntimeWarning)]
+    assert any("max_padded_frames" in m and "dropped" in m for m in messages), messages
+    kept = {i for b in batches for i in b}
+    assert kept == {0, 1, 2}, "samples longer than the cap should be the only ones dropped"
+
+
 def test_max_padded_frames_keeps_every_usable_sample():
     """The guard may repartition batches but must not silently drop fitting samples."""
     frame_lens = [94, 120, 300, 301, 500, 900, 1100, 1200]

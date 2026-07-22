@@ -108,9 +108,13 @@ def parse_args():
         type=int,
         default=0,
         help="Opt-in cap on the padded batch rectangle (batch_size * max_frames) for "
-        "batch_size_type=frame. --batch_size_per_gpu budgets the sum of raw frame lengths, "
-        "which can under-count the tensor actually allocated on bimodal corpora "
-        "(measured worst case 1.82x). 0 (default) keeps upstream batch composition.",
+        "batch_size_type=frame. --batch_size_per_gpu budgets the SUM of raw frame lengths; "
+        "the tensor actually allocated is the padded rectangle. Measured worst-case overshoot: "
+        "1.00x on LibriSpeech-/Emilia-shaped and uniform corpora, 1.82x on bimodal ones. "
+        "Recommended value when enabling is the same number as --batch_size_per_gpu "
+        "(costs <=0.06%% more batches, drops no samples, same total padded frames); a smaller "
+        "value shrinks every batch and can discard samples. Unrelated to torch.compile. "
+        "0 (default) keeps upstream batch composition.",
     )
 
     return parser.parse_args()
