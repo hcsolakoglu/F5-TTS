@@ -2762,7 +2762,7 @@ def test_max_padded_frames_keeps_every_usable_sample():
     assert sorted(i for b in baseline for i in b) == sorted(i for b in guarded for i in b)
 
 
-def test_trainer_rejects_nonzero_max_padded_frames_with_sample_batching():
+def test_trainer_rejects_nonzero_max_padded_frames_with_sample_batching(monkeypatch):
     """max_padded_frames is a frame-mode-only memory guard; sample mode cannot apply it.
 
     Sample mode uses fixed-size shuffled batches with no length sorting, so the cap has
@@ -2770,11 +2770,16 @@ def test_trainer_rejects_nonzero_max_padded_frames_with_sample_batching():
     to configure it: a user who adds the cap after an OOM believes they are protected,
     retries, and OOMs again. Reject at construction with a precise message.
     """
-    from f5_tts.model.trainer import Trainer
+    import f5_tts.model.trainer as trainer_module
+
+    def accelerator_must_not_be_constructed(*args, **kwargs):
+        raise AssertionError("invalid sampler configuration must fail before Accelerator setup")
+
+    monkeypatch.setattr(trainer_module, "Accelerator", accelerator_must_not_be_constructed)
 
     model = _build_model()
     with pytest.raises(ValueError, match="max_padded_frames"):
-        Trainer(
+        trainer_module.Trainer(
             model,
             epochs=1,
             learning_rate=1e-4,

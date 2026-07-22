@@ -77,6 +77,17 @@ class Trainer:
         global_masked_mean: bool = False,
         max_padded_frames: int = 0,
     ):
+        # Sample batching has no length-aware sampler through which this cap could act.
+        # Reject before constructing Accelerator, trackers, EMA, or the optimizer so an
+        # invalid memory-safety configuration has no process or logging side effects.
+        if max_padded_frames and batch_size_type == "sample":
+            raise ValueError(
+                "max_padded_frames bounds the padded batch rectangle and is only supported "
+                "with batch_size_type='frame' (DynamicBatchSampler). batch_size_type='sample' "
+                "uses fixed-size shuffled batches with no length sorting, so the cap cannot "
+                "be applied. Use batch_size_type='frame' or leave max_padded_frames=0."
+            )
+
         ddp_kwargs = DistributedDataParallelKwargs(find_unused_parameters=True)
 
         if logger == "wandb" and not wandb.api.api_key:
@@ -186,17 +197,6 @@ class Trainer:
         self.global_masked_mean = global_masked_mean
         # Optional cap on the padded batch rectangle for batch_size_type="frame".
         # 0 (default) keeps upstream batch composition exactly; see DynamicBatchSampler.
-        # Reject the nonsensical nonzero+sample combination up front: sample mode uses
-        # fixed-size shuffled batches with no length sorting, so the cap has no mechanism
-        # to act through and would be silently ignored -- a memory-safety guard that
-        # silently no-ops is worse than refusing to configure it.
-        if max_padded_frames and batch_size_type == "sample":
-            raise ValueError(
-                "max_padded_frames bounds the padded batch rectangle and is only supported "
-                "with batch_size_type='frame' (DynamicBatchSampler). batch_size_type='sample' "
-                "uses fixed-size shuffled batches with no length sorting, so the cap cannot "
-                "be applied. Use batch_size_type='frame' or leave max_padded_frames=0."
-            )
         self.max_padded_frames = max_padded_frames
         self.compile_active = False
         self.compile_fallback_active = False
