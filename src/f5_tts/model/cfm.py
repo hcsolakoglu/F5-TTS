@@ -420,8 +420,14 @@ class CFM(nn.Module):
         # Tensor-aware backbones consume CFG flags with branchless embedding masks.
         # Keeping these flags as 0-D tensors avoids separate torch.compile graphs for
         # each CFG bool combination while preserving the same sampled drop decisions.
-        # Backbones without this explicit capability keep their historical bool inputs.
-        if getattr(self.transformer, "supports_tensor_cfg_training_flags", False):
+        # Tensorize only when a compile target is actually active so the never-compiled
+        # default path stays byte-identical to upstream (Python bools, zero allocation
+        # on no-drop steps). Runtime fallback clears compile state, so flags revert to
+        # bools automatically. Backbones without this capability keep historical bools.
+        if (
+            getattr(self.transformer, "supports_tensor_cfg_training_flags", False)
+            and self._training_compile_enabled()
+        ):
             drop_audio_cond = torch.as_tensor(drop_audio_cond, device=device, dtype=torch.bool)
             drop_text = torch.as_tensor(drop_text, device=device, dtype=torch.bool)
 

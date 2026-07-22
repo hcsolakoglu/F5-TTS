@@ -21,9 +21,17 @@ from f5_tts.model.dataset import DynamicBatchSampler, collate_fn
 from f5_tts.model.utils import default, exists
 
 
-# Device types whose torch.optim.AdamW provides a fused kernel. MPS is the notable
-# omission; requesting fused=True there raises at optimizer construction.
-FUSED_ADAMW_DEVICE_TYPES = ("cuda", "cpu", "xpu", "privateuseone")
+# Device types whose torch.optim.AdamW provides a fused kernel. Upstream requests
+# fused=True unconditionally, which raises at optimizer construction on devices without
+# a fused kernel. Use PyTorch's authoritative per-build helper when available so the
+# request tracks whatever the installed torch actually supports (e.g. mps/hpu/mtia on
+# newer builds); fall back to a conservative set for torch versions predating the helper.
+try:
+    from torch.optim.optimizer import _get_fused_kernels_supported_devices as _fused_devices
+
+    FUSED_ADAMW_DEVICE_TYPES = frozenset(_fused_devices())
+except ImportError:  # torch < 2.x lacks the helper; keep the historical safe set.
+    FUSED_ADAMW_DEVICE_TYPES = frozenset(("cuda", "cpu", "xpu", "privateuseone"))
 
 
 # trainer
@@ -166,6 +174,17 @@ class Trainer:
         self.global_masked_mean = global_masked_mean
         # Optional cap on the padded batch rectangle for batch_size_type="frame".
         # 0 (default) keeps upstream batch composition exactly; see DynamicBatchSampler.
+        # Reject the nonsensical nonzero+sample combination up front: sample mode uses
+        # fixed-size shuffled batches with no length sorting, so the cap has no mechanism
+        # to act through and would be silently ignored -- a memory-safety guard that
+        # silently no-ops is worse than refusing to configure it.
+        if max_padded_frames and batch_size_type == "sample":
+            raise ValueError(
+                "max_padded_frames bounds the padded batch rectangle and is only supported "
+                "with batch_size_type='frame' (DynamicBatchSampler). batch_size_type='sample' "
+                "uses fixed-size shuffled batches with no length sorting, so the cap cannot "
+                "be applied. Use batch_size_type='frame' or leave max_padded_frames=0."
+            )
         self.max_padded_frames = max_padded_frames
         self.compile_active = False
         self.compile_fallback_active = False

@@ -797,9 +797,11 @@ def test_compiled_loss_core_handles_cfg_branches_and_empty_mask():
 
 
 def test_tensor_aware_training_cfg_flags_are_tensorized_for_dit_and_unett():
+    """When a compile target is active, CFG flags become 0-D bool tensors (branchless)."""
     mel, text, lens = _sample_batch(batch_size=2, frames=12, text_len=7, lens=[12, 8])
 
     dit_model = _build_model(audio_drop_prob=1.0, cond_drop_prob=0.0)
+    dit_model.compile_training_core(backend="eager", fullgraph=False, dynamic=None)
     dit_prepared = cast(PreparedArgs, dit_model._prepare_training_inputs(mel.clone(), text.clone(), lens.clone()))
     drop_audio_cond, drop_text = dit_prepared[6], dit_prepared[7]
     assert torch.is_tensor(drop_audio_cond)
@@ -812,6 +814,7 @@ def test_tensor_aware_training_cfg_flags_are_tensorized_for_dit_and_unett():
     assert drop_text.item() is False
 
     unett_model = _build_unett_model(audio_drop_prob=1.0, cond_drop_prob=0.0)
+    unett_model.compile_training_core(backend="eager", fullgraph=False, dynamic=None)
     unett_prepared = cast(PreparedArgs, unett_model._prepare_training_inputs(mel.clone(), text.clone(), lens.clone()))
     unett_drop_audio_cond, unett_drop_text = unett_prepared[6], unett_prepared[7]
     assert torch.is_tensor(unett_drop_audio_cond)
@@ -822,6 +825,71 @@ def test_tensor_aware_training_cfg_flags_are_tensorized_for_dit_and_unett():
     assert unett_drop_text.dtype is torch.bool
     assert unett_drop_audio_cond.item() is True
     assert unett_drop_text.item() is False
+
+
+def test_cfg_flags_are_python_bools_on_never_compiled_default_path():
+    """The default compile-disabled path must keep Python bool CFG flags (upstream parity).
+
+    Tensorizing flags unconditionally added per-step host->device transfers and
+    full-size zeros_like/where work that upstream's `if drop_text:` branches skipped on
+    no-drop steps. The default path is documented as byte-identical to upstream, so it
+    must use plain bools unless a compile target is actually active.
+    """
+    mel, text, lens = _sample_batch(batch_size=2, frames=12, text_len=7, lens=[12, 8])
+
+    dit_model = _build_model(audio_drop_prob=1.0, cond_drop_prob=0.0)
+    dit_prepared = cast(PreparedArgs, dit_model._prepare_training_inputs(mel.clone(), text.clone(), lens.clone()))
+    drop_audio_cond, drop_text = dit_prepared[6], dit_prepared[7]
+    assert isinstance(drop_audio_cond, bool) and not torch.is_tensor(drop_audio_cond)
+    assert isinstance(drop_text, bool) and not torch.is_tensor(drop_text)
+    assert drop_audio_cond is True
+    assert drop_text is False
+
+    unett_model = _build_unett_model(audio_drop_prob=1.0, cond_drop_prob=0.0)
+    unett_prepared = cast(PreparedArgs, unett_model._prepare_training_inputs(mel.clone(), text.clone(), lens.clone()))
+    unett_drop_audio_cond, unett_drop_text = unett_prepared[6], unett_prepared[7]
+    assert isinstance(unett_drop_audio_cond, bool) and not torch.is_tensor(unett_drop_audio_cond)
+    assert isinstance(unett_drop_text, bool) and not torch.is_tensor(unett_drop_text)
+    assert unett_drop_audio_cond is True
+    assert unett_drop_text is False
+
+
+def test_cfg_flags_revert_to_bools_after_runtime_compile_fallback():
+    """After clear_training_compile() (runtime fallback), flags must revert to bools.
+
+    A compile failure that triggers eager fallback clears compile state, so
+    _training_compile_enabled() returns False and flags become Python bools again --
+    the fallback path must not keep paying the tensorization overhead.
+    """
+    mel, text, lens = _sample_batch(batch_size=2, frames=12, text_len=7, lens=[12, 8])
+
+    model = _build_model(audio_drop_prob=1.0, cond_drop_prob=0.0)
+    model.compile_training_core(backend="eager", fullgraph=False, dynamic=None)
+    prepared = cast(PreparedArgs, model._prepare_training_inputs(mel.clone(), text.clone(), lens.clone()))
+    assert torch.is_tensor(prepared[6]) and torch.is_tensor(prepared[7]), "flags must be tensors while compiled"
+
+    model.clear_training_compile()
+    prepared = cast(PreparedArgs, model._prepare_training_inputs(mel.clone(), text.clone(), lens.clone()))
+    drop_audio_cond, drop_text = prepared[6], prepared[7]
+    assert isinstance(drop_audio_cond, bool) and not torch.is_tensor(drop_audio_cond)
+    assert isinstance(drop_text, bool) and not torch.is_tensor(drop_text)
+
+
+def test_cfg_flags_are_tensors_for_dit_blocks_regional_compile_target():
+    """target='dit_blocks' (transformer-level compile) must also tensorize CFG flags.
+
+    _training_compile_enabled() covers both cfm_loss_core (_compiled_loss_core set) and
+    dit_blocks (transformer training_compile_state enabled); the gate must not miss the
+    regional target.
+    """
+    mel, text, lens = _sample_batch(batch_size=2, frames=12, text_len=7, lens=[12, 8])
+
+    model = _build_model(audio_drop_prob=1.0, cond_drop_prob=0.0)
+    model.transformer.compile_training_target("dit_blocks", backend="eager", fullgraph=False, dynamic=None)
+    prepared = cast(PreparedArgs, model._prepare_training_inputs(mel.clone(), text.clone(), lens.clone()))
+    drop_audio_cond, drop_text = prepared[6], prepared[7]
+    assert torch.is_tensor(drop_audio_cond) and drop_audio_cond.dtype is torch.bool
+    assert torch.is_tensor(drop_text) and drop_text.dtype is torch.bool
 
 
 def test_branchless_tensor_cfg_flags_match_bool_loss_outputs_and_gradients():
@@ -2138,19 +2206,32 @@ def test_default_loss_path_gradient_matches_average_of_means_not_global_mean():
         )
 
 
-def test_adamw_fused_policy_preserves_upstream_on_cpu_and_cuda():
-    """CPU must keep upstream's fused kernel; only genuinely unsupported devices opt out.
+def test_adamw_fused_policy_matches_pytorch_authoritative_device_list():
+    """The fused-AdamW device allowlist must track PyTorch's authoritative per-build helper.
 
-    Upstream requests `fused=True` unconditionally. Narrowing that to CUDA-only silently
-    downgraded CPU training to the unfused kernel, which changes optimizer numerics and
-    the serialized optimizer state even with compile disabled -- a backward-compatibility
-    break in a code path nobody opted into. Only MPS, which has no fused AdamW, may differ.
+    Upstream requests `fused=True` unconditionally. Hardcoding a tuple that omits devices
+    PyTorch actually supports (mps/hpu/mtia on newer builds) silently downgrades those
+    users to the unfused kernel, changing optimizer numerics and serialized state on the
+    default compile-disabled path -- a backward-compatibility break nobody opted into.
+    The policy must therefore equal the helper's list when the helper is available, and
+    always include CPU + CUDA (the devices upstream unconditionally fused).
     """
     from f5_tts.model.trainer import FUSED_ADAMW_DEVICE_TYPES
 
     assert "cpu" in FUSED_ADAMW_DEVICE_TYPES, "CPU fused AdamW is upstream behaviour"
     assert "cuda" in FUSED_ADAMW_DEVICE_TYPES
-    assert "mps" not in FUSED_ADAMW_DEVICE_TYPES, "MPS has no fused AdamW kernel"
+
+    # When PyTorch exposes the authoritative helper, the policy must match it exactly --
+    # no silent omissions of devices the installed build supports.
+    try:
+        from torch.optim.optimizer import _get_fused_kernels_supported_devices
+    except ImportError:
+        pytest.skip("torch lacks _get_fused_kernels_supported_devices; fallback path covered elsewhere")
+    authoritative = frozenset(_get_fused_kernels_supported_devices())
+    assert frozenset(FUSED_ADAMW_DEVICE_TYPES) == authoritative, (
+        f"FUSED_ADAMW_DEVICE_TYPES={sorted(FUSED_ADAMW_DEVICE_TYPES)} != "
+        f"authoritative={sorted(authoritative)}"
+    )
 
 
 def test_adamw_fused_is_actually_supported_on_cpu():
@@ -2313,6 +2394,74 @@ def test_max_padded_frames_keeps_every_usable_sample():
     guarded, _ = _build_batches(frame_lens, 3000, max_samples=8, max_padded_frames=2400)
 
     assert sorted(i for b in baseline for i in b) == sorted(i for b in guarded for i in b)
+
+
+def test_trainer_rejects_nonzero_max_padded_frames_with_sample_batching():
+    """max_padded_frames is a frame-mode-only memory guard; sample mode cannot apply it.
+
+    Sample mode uses fixed-size shuffled batches with no length sorting, so the cap has
+    no mechanism to act through. Silently ignoring a safety guard is worse than refusing
+    to configure it: a user who adds the cap after an OOM believes they are protected,
+    retries, and OOMs again. Reject at construction with a precise message.
+    """
+    from f5_tts.model.trainer import Trainer
+
+    model = _build_model()
+    with pytest.raises(ValueError, match="max_padded_frames"):
+        Trainer(
+            model,
+            epochs=1,
+            learning_rate=1e-4,
+            num_warmup_updates=1,
+            save_per_updates=10**9,
+            keep_last_n_checkpoints=0,
+            logger=None,
+            log_samples=False,
+            batch_size_type="sample",
+            max_padded_frames=1000,
+        )
+
+
+def test_trainer_accepts_zero_max_padded_frames_with_sample_batching():
+    """The default (max_padded_frames=0) must remain valid for sample mode (regression guard)."""
+    from f5_tts.model.trainer import Trainer
+
+    model = _build_model()
+    trainer = Trainer(
+        model,
+        epochs=1,
+        learning_rate=1e-4,
+        num_warmup_updates=1,
+        save_per_updates=10**9,
+        keep_last_n_checkpoints=0,
+        logger=None,
+        log_samples=False,
+        batch_size_type="sample",
+        max_padded_frames=0,
+    )
+    assert trainer.max_padded_frames == 0
+    assert trainer.batch_size_type == "sample"
+
+
+def test_trainer_accepts_nonzero_max_padded_frames_with_frame_batching():
+    """Frame mode must still accept the cap (the supported configuration)."""
+    from f5_tts.model.trainer import Trainer
+
+    model = _build_model()
+    trainer = Trainer(
+        model,
+        epochs=1,
+        learning_rate=1e-4,
+        num_warmup_updates=1,
+        save_per_updates=10**9,
+        keep_last_n_checkpoints=0,
+        logger=None,
+        log_samples=False,
+        batch_size_type="frame",
+        max_padded_frames=1000,
+    )
+    assert trainer.max_padded_frames == 1000
+    assert trainer.batch_size_type == "frame"
 
 
 def _upstream_reference_loss(pred, flow, rand_span_mask):
