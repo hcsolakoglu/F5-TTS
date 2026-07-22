@@ -32,6 +32,19 @@ CUDA_INDUCTOR_EQUIVALENCE_KWARGS = [
 ]
 
 
+def _synthetic_compiler_error(message="synthetic compile failure"):
+    """Build a realistic torch.compile backend failure.
+
+    The runtime fallback only catches compiler-raised exception types. Simulating a
+    compile failure with a bare RuntimeError would test a code path that cannot occur
+    in production and would hide the fact that ordinary model errors must propagate
+    (see test_model_error_is_not_swallowed_by_compile_fallback).
+    """
+    from torch._dynamo.exc import BackendCompilerFailed
+
+    return BackendCompilerFailed(lambda: None, RuntimeError(message), None)
+
+
 def _build_model(
     *,
     audio_drop_prob=0.0,
@@ -313,7 +326,7 @@ def test_regional_dit_blocks_runtime_fallback_restores_eager_blocks():
     assert "forward" in block.__dict__
 
     def raise_compile_error(*_args, **_kwargs):
-        raise RuntimeError("synthetic dit block compile failure")
+        raise _synthetic_compiler_error("synthetic dit block compile failure")
 
     block.forward = raise_compile_error
     loss, _, _ = model._run_loss_core(*prepared_args)
@@ -1020,7 +1033,7 @@ def test_runtime_fallback_can_be_enabled_or_disabled():
     prepared_args = cast(PreparedArgs, model._prepare_training_inputs(mel.clone(), text.clone(), lens.clone()))
 
     def raise_compile_error(*_args):
-        raise RuntimeError("synthetic compile failure")
+        raise _synthetic_compiler_error()
 
     object.__setattr__(model, "_compiled_loss_core", raise_compile_error)
     object.__setattr__(model, "_compile_runtime_fallback", True)
@@ -1036,6 +1049,60 @@ def test_runtime_fallback_can_be_enabled_or_disabled():
     object.__setattr__(model, "_compile_runtime_fallback", False)
     with pytest.raises(RuntimeError, match="synthetic compile failure"):
         model._run_loss_core(*prepared_args)
+
+
+def test_model_error_is_not_swallowed_by_compile_fallback():
+    """A genuine model bug must propagate, not be disguised as a compile failure.
+
+    The fallback used to catch bare `Exception`, so a shape mismatch, a bad vocabulary
+    index or a failed assertion inside the transformer would silently disable compile,
+    report a misleading "compile failed" state, and then re-run the *same* bad input
+    eagerly -- producing a second, more confusing traceback and, for any transformer with
+    mutable state, applying that state twice.
+    """
+    model = _build_model()
+    mel, text, lens = _sample_batch()
+    prepared_args = cast(PreparedArgs, model._prepare_training_inputs(mel.clone(), text.clone(), lens.clone()))
+
+    calls = []
+
+    def raise_model_error(*_args):
+        calls.append(1)
+        raise RuntimeError("index out of range in self")
+
+    object.__setattr__(model, "_compiled_loss_core", raise_model_error)
+    object.__setattr__(model, "_compile_runtime_fallback", True)
+
+    with pytest.raises(RuntimeError, match="index out of range in self"):
+        model._run_loss_core(*prepared_args)
+
+    # the failing callable ran exactly once: no eager retry of a possibly-partial forward
+    assert calls == [1]
+    # and compile state is untouched, so the error is not misreported as a compile problem
+    assert model.training_compile_state["fallback_active"] is False
+    assert model.training_compile_state["error"] is None
+
+
+def test_host_out_of_memory_compiler_error_is_not_treated_as_cuda_capacity_oom():
+    """A compiler-side 'out of memory' must fall back, not hard-fail as a GPU OOM.
+
+    `_is_cuda_oom` used to match any RuntimeError containing "out of memory", so a Triton
+    autotune worker reporting *host* OOM was rewritten as a GPU capacity error and the
+    requested eager fallback was skipped.
+    """
+    model = _build_model()
+    mel, text, lens = _sample_batch()
+    prepared_args = cast(PreparedArgs, model._prepare_training_inputs(mel.clone(), text.clone(), lens.clone()))
+
+    def raise_host_oom(*_args):
+        raise _synthetic_compiler_error("Triton compile worker exited: host out of memory")
+
+    object.__setattr__(model, "_compiled_loss_core", raise_host_oom)
+    object.__setattr__(model, "_compile_runtime_fallback", True)
+
+    loss, _, _ = model._run_loss_core(*prepared_args)
+    assert torch.isfinite(loss)
+    assert model.training_compile_state["fallback_active"] is True
 
 
 def test_cuda_oom_from_compiled_core_is_not_swallowed_into_eager_fallback():
@@ -1094,7 +1161,7 @@ def test_non_oom_compile_failure_still_falls_back_when_enabled():
     prepared_args = cast(PreparedArgs, model._prepare_training_inputs(mel.clone(), text.clone(), lens.clone()))
 
     def raise_compile_error(*_args):
-        raise RuntimeError("synthetic compile failure")
+        raise _synthetic_compiler_error()
 
     object.__setattr__(model, "_compiled_loss_core", raise_compile_error)
     object.__setattr__(model, "_compile_runtime_fallback", True)
@@ -1495,33 +1562,122 @@ def test_default_loss_path_gradient_matches_average_of_means_not_global_mean():
         )
 
 
-def test_adamw_fused_uses_accelerator_device_not_global_cuda():
-    """fused must be driven by the actual accelerator device, not torch.cuda.is_available()."""
-    import inspect
+def test_adamw_fused_policy_preserves_upstream_on_cpu_and_cuda():
+    """CPU must keep upstream's fused kernel; only genuinely unsupported devices opt out.
 
-    from f5_tts.model.trainer import Trainer
+    Upstream requests `fused=True` unconditionally. Narrowing that to CUDA-only silently
+    downgraded CPU training to the unfused kernel, which changes optimizer numerics and
+    the serialized optimizer state even with compile disabled -- a backward-compatibility
+    break in a code path nobody opted into. Only MPS, which has no fused AdamW, may differ.
+    """
+    from f5_tts.model.trainer import FUSED_ADAMW_DEVICE_TYPES
 
-    source = inspect.getsource(Trainer.__init__)
-    assert 'self.accelerator.device.type == "cuda"' in source
-    assert "fused=torch.cuda.is_available()" not in source
+    assert "cpu" in FUSED_ADAMW_DEVICE_TYPES, "CPU fused AdamW is upstream behaviour"
+    assert "cuda" in FUSED_ADAMW_DEVICE_TYPES
+    assert "mps" not in FUSED_ADAMW_DEVICE_TYPES, "MPS has no fused AdamW kernel"
 
 
-def test_adamw_fused_false_when_accelerator_cpu_on_cuda_host():
-    """On a CUDA host with a CPU accelerator, AdamW must not request the fused kernel."""
-    if not torch.cuda.is_available():
-        pytest.skip("Requires a CUDA-capable host to prove the CPU-path divergence")
+def test_adamw_fused_is_actually_supported_on_cpu():
+    """Behavioural counterpart: the fused CPU kernel this policy relies on must exist.
 
-    from accelerate import Accelerator
-
-    # On a CUDA host the old code (torch.cuda.is_available()) would set fused=True;
-    # the patched logic keys off the actual accelerator device and must yield False.
-    cpu_accel = Accelerator(cpu=True)
-    use_fused = cpu_accel.device.type == "cuda"
-    assert use_fused is False
-    assert torch.cuda.is_available() is True  # proves the two checks diverge here
+    If a future torch drops fused CPU AdamW, this fails loudly instead of letting the
+    trainer raise at optimizer construction for every CPU user.
+    """
     model = torch.nn.Linear(4, 4)
-    opt = torch.optim.AdamW(model.parameters(), lr=1e-4, fused=use_fused)
-    assert opt.param_groups[0].get("fused", False) is False
+    opt = torch.optim.AdamW(model.parameters(), lr=1e-4, fused=True)
+    assert opt.param_groups[0].get("fused", False) is True
+
+    for parameter in model.parameters():
+        parameter.grad = torch.ones_like(parameter)
+    opt.step()  # must not raise
+    assert all(torch.isfinite(p).all() for p in model.parameters())
+
+
+def test_trainer_requests_fused_adamw_for_its_accelerator_device():
+    """The trainer must derive `fused` from the accelerator device, not global CUDA state.
+
+    Asserted behaviourally against the constructed optimizer rather than by grepping the
+    source, and without constructing a second Accelerator (AcceleratorState is a process
+    global; building one with a different device makes the test order-dependent and it
+    fails whenever an earlier test has already initialised CUDA).
+    """
+    from f5_tts.model.trainer import FUSED_ADAMW_DEVICE_TYPES, Trainer
+
+    model = _build_model()
+    trainer = Trainer(
+        model,
+        epochs=1,
+        learning_rate=1e-4,
+        num_warmup_updates=1,
+        save_per_updates=10**9,
+        keep_last_n_checkpoints=0,
+        logger=None,
+        log_samples=False,
+    )
+    expected = trainer.accelerator.device.type in FUSED_ADAMW_DEVICE_TYPES
+    assert trainer.optimizer.param_groups[0].get("fused", False) is expected
+
+
+def _upstream_reference_loss(pred, flow, rand_span_mask):
+    """The exact pre-compile upstream reduction, transcribed from SWivid/F5-TTS 2ae2c9b.
+
+    loss = F.mse_loss(pred, flow, reduction="none")
+    loss = loss[rand_span_mask]
+    return loss.mean(), cond, pred
+    """
+    loss = torch.nn.functional.mse_loss(pred, flow, reduction="none")
+    return loss[rand_span_mask].mean()
+
+
+def test_default_path_loss_is_bitwise_identical_to_upstream():
+    """With compile disabled, the loss must be bit-for-bit upstream's -- not merely close.
+
+    The compile-friendly reduction `(loss * mask).sum() / denom` is algebraically equal to
+    upstream's `loss[mask].mean()` but reassociates the summation, so it differs by ~1 ULP
+    on roughly 40% of inputs. Training is chaotic: a 1-ULP loss difference compounds into a
+    visibly different trajectory, so users who never enabled compile would silently stop
+    reproducing their previous runs. This test fails if the default path ever adopts the
+    compiled reduction.
+    """
+    model = _build_model()
+    mismatches = 0
+    for seed in range(25):
+        torch.manual_seed(seed)
+        mel = torch.randn(3, 37, 8)
+        text = torch.randint(0, 32, (3, 11))
+        lens = torch.tensor([37, 29, 33])
+        prepared = cast(PreparedArgs, model._prepare_training_inputs(mel, text, lens))
+        x1, _text, _mask, rand_span_mask, x0, _time, _dac, _dt = prepared
+
+        loss, _cond, pred = model._run_loss_core(*prepared)
+        reference = _upstream_reference_loss(pred, x1 - x0, rand_span_mask)
+
+        assert loss.dtype == reference.dtype
+        if loss.item() != reference.item():
+            mismatches += 1
+    assert mismatches == 0, f"default loss diverged from upstream on {mismatches}/25 seeds"
+
+
+def test_compiled_reduction_is_close_but_not_required_to_be_bitwise_equal():
+    """The compiled reduction may differ by ~1 ULP; it must stay within tight tolerance.
+
+    Documents the deliberate asymmetry: exactness is owed to users who did NOT opt in,
+    while the opt-in compiled path only owes numerical equivalence.
+    """
+    model = _build_model()
+    torch.manual_seed(0)
+    mel = torch.randn(3, 37, 8)
+    text = torch.randint(0, 32, (3, 11))
+    lens = torch.tensor([37, 29, 33])
+    prepared = cast(PreparedArgs, model._prepare_training_inputs(mel, text, lens))
+    x1, _text, _mask, rand_span_mask, x0, _time, _dac, _dt = prepared
+
+    upstream_loss, _cond, pred = model._run_loss_core(*prepared)
+    components_loss, _sum, _denom, _cond2, _pred2 = model._forward_loss_core_components(*prepared)
+
+    assert torch.allclose(upstream_loss, components_loss, rtol=1e-6, atol=1e-7)
+    assert components_loss.dtype == torch.float32  # fp32 accumulation guard is preserved
+    del pred, rand_span_mask
 
 
 def test_dit_text_embed_keeps_symint_in_non_tensor_path():

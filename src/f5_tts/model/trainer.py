@@ -21,6 +21,11 @@ from f5_tts.model.dataset import DynamicBatchSampler, collate_fn
 from f5_tts.model.utils import default, exists
 
 
+# Device types whose torch.optim.AdamW provides a fused kernel. MPS is the notable
+# omission; requesting fused=True there raises at optimizer construction.
+FUSED_ADAMW_DEVICE_TYPES = ("cuda", "cpu", "xpu", "privateuseone")
+
+
 # trainer
 
 
@@ -167,9 +172,13 @@ class Trainer:
 
             self.optimizer = bnb.optim.AdamW8bit(model.parameters(), lr=learning_rate)
         else:
-            # fused AdamW requires the actual training device to be CUDA; global
-            # torch.cuda.is_available() is wrong when Accelerate runs on CPU/MPS on a CUDA host.
-            use_fused = self.accelerator.device.type == "cuda"
+            # Upstream requests fused=True unconditionally, which raises when Accelerate
+            # runs on a device whose AdamW has no fused kernel (notably MPS). Restrict the
+            # request to devices that actually support it rather than to CUDA alone: fused
+            # AdamW also supports CPU, and downgrading CPU training to the unfused kernel
+            # would change optimizer numerics and checkpoint contents relative to upstream
+            # even with compile disabled.
+            use_fused = self.accelerator.device.type in FUSED_ADAMW_DEVICE_TYPES
             self.optimizer = AdamW(model.parameters(), lr=learning_rate, fused=use_fused)
         self.model, self.optimizer = self.accelerator.prepare(self.model, self.optimizer)
         self._unwrapped_model = self.accelerator.unwrap_model(self.model)
@@ -245,11 +254,19 @@ class Trainer:
                 print("DDP detected: runtime compile fallback disabled (errors will raise on all ranks).")
 
     def _sync_compile_setup_ddp(self):
-        """Synchronise setup-time compile fallback across DDP ranks.
+        """Synchronise *setup-time* compile fallback across DDP ranks.
 
-        If any rank failed to compile, all ranks switch to eager so the gradient all-reduce
-        stays consistent. Uses a single all_reduce(MAX) collective in which every rank
-        participates; no rank-only collective that would hang the others.
+        If any rank failed to compile during setup, all ranks switch to eager so the
+        gradient all-reduce stays consistent. Uses a single all_reduce(MAX) collective in
+        which every rank participates; no rank-only collective that would hang the others.
+
+        This covers setup only. A compile failure that first surfaces at *runtime* on a
+        single rank is deliberately fatal for that rank (runtime fallback is disabled under
+        DDP, see ``_configure_compile``): the alternative, one rank silently going eager,
+        would desynchronise gradients and corrupt training silently. A dying rank aborts
+        the job through the launcher, which is the intended fail-fast behaviour -- it is
+        not a graceful, collective-safe recovery, and no per-step collective is added to
+        make it one because that cost would be paid by every healthy step.
         """
         if self.accelerator.num_processes <= 1:
             return

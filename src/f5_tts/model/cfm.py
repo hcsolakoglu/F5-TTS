@@ -35,11 +35,54 @@ TRAINING_COMPILE_TARGETS = ("cfm_loss_core", "dit_blocks")
 
 
 def _is_cuda_oom(exc: BaseException) -> bool:
-    """Return True for CUDA out-of-memory errors, typed or message-based."""
+    """Return True only for a genuine CUDA allocator out-of-memory error.
+
+    Both checks require the message to mention CUDA. ``torch.cuda.OutOfMemoryError``
+    is an alias of the generic ``torch.OutOfMemoryError`` in current PyTorch, so the
+    type alone also matches host/CPU allocator failures. And a bare ``"out of memory"``
+    substring match would misclassify compiler-side failures (for example a Triton
+    autotune worker reporting *host* OOM) as a GPU capacity problem, hard-failing a run
+    that should have fallen back to eager.
+    """
     oom_type = getattr(torch.cuda, "OutOfMemoryError", None)
     if oom_type is not None and isinstance(exc, oom_type):
-        return True
-    return isinstance(exc, RuntimeError) and "out of memory" in str(exc).lower()
+        return "cuda" in str(exc).lower()
+    if isinstance(exc, RuntimeError):
+        message = str(exc).lower()
+        return "out of memory" in message and "cuda" in message
+    return False
+
+
+def _compile_failure_types() -> tuple[type[BaseException], ...]:
+    """Exception types that mean 'the compiler failed', not 'the model is wrong'.
+
+    Only these justify an eager retry. A compiler failure is raised while Dynamo is
+    tracing or while the backend is lowering, i.e. *before* the graph executes, so a
+    retry cannot double-apply side effects. Ordinary model errors (shape mismatch, bad
+    vocabulary index, dtype error, assertion) must propagate unchanged: swallowing them
+    would hide a real bug behind a misleading "compile fallback" message and then raise
+    a second, more confusing error from the eager retry.
+    """
+    types: list[type[BaseException]] = []
+    try:
+        from torch._dynamo import exc as dynamo_exc
+
+        for name in ("BackendCompilerFailed", "Unsupported", "InternalTorchDynamoError", "TorchRuntimeError"):
+            candidate = getattr(dynamo_exc, name, None)
+            if isinstance(candidate, type) and issubclass(candidate, BaseException):
+                types.append(candidate)
+    except Exception:  # pragma: no cover - torch without _dynamo
+        pass
+    try:
+        from torch._inductor import exc as inductor_exc
+
+        for name in ("InductorError", "CppCompileError", "CUDACompileError"):
+            candidate = getattr(inductor_exc, name, None)
+            if isinstance(candidate, type) and issubclass(candidate, BaseException):
+                types.append(candidate)
+    except Exception:  # pragma: no cover - torch without _inductor
+        pass
+    return tuple(types)
 
 
 class CFM(nn.Module):
@@ -207,6 +250,10 @@ class CFM(nn.Module):
         exactly. The only RNG inside the compiled region is nn.Dropout in the transformer;
         torch.get_rng_state does not round-trip the Philox offset used by compiled code, so
         restoring it would give a false guarantee. A fresh dropout draw on fallback is valid.
+
+        Only *compiler* failures trigger the eager retry (see ``_compile_failure_types``).
+        Ordinary model errors propagate unchanged so a genuine bug is not disguised as a
+        compile problem and then re-raised from a second, partially-executed forward.
         """
         compiled = self.__dict__.get("_compiled_loss_core")
         compiled_active = self._training_compile_enabled()
@@ -227,8 +274,9 @@ class CFM(nn.Module):
                     "torch.compile CFM loss core ran out of GPU memory; not falling "
                     "back to eager (reduce batch size / sequence length)."
                 ) from exc
-            runtime_fallback = self._compile_runtime_fallback
-            if not runtime_fallback:
+            if not self._compile_runtime_fallback:
+                raise
+            if not isinstance(exc, _compile_failure_types()):
                 raise
             # Permanently disable compile for the rest of this run.
             self.clear_training_compile()
@@ -237,9 +285,53 @@ class CFM(nn.Module):
             return self._forward_loss_core_components(*args)
 
     def _run_loss_core(self, *args):
-        """Run the loss core and preserve the public training return shape."""
+        """Run the loss core and preserve the public training return shape.
+
+        With compile disabled this dispatches to the bit-exact upstream reduction so the
+        default training path is byte-identical to F5-TTS without this feature. The
+        compile-friendly reduction is algebraically identical but reassociates the sum,
+        which changes the result by ~1 ULP -- acceptable for an opt-in speedup, not
+        acceptable for users who never asked for it.
+        """
+        if not self._training_compile_enabled():
+            return self._forward_loss_core_upstream_exact(*args)
         loss, _, _, cond, pred = self._run_loss_core_components(*args)
         return loss, cond, pred
+
+    def _forward_loss_core_upstream_exact(
+        self,
+        x1: torch.Tensor,
+        text: torch.Tensor,
+        mask: torch.Tensor,
+        rand_span_mask: torch.Tensor,
+        x0: torch.Tensor,
+        time: torch.Tensor,
+        drop_audio_cond: bool | torch.Tensor,
+        drop_text: bool | torch.Tensor,
+    ):
+        """Reproduce upstream's loss reduction exactly (never compiled).
+
+        ``loss[rand_span_mask]`` produces a data-dependent shape, which graph-breaks under
+        torch.compile -- that is precisely why the compiled path uses the masked-multiply
+        form instead. Keeping this expression for the default path is what makes
+        compile-disabled training bit-for-bit identical to upstream, including dtype: the
+        compiled path accumulates in fp32 (needed so a raw ``loss_sum`` cannot overflow
+        fp16), whereas upstream returns the input dtype.
+        """
+        t = time.unsqueeze(-1).unsqueeze(-1)
+        φ = (1 - t) * x0 + t * x1
+        flow = x1 - x0
+
+        cond = torch.where(rand_span_mask[..., None], torch.zeros_like(x1), x1)
+
+        pred = self.transformer(
+            x=φ, cond=cond, text=text, time=time, drop_audio_cond=drop_audio_cond, drop_text=drop_text, mask=mask
+        )
+
+        loss = F.mse_loss(pred, flow, reduction="none")
+        loss = loss[rand_span_mask]
+
+        return loss.mean(), cond, pred
 
     def _prepare_training_inputs(self, inp, text, lens):
         """Stochastic preparation shared by ``forward`` (stays eager; not compiled)."""

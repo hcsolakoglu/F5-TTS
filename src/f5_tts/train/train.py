@@ -27,7 +27,9 @@ def main(model_cfg):
         f"{model_cfg.model.name}_{mel_spec_type}_{model_cfg.model.tokenizer}_{model_cfg.datasets.name}",
     )
     wandb_resume_id = model_cfg.ckpts.get("wandb_resume_id", None)
-    compile_cfg = model_cfg.get("compile", {})
+    # `or {}` (not a `get` default) so an explicit `compile: null` in a user's config
+    # behaves like an absent block instead of raising AttributeError on the first lookup.
+    compile_cfg = model_cfg.get("compile") or {}
 
     # set text tokenizer
     if tokenizer != "custom":
