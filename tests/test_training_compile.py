@@ -1461,6 +1461,11 @@ def test_host_out_of_memory_compiler_error_is_not_treated_as_cuda_capacity_oom()
 
 
 def test_cuda_oom_from_compiled_core_is_not_swallowed_into_eager_fallback():
+    """A real CUDA OOM must keep its original type/message so standard handlers match.
+
+    The OOM is re-raised unchanged (bare ``raise``) with a compile-context note that does
+    not alter ``str(exc)``; eager fallback must stay disabled for OOM.
+    """
     model = _build_model()
     mel, text, lens = _sample_batch()
     prepared_args = cast(PreparedArgs, model._prepare_training_inputs(mel.clone(), text.clone(), lens.clone()))
@@ -1471,15 +1476,22 @@ def test_cuda_oom_from_compiled_core_is_not_swallowed_into_eager_fallback():
     object.__setattr__(model, "_compiled_loss_core", raise_oom)
     object.__setattr__(model, "_compile_runtime_fallback", True)
 
-    with pytest.raises(RuntimeError, match="ran out of GPU memory") as exc_info:
+    with pytest.raises(torch.cuda.OutOfMemoryError, match="CUDA out of memory") as exc_info:
         model._run_loss_core(*prepared_args)
 
-    assert isinstance(exc_info.value.__cause__, torch.cuda.OutOfMemoryError)
+    # Original type and message preserved; no synthetic rewrite.
+    assert "CUDA out of memory" in str(exc_info.value)
+    # A compile-context note is attached without changing the message used for matching.
+    notes = getattr(exc_info.value, "__notes__", None) or []
+    assert any("not falling back to eager" in n for n in notes)
+    # Bare raise sets __context__ (not __cause__); there is no chained synthetic error.
+    assert exc_info.value.__cause__ is None
     assert model.training_compile_state["enabled"] is True
     assert model.training_compile_state["fallback_active"] is False
 
 
 def test_message_based_oom_runtimeerror_also_skips_fallback():
+    """A message-based CUDA OOM RuntimeError keeps its original message and skips fallback."""
     model = _build_model()
     mel, text, lens = _sample_batch()
     prepared_args = cast(PreparedArgs, model._prepare_training_inputs(mel.clone(), text.clone(), lens.clone()))
@@ -1490,12 +1502,16 @@ def test_message_based_oom_runtimeerror_also_skips_fallback():
     object.__setattr__(model, "_compiled_loss_core", raise_oom_msg)
     object.__setattr__(model, "_compile_runtime_fallback", True)
 
-    with pytest.raises(RuntimeError, match="ran out of GPU memory"):
+    with pytest.raises(RuntimeError, match="out of memory") as exc_info:
         model._run_loss_core(*prepared_args)
+    # Original message preserved (no 'ran out of GPU memory' rewrite).
+    assert "cuda runtime error: out of memory" in str(exc_info.value)
+    assert "ran out of GPU memory" not in str(exc_info.value)
     assert model.training_compile_state["fallback_active"] is False
 
 
 def test_oom_still_raises_when_runtime_fallback_disabled():
+    """With runtime fallback disabled, a CUDA OOM still raises the original exception."""
     model = _build_model()
     mel, text, lens = _sample_batch()
     prepared_args = cast(PreparedArgs, model._prepare_training_inputs(mel.clone(), text.clone(), lens.clone()))
@@ -1506,8 +1522,47 @@ def test_oom_still_raises_when_runtime_fallback_disabled():
     object.__setattr__(model, "_compiled_loss_core", raise_oom)
     object.__setattr__(model, "_compile_runtime_fallback", False)
 
-    with pytest.raises(RuntimeError, match="ran out of GPU memory"):
+    with pytest.raises(torch.cuda.OutOfMemoryError, match="CUDA out of memory"):
         model._run_loss_core(*prepared_args)
+    assert model.training_compile_state["fallback_active"] is False
+
+
+def test_dit_blocks_eager_region_oom_is_not_mislabeled_as_compiled_loss_core_oom():
+    """Under target='dit_blocks' the CFM loss core runs eager; an OOM there must keep its
+    original type/message and must NOT be relabeled as a 'compiled CFM loss core' OOM.
+
+    With _compiled_loss_core is None (regional target), _run_loss_core_components takes the
+    eager _forward_loss_core_components path (cfm.py); an OOM raised from that eager region
+    must propagate unchanged.
+    """
+    model = _build_model()
+    mel, text, lens = _sample_batch()
+    prepared_args = cast(PreparedArgs, model._prepare_training_inputs(mel.clone(), text.clone(), lens.clone()))
+
+    # Simulate a dit_blocks setup: no compiled loss-core callable, but compile "enabled"
+    # via the transformer state so _training_compile_enabled() is True and the eager
+    # loss-core path is selected inside _run_loss_core_components.
+    object.__setattr__(model, "_compiled_loss_core", None)
+    object.__setattr__(model, "_compile_target", "dit_blocks")
+    object.__setattr__(model, "_compile_runtime_fallback", True)
+    object.__setattr__(model.transformer, "_dit_compile_target", "dit_blocks")
+
+    original_components = model._forward_loss_core_components
+
+    def raise_oom_eager(*_args):
+        raise torch.cuda.OutOfMemoryError("CUDA out of memory. Tried to allocate 4.00 GiB")
+
+    object.__setattr__(model, "_forward_loss_core_components", raise_oom_eager)
+    try:
+        with pytest.raises(torch.cuda.OutOfMemoryError, match="CUDA out of memory") as exc_info:
+            model._run_loss_core(*prepared_args)
+    finally:
+        object.__setattr__(model, "_forward_loss_core_components", original_components)
+
+    # The eager-region OOM must not be relabeled with a compiled-loss-core message.
+    assert "ran out of GPU memory" not in str(exc_info.value)
+    assert "CFM loss core" not in str(exc_info.value)
+    assert model.training_compile_state["fallback_active"] is False
 
 
 def test_non_oom_compile_failure_still_falls_back_when_enabled():
@@ -2364,3 +2419,124 @@ def test_all_training_configs_define_global_masked_mean_default_false():
         config = yaml.safe_load(config_path.read_text())
         assert "optim" in config, config_path.name
         assert config["optim"].get("global_masked_mean") is False, config_path.name
+
+
+def test_post_fallback_default_path_keeps_fp32_components_reduction():
+    """After a runtime compile fallback, the default (non-components) loss path must keep
+    the fp32 masked-multiply reduction, not revert to the upstream input-dtype reduction.
+
+    The upstream-exact path computes ``F.mse_loss(pred, flow)`` in the input dtype; an fp16
+    AMP run that fell back mid-training would switch to fp16 squared error and could
+    overflow. The post-fallback path reuses ``_forward_loss_core_components`` (fp32), which
+    is numerically safe and matches the reduction the run used while compiled.
+    """
+    model = _build_model()
+    mel, text, lens = _sample_batch()
+    prepared = cast(PreparedArgs, model._prepare_training_inputs(mel.clone(), text.clone(), lens.clone()))
+
+    # Enable compile (eager backend keeps the test CPU-fast and deterministic).
+    model.compile_training_core(backend="eager", fullgraph=False, dynamic=None)
+    assert model.training_compile_state["enabled"] is True
+
+    # Inject a compiled callable that raises a compiler failure, then run once to trigger
+    # the runtime fallback (clear_training_compile + _compile_fallback_active=True).
+    def raise_compile_error(*_args):
+        raise _synthetic_compiler_error()
+
+    object.__setattr__(model, "_compiled_loss_core", raise_compile_error)
+    object.__setattr__(model, "_compile_runtime_fallback", True)
+    loss_first, _, _ = model._run_loss_core(*prepared)
+    assert torch.isfinite(loss_first)
+    assert model.training_compile_state["fallback_active"] is True
+    assert model.training_compile_state["enabled"] is False
+
+    # Subsequent default-path calls must use the fp32 components reduction.
+    loss_again, _, _ = model._run_loss_core(*prepared)
+    components_loss, _sum, _denom, _cond, _pred = model._forward_loss_core_components(*prepared)
+    assert loss_again.dtype == torch.float32
+    assert torch.equal(loss_again, components_loss)
+
+
+def test_post_fallback_fp32_reduction_matches_active_compiled_reduction():
+    """The post-fallback fp32 reduction must equal the reduction the run used while
+    compiled, so a mid-training fallback does not change the loss objective (only the
+    backend, eager vs compiled). Compares the post-fallback loss against a freshly
+    compiled-path loss from identical inputs.
+    """
+    model = _build_model()
+    torch.manual_seed(0)
+    mel = torch.randn(3, 37, 8)
+    text = torch.randint(0, 32, (3, 11))
+    lens = torch.tensor([37, 29, 33])
+    prepared = cast(PreparedArgs, model._prepare_training_inputs(mel, text, lens))
+
+    # Active-compiled reduction (eager backend: same reduction, no real compilation).
+    model.compile_training_core(backend="eager", fullgraph=False, dynamic=None)
+    compiled_loss, _, _ = model._run_loss_core(*prepared)
+
+    # Force fallback.
+    def raise_compile_error(*_args):
+        raise _synthetic_compiler_error()
+
+    object.__setattr__(model, "_compiled_loss_core", raise_compile_error)
+    object.__setattr__(model, "_compile_runtime_fallback", True)
+    model._run_loss_core(*prepared)  # triggers fallback
+    assert model.training_compile_state["fallback_active"] is True
+
+    # Same inputs -> post-fallback eager fp32 reduction must equal the compiled reduction.
+    fallback_loss, _, _ = model._run_loss_core(*prepared)
+    assert torch.equal(fallback_loss, compiled_loss)
+
+
+def test_never_compiled_default_path_stays_bit_exact_upstream_after_fallback_fix():
+    """The finding-6 fix must NOT change the never-compiled default path.
+
+    A model whose compile was never enabled (_compile_fallback_active stays False) must
+    still take the byte-exact upstream reduction, preserving the exact-default contract.
+    """
+    model = _build_model()
+    assert model.training_compile_state["fallback_active"] is False
+    assert model.training_compile_state["enabled"] is False
+
+    mismatches = 0
+    for seed in range(10):
+        torch.manual_seed(seed)
+        mel = torch.randn(3, 37, 8)
+        text = torch.randint(0, 32, (3, 11))
+        lens = torch.tensor([37, 29, 33])
+        prepared = cast(PreparedArgs, model._prepare_training_inputs(mel, text, lens))
+        x1, _text, _mask, rand_span_mask, x0, _time, _dac, _dt = prepared
+
+        loss, _cond, pred = model._run_loss_core(*prepared)
+        reference = _upstream_reference_loss(pred, x1 - x0, rand_span_mask)
+        assert loss.dtype == reference.dtype
+        if loss.item() != reference.item():
+            mismatches += 1
+    assert mismatches == 0, f"never-compiled default diverged from upstream on {mismatches}/10 seeds"
+
+
+def test_post_fallback_global_masked_mean_components_path_still_fp32():
+    """The global_masked_mean path (return_loss_components=True) must also stay fp32 after
+    fallback. forward(..., return_loss_components=True) calls _run_loss_core_components
+    directly, which dispatches to the fp32 _forward_loss_core_components when compile is
+    off -- this was already safe and must remain so.
+    """
+    model = _build_model()
+    mel, text, lens = _sample_batch()
+    prepared = cast(PreparedArgs, model._prepare_training_inputs(mel.clone(), text.clone(), lens.clone()))
+
+    model.compile_training_core(backend="eager", fullgraph=False, dynamic=None)
+
+    def raise_compile_error(*_args):
+        raise _synthetic_compiler_error()
+
+    object.__setattr__(model, "_compiled_loss_core", raise_compile_error)
+    object.__setattr__(model, "_compile_runtime_fallback", True)
+    # Trigger fallback via the components path.
+    _ = model(mel, text=text, lens=lens, return_loss_components=True)
+    assert model.training_compile_state["fallback_active"] is True
+
+    loss, loss_sum, denom, _cond, _pred = model(mel, text=text, lens=lens, return_loss_components=True)
+    assert loss.dtype == torch.float32
+    assert loss_sum.dtype == torch.float32
+    assert torch.isfinite(loss)

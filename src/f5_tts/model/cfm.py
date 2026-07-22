@@ -53,6 +53,26 @@ def _is_cuda_oom(exc: BaseException) -> bool:
     return False
 
 
+def _note_oom_compile_context(exc: BaseException) -> None:
+    """Attach a compile-context note to a CUDA OOM without changing its type/message.
+
+    ``add_note`` (Python 3.11+) appends to ``__notes__`` and is not part of
+    ``str(exc)``, so ``except`` type checks and message-based batch-size reducers
+    keep matching the original exception. Idempotent: never duplicates the note.
+    """
+    note = (
+        "torch.compile: GPU OOM; not falling back to eager "
+        "(reduce batch size / sequence length)."
+    )
+    add_note = getattr(exc, "add_note", None)
+    if add_note is None:
+        return
+    existing = getattr(exc, "__notes__", None) or ()
+    if note in existing:
+        return
+    add_note(note)
+
+
 def _compile_failure_types() -> tuple[type[BaseException], ...]:
     """Exception types that mean 'the compiler failed', not 'the model is wrong'.
 
@@ -169,9 +189,11 @@ class CFM(nn.Module):
 
         ``runtime_fallback`` (default True) lets a *forward* compile failure permanently
         switch this module to eager. Set it False under DDP so a failure raises on every
-        rank instead of desynchronising the gradient all-reduce. Note: this fallback covers
-        forward failures only; a compile failure during backward is not caught and will
-        raise; disable compile (``fallback_to_eager=False``) to surface such errors.
+        rank instead of desynchronising the gradient all-reduce. Note: this fallback
+        covers forward failures only; a compile failure during backward is not caught and
+        will raise. To surface such errors, set ``runtime_fallback=False`` (Trainer:
+        ``compile_fallback_to_eager=False``) so a compile failure raises instead of
+        silently switching to eager; compilation itself stays active.
         """
         if target not in TRAINING_COMPILE_TARGETS:
             valid = ", ".join(TRAINING_COMPILE_TARGETS)
@@ -268,12 +290,15 @@ class CFM(nn.Module):
         except Exception as exc:
             # A compiled CUDA OOM is a capacity failure, not a compiler failure.
             # Retrying eagerly usually repeats the same allocation pressure and can hide
-            # the real problem behind a fallback state, so preserve the OOM as cause.
+            # the real problem behind a fallback state, so never fall back on a real GPU
+            # OOM. Re-raise the ORIGINAL exception (bare ``raise``) so its concrete type
+            # (``torch.cuda.OutOfMemoryError``) and the standard ``CUDA out of memory``
+            # message survive: ``except torch.cuda.OutOfMemoryError`` handlers and
+            # message-based batch-size reducers depend on them. A note adds compile
+            # context without altering type or message matching.
             if _is_cuda_oom(exc):
-                raise RuntimeError(
-                    "torch.compile CFM loss core ran out of GPU memory; not falling "
-                    "back to eager (reduce batch size / sequence length)."
-                ) from exc
+                _note_oom_compile_context(exc)
+                raise
             if not self._compile_runtime_fallback:
                 raise
             if not isinstance(exc, _compile_failure_types()):
@@ -292,8 +317,21 @@ class CFM(nn.Module):
         compile-friendly reduction is algebraically identical but reassociates the sum,
         which changes the result by ~1 ULP -- acceptable for an opt-in speedup, not
         acceptable for users who never asked for it.
+
+        After a *runtime compile fallback* (``_compile_fallback_active``), the module is
+        back to eager, but we deliberately keep the fp32 masked-multiply reduction
+        (``_forward_loss_core_components``) instead of the upstream-exact path. The
+        upstream path computes ``F.mse_loss(pred, flow)`` in the input dtype, so an fp16
+        AMP run that fell back mid-training would switch from the compiled fp32
+        accumulation to fp16 squared error and could turn a finite loss into ``inf``/
+        ``nan``. The fp32 components path is numerically safe and matches the reduction
+        the run was using while compiled. The never-compiled default (``_compile_fallback_
+        active`` stays False) still takes the byte-exact upstream path.
         """
         if not self._training_compile_enabled():
+            if self._compile_fallback_active:
+                loss, _, _, cond, pred = self._forward_loss_core_components(*args)
+                return loss, cond, pred
             return self._forward_loss_core_upstream_exact(*args)
         loss, _, _, cond, pred = self._run_loss_core_components(*args)
         return loss, cond, pred
