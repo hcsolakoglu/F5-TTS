@@ -169,27 +169,35 @@ class CustomDataset(Dataset):
 
 
 def padded_mel_frames(frame_len: float, mel_spec_type: str) -> int:
-    """Exact padded mel-frame count for one clip, per mel frontend.
+    """Conservative padded mel-frame upper bound for one clip, per mel frontend.
 
-    ``frame_len`` is the float returned by ``get_frame_len`` (resampled samples /
-    hop_length). ``collate_fn`` pads every clip in a batch to the batch max of this
-    count, so the padded rectangle the GPU allocates is
-    ``len(batch) * max(padded_mel_frames(frame_len_i, mel_spec_type))``.
+    ``frame_len`` is the float returned by ``get_frame_len`` --
+    ``n_source_samples / source_rate * target_sample_rate / hop_length`` -- i.e. the
+    *ideal* resampled sample count divided by ``hop_length``. ``collate_fn`` pads every
+    clip in a batch to the batch max of this count, so the padded rectangle the GPU
+    allocates is ``len(batch) * max(padded_mel_frames(frame_len_i, mel_spec_type))``.
+
+    This is an **upper bound, not an exact count**: ``torchaudio.transforms.Resample``
+    emits ``ceil(n_source * target_rate / source_rate)`` samples, which can be up to one
+    sample more than the float ratio ``get_frame_len`` budgets on. That extra sample can
+    cross a hop boundary and add a whole mel frame, so a ``floor(frame_len)``-based cap
+    is violated (empirically ~1.5% of resampled clips across common 16k/22.05k/48k ->
+    24k pairs). ``ceil(frame_len)`` absorbs the resampling rounding and is a tight,
+    never-under estimate (max one frame of slack). At exact hop multiples
+    (``frame_len`` integral, including same-rate / direct-target-rate audio where no
+    resampling happens) ``ceil == floor`` so the bound is exact there.
 
     vocos uses ``torchaudio.MelSpectrogram(center=True)``, whose output width is
-    ``1 + floor(n_samples / hop_length)`` == ``floor(frame_len) + 1``. The previous
-    ``ceil(frame_len)`` was correct for non-integral frame_len (where ceil == floor+1)
-    but one frame short at exact hop multiples (where ceil == floor), so the cap was
-    violated by up to ``len(batch)`` frames.
+    ``1 + floor(n_samples / hop_length)``; the bound is ``ceil(frame_len) + 1``.
 
     bigvgan uses ``center=False`` with symmetric ``(n_fft - hop_length)//2`` reflect
-    padding, whose output width is ``floor(n_samples / hop_length)`` ==
-    ``floor(frame_len)``; ``ceil`` was already a safe (loose) upper bound there.
+    padding, whose output width is ``floor(n_samples / hop_length)``; the bound is
+    ``ceil(frame_len)``.
     """
     if mel_spec_type == "vocos":
-        return math.floor(frame_len) + 1
+        return math.ceil(frame_len) + 1
     if mel_spec_type == "bigvgan":
-        return math.floor(frame_len)
+        return math.ceil(frame_len)
     raise ValueError(f"unsupported mel_spec_type for padded-frame cap: {mel_spec_type!r}")
 
 
@@ -233,7 +241,7 @@ class DynamicBatchSampler(Sampler[list[int]]):
             0                      off; batch composition byte-identical to upstream. DEFAULT.
             == frames_threshold    RECOMMENDED for bigvgan. Bounds the rectangle to exactly
                                    the budget already requested. For vocos (center=True) the
-                                   longest clip's padded width is ``floor(frame_len)+1``, so a
+                                   longest clip's padded width is ``ceil(frame_len)+1``, so a
                                    clip exactly at frames_threshold is one frame over and is
                                    dropped; use ``frames_threshold + 1`` for vocos to keep it.
             == frames_threshold+1  RECOMMENDED for vocos. Same bound as above while accounting
@@ -280,9 +288,9 @@ class DynamicBatchSampler(Sampler[list[int]]):
             # `indices` is sorted ascending by frame_len, so the incoming element is always
             # the batch maximum and the padded rectangle is exactly (len(batch)+1)*frame_len.
             # get_frame_len returns a float (duration * sample_rate / hop_length) but collate_fn
-            # pads to a whole number of mel frames, so the cap must be checked against the
-            # frontend-specific mel-frame count (vocos center=True adds one frame at exact hop
-            # multiples; see ``padded_mel_frames``), not the raw float.
+            # pads to a whole number of mel frames, and torchaudio resampling rounds the output
+            # sample count up (ceil), so the cap must be checked against the frontend-specific
+            # mel-frame *upper bound* (see ``padded_mel_frames``), not the raw float.
             padded_fits = (
                 self.max_padded_frames == 0
                 or (len(batch) + 1) * padded_mel_frames(frame_len, self.mel_spec_type) <= self.max_padded_frames

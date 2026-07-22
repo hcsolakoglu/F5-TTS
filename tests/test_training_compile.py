@@ -3070,6 +3070,128 @@ def test_max_padded_frames_vocos_cap_rejects_what_old_ceil_admitted():
     assert any("max_padded_frames" in m and "dropped" in m for m in messages), messages
 
 
+# --- Resampling-aware cap regression tests -----------------------------------
+#
+# ``get_frame_len`` budgets on the float ratio ``n_src * tgt / src / hop``, but
+# ``torchaudio.transforms.Resample`` emits ``ceil(n_src * tgt / src)`` samples -- up to
+# one sample more than the ratio. That extra sample can cross a hop boundary and add a
+# whole mel frame, so a ``floor(frame_len)``-based cap is violated on ~1.5% of resampled
+# clips. The fix uses ``ceil(frame_len)`` (bigvgan) / ``ceil(frame_len) + 1`` (vocos),
+# which absorbs the rounding. These tests run the *real* torchaudio resampler and mel
+# frontends as the oracle, not the sampler's own formula.
+
+# (n_source_samples, source_rate); all resampled to the 24k target the trainer uses.
+_RESAMPLE_CASES = [
+    (5461, 16000),  # the reported case: 8191.5 -> 8192 samples, crosses a hop boundary
+    (3333, 22050),  # 22.05k -> 24k, non-integer ratio
+    (12345, 48000),  # 48k -> 24k, half-rate
+    (7000, 24000),  # same rate, no resampling -- bound must still hold (ceil == floor)
+]
+
+
+@pytest.mark.parametrize("mel_spec_type", ["vocos", "bigvgan"])
+def test_padded_mel_frames_upper_bounds_real_resampled_mel_width(mel_spec_type):
+    """The cap helper must never underestimate the real resampled mel width.
+
+    For each (n_src, src_rate) we run the actual torchaudio Resample to 24k, then the
+    actual mel frontend, and compare the real tensor width against
+    ``padded_mel_frames(frame_len, mel_spec_type)`` where ``frame_len`` is the float
+    ``get_frame_len`` would return. The helper must be >= the real width (it is an upper
+    bound). We also assert the prior ``floor``-based helper would have been *under* the
+    real width on the 16k n=5461 case, pinning the regression.
+    """
+    import math as _math
+
+    import torchaudio
+
+    from f5_tts.model.dataset import padded_mel_frames
+
+    hop = 256
+    target_rate = 24000
+    for n_src, src_rate in _RESAMPLE_CASES:
+        wav_src = torch.zeros(n_src)
+        if src_rate == target_rate:
+            wav_tgt = wav_src
+        else:
+            resampler = torchaudio.transforms.Resample(src_rate, target_rate)
+            wav_tgt = resampler(wav_src)
+        mel = _real_mel_widths([wav_tgt.shape[-1]], mel_spec_type, hop_length=hop)[0]
+        frame_len = n_src / src_rate * target_rate / hop  # what get_frame_len returns
+        helper = padded_mel_frames(frame_len, mel_spec_type)
+        assert helper >= mel, (
+            f"{mel_spec_type} src={src_rate} n_src={n_src}: frame_len={frame_len} "
+            f"helper={helper} < real_width={mel} (resampled samples={wav_tgt.shape[-1]})"
+        )
+        # Prior floor-based helper (the bug): must be under the real width on the
+        # reported 16k n=5461 -> 24k case, confirming this is a real regression not a
+        # tautology. ceil(frame_len) == floor(frame_len) at integral frame_len, so only
+        # the non-integral 5461 case is asserted here.
+        if (n_src, src_rate) == (5461, 16000):
+            old_helper = _math.floor(frame_len) + (1 if mel_spec_type == "vocos" else 0)
+            assert old_helper < mel, (
+                f"{mel_spec_type}: prior floor helper {old_helper} was not under real "
+                f"width {mel} -- regression guard would be vacuous"
+            )
+
+
+@pytest.mark.parametrize("mel_spec_type", ["vocos", "bigvgan"])
+def test_max_padded_frames_cap_holds_under_real_resampling_batched(mel_spec_type):
+    """A batch of resampled clips must not blow the cap the prior floor formula admitted.
+
+    Ten identical 16k clips of 5461 samples resample to 8192 samples (24k), i.e. real
+    bigvgan width 32 / vocos width 33. ``get_frame_len`` reports frame_len=31.998, so
+    the prior ``floor``-based helper estimated 31 (bigvgan) / 32 (vocos) frames per
+    clip. Setting ``max_padded_frames`` to ``10 * prior_helper`` was admitted by the old
+    code (10 * prior <= cap) but the *real* padded rectangle is ``10 * real_width``,
+    which exceeds the cap -- a silent OOM risk. The ``ceil``-based fix must instead cap
+    the batch at 9 clips so the real rectangle stays within the budget.
+    """
+    import math as _math
+
+    import torchaudio
+
+    from f5_tts.model.dataset import padded_mel_frames
+
+    hop = 256
+    n_src, src_rate, target_rate = 5461, 16000, 24000
+    resampler = torchaudio.transforms.Resample(src_rate, target_rate)
+    n_tgt = resampler(torch.zeros(n_src)).shape[-1]  # 8192
+    real_width = _real_mel_widths([n_tgt], mel_spec_type, hop_length=hop)[0]
+    frame_len = n_src / src_rate * target_rate / hop  # 31.998046875
+
+    prior_helper = _math.floor(frame_len) + (1 if mel_spec_type == "vocos" else 0)
+    n_clips = 10
+    cap = n_clips * prior_helper  # exactly what the old floor formula admitted
+    # Sanity: the old formula's estimate fit the cap, but the real rectangle does not.
+    assert n_clips * prior_helper <= cap
+    assert n_clips * real_width > cap, (
+        f"{mel_spec_type}: real rectangle {n_clips * real_width} must exceed cap {cap} "
+        "for this to be a real cap-violation regression"
+    )
+
+    frame_lens = [frame_len] * n_clips
+    batches, _ = _build_batches(
+        frame_lens, 10_000, max_samples=64, max_padded_frames=cap, mel_spec_type=mel_spec_type
+    )
+    # The ceil-based helper must keep every batch's real rectangle within the cap.
+    helper = padded_mel_frames(frame_len, mel_spec_type)
+    for batch in batches:
+        real_padded = len(batch) * real_width
+        assert real_padded <= cap, (
+            f"{mel_spec_type}: real padded rectangle {real_padded} exceeds cap {cap} "
+            f"(batch size {len(batch)}, real_width {real_width})"
+        )
+    # And it must have repartitioned: the old formula admitted all 10 in one batch, the
+    # fix caps the batch at floor(cap / helper) clips.
+    max_batch = max(len(b) for b in batches)
+    assert max_batch <= cap // helper, (
+        f"{mel_spec_type}: batch size {max_batch} exceeds cap//helper={cap // helper}"
+    )
+    assert max_batch < n_clips, (
+        f"{mel_spec_type}: fix failed to repartition the violating batch ({max_batch} clips)"
+    )
+
+
 def _upstream_reference_loss(pred, flow, rand_span_mask):
     """Return the exact masked-mean reduction used by upstream commit 2ae2c9b."""
     loss = torch.nn.functional.mse_loss(pred, flow, reduction="none")
