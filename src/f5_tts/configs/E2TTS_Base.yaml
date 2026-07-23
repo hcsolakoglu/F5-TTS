@@ -17,6 +17,21 @@ optim:
   max_grad_norm: 1.0  # gradient clipping
   bnb_optimizer: False  # use bnb 8bit AdamW optimizer or not
   global_masked_mean: False  # opt-in: equal-weight every masked frame across accumulation/DDP (default preserves per-microbatch mean)
+  # Opt-in cap on the PADDED batch rectangle (batch_size * max_frames), used when
+  # datasets.batch_size_type=frame. datasets.batch_size_per_gpu budgets the SUM of raw frame
+  # lengths; the tensor actually allocated is the padded rectangle. Measured worst-case
+  # overshoot at N=100k: 1.00x for LibriSpeech-/Emilia-shaped
+  # and uniform corpora, but 1.82x for bimodal ones (short prompts mixed with long-form audio).
+  #   0                      -> cap off (DEFAULT); valid-row datasets keep upstream batches
+  #   = datasets.batch_size_per_gpu -> lossless BigVGAN bound; for Vocos use this value + 1
+  #                             for center padding. Measured cost was <=0.06% more batches
+  #                             with no sample loss and unchanged total padded frames.
+  #   > datasets.batch_size_per_gpu -> deliberate slack; only matters on bimodal data
+  #   < datasets.batch_size_per_gpu -> not recommended: shrinks every batch, can discard samples
+  # Unrelated to torch.compile - compiled runs measured ~12% LOWER peak VRAM than eager, so
+  # Invalid-row length accounting is corrected independently of the cap. Enable this guard
+  # based on your corpus shape, not on whether compile is on.
+  max_padded_frames: 0
 
 model:
   name: E2TTS_Base

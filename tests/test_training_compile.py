@@ -2076,6 +2076,7 @@ def test_trainer_uses_persistent_workers_only_when_workers_are_enabled(monkeypat
     trainer.batch_size_per_gpu = 2
     trainer.max_samples = 2
     trainer.vocoder_name = "vocos"
+    trainer.max_padded_frames = 0  # set by Trainer.__init__; frame mode reads it at the sampler call site
     cast(Any, trainer).accelerator = DummyAccelerator()
     dataset = DummyDataset()
 

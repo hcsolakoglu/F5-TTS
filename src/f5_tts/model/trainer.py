@@ -75,7 +75,22 @@ class Trainer:
         compile_dynamic: bool | None = None,
         compile_fallback_to_eager: bool = True,
         global_masked_mean: bool = False,
+        max_padded_frames: int = 0,
     ):
+        if max_padded_frames < 0:
+            raise ValueError("max_padded_frames must be >= 0 (0 disables the padded-rectangle cap)")
+
+        # Sample batching has no length-aware sampler through which this cap could act.
+        # Reject before constructing Accelerator, trackers, EMA, or the optimizer so an
+        # invalid memory-safety configuration has no process or logging side effects.
+        if max_padded_frames and batch_size_type == "sample":
+            raise ValueError(
+                "max_padded_frames bounds the padded batch rectangle and is only supported "
+                "with batch_size_type='frame' (DynamicBatchSampler). batch_size_type='sample' "
+                "uses fixed-size shuffled batches with no length sorting, so the cap cannot "
+                "be applied. Use batch_size_type='frame' or leave max_padded_frames=0."
+            )
+
         ddp_kwargs = DistributedDataParallelKwargs(find_unused_parameters=True)
 
         if logger == "wandb" and not wandb.api.api_key:
@@ -154,6 +169,9 @@ class Trainer:
         self.max_samples = max_samples
         self.grad_accumulation_steps = grad_accumulation_steps
         self.max_grad_norm = max_grad_norm
+        # Optional cap on the padded batch rectangle for batch_size_type="frame".
+        # 0 disables the cap; see DynamicBatchSampler for invalid-row accounting.
+        self.max_padded_frames = max_padded_frames
 
         # mel vocoder config
         self.vocoder_name = mel_spec_type
@@ -567,6 +585,8 @@ class Trainer:
                 max_samples=self.max_samples,
                 random_seed=resumable_with_seed,  # This enables reproducible shuffling
                 drop_residual=False,
+                max_padded_frames=self.max_padded_frames,
+                mel_spec_type=self.vocoder_name,
             )
             train_dataloader = DataLoader(
                 train_dataset,

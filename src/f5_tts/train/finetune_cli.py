@@ -103,6 +103,19 @@ def parse_args():
         help="Opt-in: weight every masked frame equally across gradient accumulation and DDP "
         "(default off preserves the historical per-microbatch mean loss)",
     )
+    parser.add_argument(
+        "--max_padded_frames",
+        type=int,
+        default=0,
+        help="Opt-in cap on the padded batch rectangle (batch_size * max_frames) for "
+        "batch_size_type=frame. --batch_size_per_gpu budgets the SUM of raw frame lengths; "
+        "the tensor actually allocated is the padded rectangle. Measured worst-case overshoot: "
+        "1.00x on LibriSpeech-/Emilia-shaped and uniform corpora, 1.82x on bimodal ones. "
+        "Lossless value when enabling is --batch_size_per_gpu for BigVGAN or that value + 1 "
+        "for Vocos center padding (costs <=0.06%% more batches in measured corpora); a smaller "
+        "value shrinks every batch and can discard samples. Unrelated to torch.compile. "
+        "0 disables only the cap; invalid-row length accounting is corrected independently.",
+    )
     return parser.parse_args()
 
 
@@ -243,6 +256,7 @@ def main():
         compile_dynamic=compile_dynamic,
         compile_fallback_to_eager=not args.compile_no_fallback,
         global_masked_mean=args.global_masked_mean,
+        max_padded_frames=args.max_padded_frames,
     )
 
     train_dataset = load_dataset(args.dataset_name, tokenizer, mel_spec_kwargs=mel_spec_kwargs)
