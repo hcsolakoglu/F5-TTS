@@ -3,6 +3,7 @@ from __future__ import annotations
 import gc
 import math
 import os
+from typing import Any, cast
 
 import torch
 import torchaudio
@@ -18,6 +19,19 @@ from tqdm import tqdm
 from f5_tts.model import CFM
 from f5_tts.model.dataset import DynamicBatchSampler, collate_fn
 from f5_tts.model.utils import default, exists
+
+
+# Device types whose torch.optim.AdamW provides a fused kernel. Upstream requests
+# fused=True unconditionally, which raises at optimizer construction on devices without
+# a fused kernel. Use PyTorch's authoritative per-build helper when available so the
+# request tracks whatever the installed torch actually supports (e.g. mps/hpu/mtia on
+# newer builds); fall back to a conservative set for torch versions predating the helper.
+try:
+    from torch.optim.optimizer import _get_fused_kernels_supported_devices as _fused_devices
+
+    FUSED_ADAMW_DEVICE_TYPES = frozenset(_fused_devices())
+except ImportError:  # torch < 2.x lacks the helper; keep the historical safe set.
+    FUSED_ADAMW_DEVICE_TYPES = frozenset(("cuda", "cpu", "xpu", "privateuseone"))
 
 
 # trainer
@@ -53,6 +67,14 @@ class Trainer:
         is_local_vocoder: bool = False,  # use local path vocoder
         local_vocoder_path: str = "",  # local vocoder path
         model_cfg_dict: dict = dict(),  # training config
+        compile_enabled: bool = False,
+        compile_backend: str | None = "inductor",
+        compile_target: str = "cfm_loss_core",
+        compile_mode: str | None = None,
+        compile_fullgraph: bool = False,
+        compile_dynamic: bool | None = None,
+        compile_fallback_to_eager: bool = True,
+        global_masked_mean: bool = False,
     ):
         ddp_kwargs = DistributedDataParallelKwargs(find_unused_parameters=True)
 
@@ -66,6 +88,13 @@ class Trainer:
             gradient_accumulation_steps=grad_accumulation_steps,
             **accelerate_kwargs,
         )
+
+        # global_masked_mean backpropagates raw loss_sum and rescales parameter.grad
+        # after backward (see _scale_gradients_by_loss_denom). DeepSpeed/ZeRO partitions
+        # or frees .grad after backward, making that per-parameter scaling a silent no-op
+        # and applying gradients ~global_denom/(G*W) times too large. Reject explicitly.
+        if global_masked_mean:
+            self._reject_sharded_grad_backend_for_global_masked_mean()
 
         self.logger = logger
         if self.logger == "wandb":
@@ -117,7 +146,7 @@ class Trainer:
         self.num_warmup_updates = num_warmup_updates
         self.save_per_updates = save_per_updates
         self.keep_last_n_checkpoints = keep_last_n_checkpoints
-        self.last_per_updates = default(last_per_updates, save_per_updates)
+        self.last_per_updates = int(cast(Any, default(last_per_updates, save_per_updates)))
         self.checkpoint_path = default(checkpoint_path, "ckpts/test_f5-tts")
 
         self.batch_size_per_gpu = batch_size_per_gpu
@@ -135,17 +164,254 @@ class Trainer:
 
         self.duration_predictor = duration_predictor
 
+        # torch.compile configuration (optional, default-off)
+        self.compile_enabled = compile_enabled
+        self.compile_backend = compile_backend
+        self.compile_target = compile_target
+        self.compile_mode = compile_mode
+        self.compile_fullgraph = compile_fullgraph
+        self.compile_dynamic = compile_dynamic
+        self.compile_fallback_to_eager = compile_fallback_to_eager
+        # Opt-in global masked-mean loss normalization (default off): when enabled the
+        # trainer backprops per-microbatch loss_sum and rescales synced gradients by the
+        # global masked-frame denominator across accumulation windows and DDP ranks, so
+        # every masked frame is weighted equally. When disabled (default) the trainer
+        # preserves the historical per-microbatch mean-loss backward (average-of-means).
+        # Incompatible with DeepSpeed/ZeRO (rejected at construction): post-backward
+        # per-parameter .grad scaling requires unpartitioned gradients. AMP-safe: the
+        # loss core accumulates in fp32 and the normalisation scalar is a Python float
+        # (not pre-cast to the gradient dtype), so fp16 subnormal flush cannot corrupt
+        # the scale.
+        self.global_masked_mean = global_masked_mean
+        self.compile_active = False
+        self.compile_fallback_active = False
+        self._unwrapped_model = None  # cached after accelerator.prepare
+
         if bnb_optimizer:
             import bitsandbytes as bnb
 
             self.optimizer = bnb.optim.AdamW8bit(model.parameters(), lr=learning_rate)
         else:
-            self.optimizer = AdamW(model.parameters(), lr=learning_rate, fused=True)
+            # Upstream requests fused=True unconditionally, which raises when Accelerate
+            # runs on a device whose AdamW has no fused kernel (notably MPS). Restrict the
+            # request to devices that actually support it rather than to CUDA alone: fused
+            # AdamW also supports CPU, and downgrading CPU training to the unfused kernel
+            # would change optimizer numerics and checkpoint contents relative to upstream
+            # even with compile disabled.
+            use_fused = self.accelerator.device.type in FUSED_ADAMW_DEVICE_TYPES
+            self.optimizer = AdamW(model.parameters(), lr=learning_rate, fused=use_fused)
         self.model, self.optimizer = self.accelerator.prepare(self.model, self.optimizer)
+        self._unwrapped_model = self.accelerator.unwrap_model(self.model)
+        self._configure_compile()
 
     @property
     def is_main(self):
         return self.accelerator.is_main_process
+
+    # ---- torch.compile support (optional, default-off) ----
+
+    def _reject_sharded_grad_backend_for_global_masked_mean(self):
+        """Reject DeepSpeed/ZeRO when global_masked_mean is enabled.
+
+        ``_scale_gradients_by_loss_denom`` iterates ``self.model.parameters()`` and
+        multiplies ``parameter.grad`` in-place after ``accelerator.backward``. DeepSpeed
+        ZeRO-2/3 partitions or frees ``.grad`` after backward, so the loop becomes a
+        silent no-op and gradients are applied ``global_denom / (G * world_size)`` times
+        too large. This must fail fast rather than corrupt training silently.
+        """
+        plugin = getattr(self.accelerator.state, "deepspeed_plugin", None)
+        if plugin is not None:
+            raise NotImplementedError(
+                "global_masked_mean=True is incompatible with DeepSpeed/ZeRO: "
+                "post-backward per-parameter .grad scaling requires unpartitioned "
+                "gradients, but DeepSpeed partitions/frees .grad after backward. "
+                "Use global_masked_mean=False (default) with DeepSpeed."
+            )
+
+    def _configure_compile(self):
+        """Set up torch.compile on the CFM loss core if enabled.
+
+        Compilation is lazy (triggered by the first real training batch); there is no
+        synthetic preflight, which avoids shape/vocab mismatches with arbitrary models.
+        In DDP (num_processes > 1) runtime fallback is disabled: a per-rank eager fallback
+        would desynchronise the gradient all-reduce. Setup-time fallback is still allowed
+        and synchronised across ranks via ``_sync_compile_setup_ddp``.
+
+        Strict mode (``compile_fallback_to_eager=False``): a rank-local setup exception is
+        deferred until *every* rank has participated in the status collective
+        (``_sync_compile_setup_ddp``), then all ranks raise coherently -- the failing rank
+        re-raises its original exception, peers raise a collective-failure error. This
+        prevents a rank-divergent setup failure from stranding healthy ranks in an
+        unmatched collective. Single-process preserves the original immediate re-raise.
+        """
+        if not self.compile_enabled:
+            return
+
+        if not hasattr(torch, "compile"):
+            # torch.compile unavailable: participate in the collective before raising.
+            self.compile_active = False
+            if self.compile_fallback_to_eager:
+                self.compile_fallback_active = True
+                if self.is_main:
+                    print("torch.compile is unavailable; falling back to eager training.")
+            self._sync_compile_setup_ddp(local_failed=True)
+            if not self.compile_fallback_to_eager:
+                raise RuntimeError("torch.compile is unavailable in this PyTorch build")
+            return
+
+        compile_kwargs = {
+            "backend": self.compile_backend,
+            "mode": self.compile_mode,
+            "fullgraph": self.compile_fullgraph,
+            "dynamic": self.compile_dynamic,
+        }
+        compile_kwargs = {k: v for k, v in compile_kwargs.items() if v is not None}
+
+        # Under DDP, disable runtime fallback so a compile failure raises on all ranks
+        # (collective-safe) instead of one rank silently going eager.
+        runtime_fallback = self.compile_fallback_to_eager and self.accelerator.num_processes <= 1
+
+        setup_exc: Exception | None = None
+        try:
+            compile_fn = getattr(self._unwrapped_model, "compile_training_core", None)
+            if compile_fn is None:
+                raise TypeError("The training model does not expose compile_training_core()")
+            compile_target = getattr(self, "compile_target", "cfm_loss_core")
+            compile_fn(target=compile_target, runtime_fallback=runtime_fallback, **compile_kwargs)
+            self.compile_active = True
+        except Exception as exc:
+            # Defer the strict-mode re-raise until after the collective so every rank
+            # participates before any rank raises. Store the exception; in fallback mode
+            # also mark/clear for eager continuation. In strict mode compile_fallback_active
+            # stays False (we are not falling back — we are about to raise).
+            setup_exc = exc
+            self.compile_active = False
+            if self.compile_fallback_to_eager:
+                self.compile_fallback_active = True
+                if self.is_main:
+                    print(f"torch.compile setup failed; falling back to eager training. Error: {exc}")
+                clear_fn = getattr(self._unwrapped_model, "clear_training_compile", None)
+                if clear_fn is not None:
+                    clear_fn()
+
+        # Every rank participates in the status exchange before any rank raises.
+        any_failed = self._sync_compile_setup_ddp(local_failed=setup_exc is not None)
+
+        # Strict mode: raise coherently on ALL ranks after the collective.
+        if any_failed and not self.compile_fallback_to_eager:
+            if setup_exc is not None:
+                raise setup_exc
+            raise RuntimeError("torch.compile setup failed on at least one rank; aborting (strict mode).")
+
+        if self.compile_active and self.is_main:
+            compile_target = getattr(self, "compile_target", "cfm_loss_core")
+            print(
+                f"torch.compile enabled (target={compile_target}, backend={self.compile_backend}, "
+                f"mode={self.compile_mode}, fullgraph={self.compile_fullgraph}, dynamic={self.compile_dynamic})"
+            )
+            if self.accelerator.num_processes > 1 and self.compile_fallback_to_eager:
+                print("DDP detected: runtime compile fallback disabled (errors will raise on all ranks).")
+
+    def _sync_compile_setup_ddp(self, local_failed: bool = False) -> bool:
+        """Exchange setup-time compile status across DDP ranks via a single reduce.
+
+        Every rank participates before any rank raises, so a rank-divergent setup failure
+        cannot strand peers in an unmatched collective. ``local_failed`` carries strict-
+        mode failures (where ``compile_fallback_active`` is not set because we are about to
+        raise, not fall back). Returns ``True`` if any rank reported a setup failure. In
+        fallback mode, all ranks switch to eager so the gradient all-reduce stays
+        consistent. In strict mode the caller raises after this returns (see
+        ``_configure_compile``).
+
+        Uses ``accelerator.reduce(..., reduction='max')`` on a 0/1 flag rather than a raw
+        ``torch.distributed.all_reduce`` so the collective goes through Accelerate's
+        dispatch layer (handles DeepSpeed/FSDP process groups correctly). Single-process
+        returns the local flag directly with no collective.
+
+        This covers setup only. A compile failure that first surfaces at *runtime* on a
+        single rank is deliberately fatal for that rank (runtime fallback is disabled under
+        DDP, see ``_configure_compile``): the alternative, one rank silently going eager,
+        would desynchronise gradients and corrupt training silently. A dying rank aborts
+        the job through the launcher, which is the intended fail-fast behaviour -- it is
+        not a graceful, collective-safe recovery, and no per-step collective is added to
+        make it one because that cost would be paid by every healthy step.
+        """
+        failed = local_failed or self.compile_fallback_active
+        if self.accelerator.num_processes <= 1:
+            return failed
+        flag = torch.tensor(1.0 if failed else 0.0, device=self.accelerator.device)
+        flag = cast(torch.Tensor, self.accelerator.reduce(flag, reduction="max"))
+        any_failed = float(flag) > 0.0
+        if any_failed and self.compile_active:
+            if self.is_main:
+                print("torch.compile setup failed on at least one rank; switching all ranks to eager.")
+            clear_fn = getattr(self._unwrapped_model, "clear_training_compile", None)
+            if clear_fn is not None:
+                clear_fn()
+            self.compile_active = False
+        if any_failed:
+            self.compile_fallback_active = True
+        return any_failed
+
+    def _check_compile_runtime_fallback(self):
+        """Detect a runtime compile failure surfaced by the CFM module and update trainer state."""
+        if not self.compile_active:
+            return
+        state = getattr(self._unwrapped_model, "training_compile_state", None)
+        if state is not None and state["fallback_active"]:
+            if self.is_main:
+                print(f"torch.compile runtime failed; continuing eagerly. Error: {state['error']}")
+            self.compile_active = False
+            self.compile_fallback_active = True
+
+    def _global_loss_denom(self, local_loss_denom: torch.Tensor) -> torch.Tensor:
+        """Sum the masked-frame denominator across all ranks for the active update."""
+        if hasattr(self.accelerator, "device"):
+            local_loss_denom = local_loss_denom.to(device=self.accelerator.device)
+        local_loss_denom = local_loss_denom.detach().to(dtype=torch.float32)
+        global_loss_denom = cast(torch.Tensor, self.accelerator.reduce(local_loss_denom, reduction="sum"))
+        return global_loss_denom.clamp(min=1.0)
+
+    def _scale_gradients_by_loss_denom(self, global_loss_denom: torch.Tensor):
+        """Convert accumulated loss-sum gradients into global masked-mean gradients.
+
+        ``Accelerator.backward`` divides by ``gradient_accumulation_steps`` and DDP
+        averages gradients across ranks. We backpropagate raw ``loss_sum`` values, then
+        multiply the synced gradient buffer by ``G * world_size / global_denom`` so the
+        effective gradient is ``grad(sum(loss_sum) / sum(denom))``.
+
+        The scale is computed as a Python float and applied via ``mul_(float)`` rather
+        than pre-casting to ``parameter.grad.dtype``. Under fp16 AMP (which Accelerate
+        1.14 can enable via ``prepare_model`` autocast wrapping), a small scale such as
+        1e-6 would flush to a subnormal with zero precision bits (or to zero) when cast
+        to fp16, corrupting the gradient. A Python float scalar is handled at full
+        precision by the ATen kernel -- only the result is rounded back to the tensor's
+        dtype, preserving the scale's magnitude.
+
+        Pre-backward power-of-two divisor (evaluated, NOT implemented):
+        Backpropagating ``loss_sum / 2**16`` per microbatch and folding ``2**16`` into
+        the final scale is mathematically exact (powers of two are representable in
+        fp32/fp16), but provides no benefit and can be harmful under AMP: the loss core
+        already accumulates in fp32 (cfm.py ``_forward_loss_core_components``), so
+        ``loss_sum`` cannot overflow fp16; and ``GradScaler`` multiplies the loss by its
+        own adaptive scale (default 2**16) before backward, so a 2**16 divisor exactly
+        cancels the default scaler and *doubles* the effective divisor when the scaler
+        has backed off (e.g. 2**15), causing fp16 gradient underflow. The raw-sum AMP
+        concern is therefore addressed by the fp32 loss core + python-float scale, not by
+        a pre-backward divisor.
+        """
+        # Python float: avoids pre-casting the scale to the gradient dtype.
+        scale = (self.grad_accumulation_steps * self.accelerator.num_processes) / float(global_loss_denom.item())
+        for parameter in self.model.parameters():
+            if parameter.grad is not None:
+                parameter.grad.mul_(scale)
+
+    @staticmethod
+    def _materialize_log_scalars(loss: torch.Tensor, duration_loss: torch.Tensor | None):
+        """Synchronize each logged tensor at most once and reuse the Python scalars."""
+        loss_scalar = loss.item()
+        duration_loss_scalar = duration_loss.item() if duration_loss is not None else None
+        return loss_scalar, duration_loss_scalar
 
     def save_checkpoint(self, update, last=False):
         self.accelerator.wait_for_everyone()
@@ -182,7 +448,7 @@ class Trainer:
                         os.remove(os.path.join(self.checkpoint_path, oldest_checkpoint))
                         print(f"Removed old checkpoint: {oldest_checkpoint}")
 
-    def load_checkpoint(self):
+    def load_checkpoint(self) -> int:
         if (
             not exists(self.checkpoint_path)
             or not os.path.exists(self.checkpoint_path)
@@ -260,7 +526,7 @@ class Trainer:
 
         del checkpoint
         gc.collect()
-        return update
+        return int(cast(Any, update))
 
     def train(self, train_dataset: Dataset, num_workers=16, resumable_with_seed: int = None):
         if self.log_samples:
@@ -279,13 +545,15 @@ class Trainer:
         else:
             generator = None
 
+        persistent_workers = num_workers > 0
+
         if self.batch_size_type == "sample":
             train_dataloader = DataLoader(
                 train_dataset,
                 collate_fn=collate_fn,
                 num_workers=num_workers,
                 pin_memory=True,
-                persistent_workers=True,
+                persistent_workers=persistent_workers,
                 batch_size=self.batch_size_per_gpu,
                 shuffle=True,
                 generator=generator,
@@ -305,7 +573,7 @@ class Trainer:
                 collate_fn=collate_fn,
                 num_workers=num_workers,
                 pin_memory=True,
-                persistent_workers=True,
+                persistent_workers=persistent_workers,
                 batch_sampler=batch_sampler,
             )
         else:
@@ -327,7 +595,7 @@ class Trainer:
         train_dataloader, self.scheduler = self.accelerator.prepare(
             train_dataloader, self.scheduler
         )  # actual multi_gpu updates = single_gpu updates / gpu nums
-        start_update = self.load_checkpoint()
+        start_update = int(self.load_checkpoint())
         global_update = start_update
 
         if exists(resumable_with_seed):
@@ -338,6 +606,8 @@ class Trainer:
             skipped_dataloader = self.accelerator.skip_first_batches(train_dataloader, num_batches=skipped_batch)
         else:
             skipped_epoch = 0
+
+        loss_denom_accum = None
 
         for epoch in range(skipped_epoch, self.epochs):
             self.model.train()
@@ -361,6 +631,7 @@ class Trainer:
             )
 
             for batch in current_dataloader:
+                duration_loss = None
                 with self.accelerator.accumulate(self.model):
                     text_inputs = batch["text"]
                     mel_spec = batch["mel"].permute(0, 2, 1)
@@ -368,13 +639,36 @@ class Trainer:
 
                     # TODO. add duration predictor training
                     if self.duration_predictor is not None and self.accelerator.is_local_main_process:
-                        dur_loss = self.duration_predictor(mel_spec, lens=batch.get("durations"))
-                        self.accelerator.log({"duration loss": dur_loss.item()}, step=global_update)
+                        duration_loss = self.duration_predictor(mel_spec, lens=batch.get("durations")).detach()
 
-                    loss, cond, pred = self.model(
-                        mel_spec, text=text_inputs, lens=mel_lengths, noise_scheduler=self.noise_scheduler
-                    )
-                    self.accelerator.backward(loss)
+                    if self.global_masked_mean:
+                        loss, loss_sum, loss_denom, cond, pred = self.model(
+                            mel_spec,
+                            text=text_inputs,
+                            lens=mel_lengths,
+                            noise_scheduler=self.noise_scheduler,
+                            return_loss_components=True,
+                        )
+                        loss_denom = loss_denom.detach().to(dtype=torch.float32)
+                        loss_denom_accum = loss_denom if loss_denom_accum is None else loss_denom_accum + loss_denom
+                        self._check_compile_runtime_fallback()
+                        self.accelerator.backward(loss_sum)
+
+                        if self.accelerator.sync_gradients:
+                            assert loss_denom_accum is not None
+                            global_loss_denom = self._global_loss_denom(loss_denom_accum)
+                            self._scale_gradients_by_loss_denom(global_loss_denom)
+                            loss_denom_accum = None
+                    else:
+                        # Default: preserve historical per-microbatch mean-loss backward.
+                        loss, cond, pred = self.model(
+                            mel_spec,
+                            text=text_inputs,
+                            lens=mel_lengths,
+                            noise_scheduler=self.noise_scheduler,
+                        )
+                        self._check_compile_runtime_fallback()
+                        self.accelerator.backward(loss)
 
                     if self.max_grad_norm > 0 and self.accelerator.sync_gradients:
                         self.accelerator.clip_grad_norm_(self.model.parameters(), self.max_grad_norm)
@@ -383,20 +677,33 @@ class Trainer:
                     self.scheduler.step()
                     self.optimizer.zero_grad()
 
+                # Each .item() forces a CUDA sync. Materialise once on logging ranks and
+                # reuse the Python scalars for progress, tracker, and TensorBoard consumers.
+                loss_scalar = None
+                duration_loss_scalar = None
+                if self.accelerator.is_local_main_process:
+                    loss_scalar, duration_loss_scalar = self._materialize_log_scalars(loss, duration_loss)
+
                 if self.accelerator.sync_gradients:
                     if self.is_main:
                         self.ema_model.update()
 
                     global_update += 1
                     progress_bar.update(1)
-                    progress_bar.set_postfix(update=str(global_update), loss=loss.item())
+                    if self.accelerator.is_local_main_process:
+                        assert loss_scalar is not None
+                        progress_bar.set_postfix(update=str(global_update), loss=loss_scalar)
 
                 if self.accelerator.is_local_main_process:
-                    self.accelerator.log(
-                        {"loss": loss.item(), "lr": self.scheduler.get_last_lr()[0]}, step=global_update
-                    )
+                    assert loss_scalar is not None
+                    metrics = {"loss": loss_scalar, "lr": self.scheduler.get_last_lr()[0]}
+                    if duration_loss_scalar is not None:
+                        metrics["duration loss"] = duration_loss_scalar
+                    self.accelerator.log(metrics, step=int(global_update))
                 if self.logger == "tensorboard" and self.accelerator.is_main_process:
-                    self.writer.add_scalar("loss", loss.item(), global_update)
+                    assert loss_scalar is not None
+                    assert self.writer is not None
+                    self.writer.add_scalar("loss", loss_scalar, global_update)
                     self.writer.add_scalar("lr", self.scheduler.get_last_lr()[0], global_update)
 
                 if global_update % self.last_per_updates == 0 and self.accelerator.sync_gradients:
@@ -410,32 +717,45 @@ class Trainer:
                         infer_text = [
                             text_inputs[0] + ([" "] if isinstance(text_inputs[0], list) else " ") + text_inputs[0]
                         ]
-                        with torch.inference_mode(), self.accelerator.autocast():
-                            generated, _ = self.accelerator.unwrap_model(self.model).sample(
-                                cond=mel_spec[0][:ref_audio_len].unsqueeze(0),
-                                text=infer_text,
-                                duration=ref_audio_len * 2,
-                                steps=nfe_step,
-                                cfg_strength=cfg_strength,
-                                sway_sampling_coef=sway_sampling_coef,
-                            )
-                            generated = generated.to(torch.float32)
-                            gen_mel_spec = generated[:, ref_audio_len:, :].permute(0, 2, 1).to(self.accelerator.device)
-                            ref_mel_spec = batch["mel"][0, :, :ref_audio_len].unsqueeze(0)
-                            if self.vocoder_name == "vocos":
-                                gen_audio = vocoder.decode(gen_mel_spec).cpu()
-                                ref_audio = vocoder.decode(ref_mel_spec).cpu()
-                            elif self.vocoder_name == "bigvgan":
-                                gen_audio = vocoder(gen_mel_spec).squeeze(0).cpu()
-                                ref_audio = vocoder(ref_mel_spec).squeeze(0).cpu()
+                        # Switch the unwrapped model to eval so regional compile dispatch
+                        # (which keys on Module.training) routes inference through the eager
+                        # path. Logged samples use cfg_infer-doubled batches and swept
+                        # durations; routing them through the training compile cache would
+                        # exhaust its per-code-object recompile budget and silently push new
+                        # training shapes back to eager while compile is still reported active.
+                        sample_model = self.accelerator.unwrap_model(self.model)
+                        was_training = sample_model.training
+                        sample_model.eval()
+                        try:
+                            with torch.inference_mode(), self.accelerator.autocast():
+                                generated, _ = sample_model.sample(
+                                    cond=mel_spec[0][:ref_audio_len].unsqueeze(0),
+                                    text=infer_text,
+                                    duration=ref_audio_len * 2,
+                                    steps=nfe_step,
+                                    cfg_strength=cfg_strength,
+                                    sway_sampling_coef=sway_sampling_coef,
+                                )
+                                generated = generated.to(torch.float32)
+                                gen_mel_spec = (
+                                    generated[:, ref_audio_len:, :].permute(0, 2, 1).to(self.accelerator.device)
+                                )
+                                ref_mel_spec = batch["mel"][0, :, :ref_audio_len].unsqueeze(0)
+                                if self.vocoder_name == "vocos":
+                                    gen_audio = vocoder.decode(gen_mel_spec).cpu()
+                                    ref_audio = vocoder.decode(ref_mel_spec).cpu()
+                                elif self.vocoder_name == "bigvgan":
+                                    gen_audio = vocoder(gen_mel_spec).squeeze(0).cpu()
+                                    ref_audio = vocoder(ref_mel_spec).squeeze(0).cpu()
 
-                        torchaudio.save(
-                            f"{log_samples_path}/update_{global_update}_gen.wav", gen_audio, target_sample_rate
-                        )
-                        torchaudio.save(
-                            f"{log_samples_path}/update_{global_update}_ref.wav", ref_audio, target_sample_rate
-                        )
-                        self.model.train()
+                            torchaudio.save(
+                                f"{log_samples_path}/update_{global_update}_gen.wav", gen_audio, target_sample_rate
+                            )
+                            torchaudio.save(
+                                f"{log_samples_path}/update_{global_update}_ref.wav", ref_audio, target_sample_rate
+                            )
+                        finally:
+                            sample_model.train(was_training)
 
         self.save_checkpoint(global_update, last=True)
 

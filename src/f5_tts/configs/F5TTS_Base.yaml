@@ -16,6 +16,7 @@ optim:
   grad_accumulation_steps: 1  # note: updates = steps / grad_accumulation_steps
   max_grad_norm: 1.0  # gradient clipping
   bnb_optimizer: False  # use bnb 8bit AdamW optimizer or not
+  global_masked_mean: False  # opt-in: equal-weight every masked frame across accumulation/DDP (default preserves per-microbatch mean)
 
 model:
   name: F5TTS_Base  # model name
@@ -55,3 +56,24 @@ ckpts:
   keep_last_n_checkpoints: -1  # -1 to keep all, 0 to not save intermediate, > 0 to keep last N checkpoints
   last_per_updates: 5000  # save last checkpoint per updates
   save_dir: ckpts/${model.name}_${model.mel_spec.mel_spec_type}_${model.tokenizer}_${datasets.name}
+
+compile:
+  enabled: False  # optional torch.compile path; disabled by default
+  target: dit_blocks  # dit_blocks | cfm_loss_core
+  # dit_blocks compiles each DiT block (training only); cfm_loss_core compiles the whole
+  # loss core. Measured on variable-length data: dit_blocks pays ~40% less cold compile and
+  # reaches a similar steady state, so it amortizes far sooner. cfm_loss_core covers 100% of
+  # parameters and edges ahead on steady-state throughput once warm, so prefer it only for
+  # very long runs. Both were ~1.1x eager steady-state with ~12% lower peak VRAM.
+  backend: inductor  # requires triton on CUDA
+  # Keep the default mode for variable-length training. reduce-overhead and max-autotune
+  # were slower/unstable in measured variable-shape runs and are not recommended here.
+  mode: null
+  fullgraph: False  # NOTE: with fullgraph the recompile limit is a HARD error, not a fall back to eager
+  dynamic: null  # null lets Dynamo auto-promote varying dims after the 2nd distinct value;
+  # True compiles one symbolic graph up front, which halves recompiles and cold-compile time.
+  # False specializes per shape and is catastrophic for variable-length training.
+  fallback_to_eager: True  # fall back to eager if compile setup fails (runtime fallback disabled in DDP)
+  # Reproducibility note: with dropout > 0 (the default), Inductor uses its own RNG, so
+  # compiled dropout masks differ from eager. This is expected and statistically harmless.
+  # For eager-identical dropout, pass options={"fallback_random": True} to torch.compile.

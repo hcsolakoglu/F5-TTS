@@ -11,9 +11,11 @@ d - dimension
 from __future__ import annotations
 
 import threading
+from typing import cast
 
 import torch
 import torch.nn.functional as F
+import torch.utils.checkpoint
 from torch import nn
 from x_transformers.x_transformers import RotaryEmbedding
 
@@ -83,33 +85,42 @@ class TextEmbedding(nn.Module):
 
         return upsampled_text
 
-    def forward(self, text: int["b nt"], seq_len, drop_text=False):
-        text = text + 1  # use 0 as filler token. preprocess of batch pad -1, see list_str_to_idx()
+    def forward(self, text: int["b nt"], seq_len, drop_text=False, valid_seq_lens=None):
+        text_tensor = (
+            cast(torch.Tensor, text) + 1
+        )  # use 0 as filler token. preprocess of batch pad -1, see list_str_to_idx()
         valid_pos_mask = None
         if torch.is_tensor(seq_len):
-            seq_len = seq_len.to(device=text.device, dtype=torch.long)
-            max_seq_len = int(seq_len.max().item())
+            seq_len_tensor = seq_len.to(device=text_tensor.device, dtype=torch.long)
+            max_seq_len = int(seq_len_tensor.max().item())
+            if valid_seq_lens is None:
+                valid_seq_lens = seq_len_tensor
         else:
-            max_seq_len = int(seq_len)
+            # Keep SymInt (not int()) so dynamic-shape torch.compile does not specialize
+            # the graph per sequence length. In eager mode seq_len is already a Python int.
+            max_seq_len = seq_len
 
-        text = text[:, :max_seq_len]  # curtail if character tokens are more than the mel spec tokens
-        text = F.pad(text, (0, max_seq_len - text.shape[1]), value=0)
+        text_tensor = text_tensor[:, :max_seq_len]  # curtail if character tokens are more than the mel spec tokens
+        text_tensor = F.pad(text_tensor, (0, max_seq_len - text_tensor.shape[1]), value=0)
 
-        if torch.is_tensor(seq_len):
-            seq_pos = torch.arange(max_seq_len, device=text.device).unsqueeze(0)
-            valid_pos_mask = seq_pos < seq_len.unsqueeze(1)
-            text = text.masked_fill(~valid_pos_mask, 0)
+        if valid_seq_lens is not None:
+            valid_seq_lens = valid_seq_lens.to(device=text_tensor.device, dtype=torch.long)
+            seq_pos = torch.arange(max_seq_len, device=text_tensor.device).unsqueeze(0)
+            valid_pos_mask = seq_pos < valid_seq_lens.unsqueeze(1)
+            text_tensor = text_tensor.masked_fill(~valid_pos_mask, 0)
 
-        if self.mask_padding:
-            text_mask = text == 0
+        text_mask = text_tensor == 0
 
-        if drop_text:  # cfg for text
-            text = torch.zeros_like(text)
+        if torch.is_tensor(drop_text):
+            drop_text_flag = drop_text.to(device=text_tensor.device, dtype=torch.bool).reshape(())
+            text_tensor = torch.where(drop_text_flag, torch.zeros_like(text_tensor), text_tensor)
+        elif drop_text:  # cfg for text
+            text_tensor = torch.zeros_like(text_tensor)
 
-        text = self.text_embed(text)  # b n -> b n d
+        text_tensor = self.text_embed(text_tensor)  # b n -> b n d
         if valid_pos_mask is not None:
             # Keep short-sample tail strictly zero (equivalent to per-sample pad_sequence(..., 0)).
-            text = text.masked_fill(~valid_pos_mask.unsqueeze(-1), 0.0)
+            text_tensor = text_tensor.masked_fill(~valid_pos_mask.unsqueeze(-1), 0.0)
 
         # possible extra modeling
         if self.extra_modeling:
@@ -117,26 +128,30 @@ class TextEmbedding(nn.Module):
             freqs = self.freqs_cis[:max_seq_len, :]
             if valid_pos_mask is not None:
                 freqs = freqs.unsqueeze(0) * valid_pos_mask.unsqueeze(-1).to(freqs.dtype)
-            text = text + freqs
+            text_tensor = text_tensor + freqs
 
             # convnextv2 blocks
             if self.mask_padding:
-                text = text.masked_fill(text_mask.unsqueeze(-1).expand(-1, -1, text.size(-1)), 0.0)
+                text_tensor = text_tensor.masked_fill(text_mask.unsqueeze(-1).expand(-1, -1, text_tensor.size(-1)), 0.0)
                 for block in self.text_blocks:
-                    text = block(text)
-                    text = text.masked_fill(text_mask.unsqueeze(-1).expand(-1, -1, text.size(-1)), 0.0)
+                    text_tensor = block(text_tensor)
+                    text_tensor = text_tensor.masked_fill(
+                        text_mask.unsqueeze(-1).expand(-1, -1, text_tensor.size(-1)), 0.0
+                    )
             else:
-                text = self.text_blocks(text)
+                text_tensor = self.text_blocks(text_tensor)
 
         if self.average_upsampling:
-            if torch.is_tensor(seq_len):
-                target_lens = seq_len.to(device=text.device, dtype=torch.long)
+            if valid_seq_lens is not None:
+                target_lens = valid_seq_lens
+            elif torch.is_tensor(seq_len):
+                target_lens = seq_len.to(device=text_tensor.device, dtype=torch.long)
             else:
-                target_lens = torch.full((text.shape[0],), int(seq_len), device=text.device, dtype=torch.long)
+                target_lens = torch.full((text_tensor.shape[0],), seq_len, device=text_tensor.device, dtype=torch.long)
 
-            text = self.average_upsample_text_by_mask(text, ~text_mask, target_lens)
+            text_tensor = self.average_upsample_text_by_mask(text_tensor, ~text_mask, target_lens)
 
-        return text
+        return text_tensor
 
 
 # noised input audio and context mixing embedding
@@ -156,18 +171,26 @@ class InputEmbedding(nn.Module):
         drop_audio_cond=False,
         audio_mask: bool["b n"] | None = None,
     ):
-        if drop_audio_cond:  # cfg for cond audio
-            cond = torch.zeros_like(cond)
+        x_tensor = cast(torch.Tensor, x)
+        cond_tensor = cast(torch.Tensor, cond)
+        text_embed_tensor = cast(torch.Tensor, text_embed)
+        if torch.is_tensor(drop_audio_cond):
+            drop_audio_cond_flag = drop_audio_cond.to(device=cond_tensor.device, dtype=torch.bool).reshape(())
+            cond_tensor = torch.where(drop_audio_cond_flag, torch.zeros_like(cond_tensor), cond_tensor)
+        elif drop_audio_cond:  # cfg for cond audio
+            cond_tensor = torch.zeros_like(cond_tensor)
 
-        x = self.proj(torch.cat((x, cond, text_embed), dim=-1))
-        x = self.conv_pos_embed(x, mask=audio_mask) + x
-        return x
+        x_tensor = self.proj(torch.cat((x_tensor, cond_tensor, text_embed_tensor), dim=-1))
+        x_tensor = self.conv_pos_embed(x_tensor, mask=audio_mask) + x_tensor
+        return x_tensor
 
 
 # Transformer backbone using DiT blocks
 
 
 class DiT(nn.Module):
+    supports_tensor_cfg_training_flags = True
+
     def __init__(
         self,
         *,
@@ -232,6 +255,14 @@ class DiT(nn.Module):
 
         self.checkpoint_activations = checkpoint_activations
 
+        # Optional regional torch.compile state. These attributes intentionally stay out
+        # of nn.Module registration so checkpoint/state_dict keys are unchanged. Compiled
+        # per-block callables live only on the owning DiT and are stripped on
+        # deepcopy/pickle (see __getstate__/__setstate__) so copies deserialize eager and
+        # never share the source model's compiled closures or parameters.
+        object.__setattr__(self, "_dit_compile_target", None)
+        object.__setattr__(self, "_compiled_dit_block_forwards", None)
+
         self.initialize_weights()
 
     # `_cache_local` is lazily initialized on first inference-time cache write so that
@@ -281,6 +312,112 @@ class DiT(nn.Module):
 
         return ckpt_forward
 
+    @property
+    def training_compile_state(self):
+        return {
+            "enabled": self._dit_compile_target is not None,
+            "target": self._dit_compile_target,
+        }
+
+    # Compile-only state must not survive deepcopy/pickle: compiled callables are bound to
+    # the source model's parameters and are unpickleable (torch.compile internals). Copies
+    # and deserialized models must fall back to eager execution rather than silently share
+    # the source closure or crash on pickle. This mirrors nn.Module's own handling of
+    # ``_compiled_call_impl`` in __getstate__.
+    _DIT_COMPILE_ONLY_ATTRS = ("_dit_compile_target", "_compiled_dit_block_forwards")
+
+    def __getstate__(self):
+        state = super().__getstate__()
+        for attr in self._DIT_COMPILE_ONLY_ATTRS:
+            state.pop(attr, None)
+        return state
+
+    def __setstate__(self, state):
+        super().__setstate__(state)
+        for attr in self._DIT_COMPILE_ONLY_ATTRS:
+            object.__setattr__(self, attr, None)
+
+    def compile_training_target(self, target: str, **compile_kwargs):
+        """Compile a regional DiT training target without changing module ownership.
+
+        ``target='dit_blocks'`` compiles each existing ``DiTBlock``'s hook-aware
+        ``_call_impl`` and stores the compiled callables on the owning DiT. The
+        ``ModuleList`` and parameter registration remain unchanged, avoiding ``_orig_mod``
+        checkpoint keys and preserving Accelerate/DDP ownership. No ``block.forward`` is
+        patched, so deep copies, ``torch.save``, and multiprocessing spawn see ordinary
+        pickleable modules and deserialize to eager execution. Compiling ``_call_impl``
+        (the same mechanism ``nn.Module.compile`` uses) rather than the bare ``forward``
+        preserves forward pre/post hooks and full backward hooks exactly as in eager mode,
+        because ``_call_impl`` is nn.Module's hook-dispatch path.
+        """
+        if target != "dit_blocks":
+            raise ValueError("DiT regional compile target must be 'dit_blocks'")
+        if self.checkpoint_activations:
+            raise ValueError(
+                "torch.compile target=dit_blocks is incompatible with "
+                "DiT checkpoint_activations=True; disable activation checkpointing "
+                "or use target=cfm_loss_core."
+            )
+
+        self.clear_training_compile()
+        compiled = self._compile_each_dit_block(**compile_kwargs)
+        object.__setattr__(self, "_dit_compile_target", target)
+        return compiled
+
+    def clear_training_compile(self):
+        """Restore eager DiT execution after regional compilation."""
+        object.__setattr__(self, "_dit_compile_target", None)
+        object.__setattr__(self, "_compiled_dit_block_forwards", None)
+
+    def _compile_each_dit_block(self, **compile_kwargs):
+        # Compile each block's ``_call_impl`` rather than its bare ``forward``. ``_call_impl``
+        # is nn.Module's hook-aware dispatch: it runs forward pre/post hooks and wires full
+        # backward hooks (via BackwardHook) around ``forward``. Compiling it -- the same
+        # mechanism ``nn.Module.compile`` uses -- lets the owner-loop dispatch route through
+        # the compiled callable while preserving module hooks exactly as in eager mode.
+        # Compiling the bare ``forward`` instead would bypass ``_call_impl`` and silently
+        # drop every registered hook. ``block._compiled_call_impl`` is intentionally NOT set
+        # so eval/inference ``block(...)`` calls (which skip this training-gated dispatch)
+        # stay eager and never consume the training compile cache. Compile every block
+        # first; only commit the tuple to instance state once the whole list succeeds, so a
+        # partial failure leaves no compiled state behind.
+        compiled_forwards = tuple(
+            torch.compile(block._call_impl, **compile_kwargs) for block in self.transformer_blocks
+        )
+        object.__setattr__(self, "_compiled_dit_block_forwards", compiled_forwards)
+        return compiled_forwards
+
+    def _forward_block_range(self, x, t, mask, rope):
+        for block in self.transformer_blocks:
+            x = block(x, t, mask=mask, rope=rope)
+        return x
+
+    def _run_transformer_blocks(self, x, t, mask, rope):
+        if self.checkpoint_activations:
+            for block in self.transformer_blocks:
+                # https://pytorch.org/docs/stable/checkpoint.html#torch.utils.checkpoint.checkpoint
+                x = torch.utils.checkpoint.checkpoint(self.ckpt_wrapper(block), x, t, mask, rope, use_reentrant=False)
+            return x
+
+        # Regional compile dispatch: route through the compiled per-block callables only
+        # while training. Each callable is a compiled ``block._call_impl``, so calling it
+        # fires forward pre/post hooks and full backward hooks exactly as an eager
+        # ``block(...)`` would -- the compiled graph includes nn.Module's hook-dispatch
+        # path, not just the bare forward. Inference (CFM.sample, logged samples) uses the
+        # eager path so its distinct shapes (cfg_infer-doubled batch, swept durations)
+        # never consume the training compile cache's per-code-object recompile budget, and
+        # because ``block._compiled_call_impl`` is never set, an eager ``block(...)`` never
+        # accidentally enters the compiled path. Dispatch lives in the owner loop rather
+        # than on each block.forward so modules stay unpatched, deepcopy-safe, and
+        # pickleable.
+        compiled = self.__dict__.get("_compiled_dit_block_forwards")
+        if compiled is not None and self.training:
+            for compiled_forward in compiled:
+                x = compiled_forward(x, t, mask=mask, rope=rope)
+            return x
+
+        return self._forward_block_range(x, t, mask, rope)
+
     def get_input_embed(
         self,
         x,  # b n d
@@ -294,9 +431,11 @@ class DiT(nn.Module):
         if self.text_uncond is None or self.text_cond is None or not cache:
             if audio_mask is None:
                 seq_len = x.shape[1]
+                valid_seq_lens = None
             else:
-                seq_len = audio_mask.sum(dim=1)  # per-sample valid speech length
-            text_embed = self.text_embed(text, seq_len=seq_len, drop_text=drop_text)
+                seq_len = x.shape[1]
+                valid_seq_lens = audio_mask.sum(dim=1)  # per-sample valid speech length
+            text_embed = self.text_embed(text, seq_len=seq_len, drop_text=drop_text, valid_seq_lens=valid_seq_lens)
             if cache:
                 if drop_text:
                     self.text_uncond = text_embed
@@ -354,12 +493,7 @@ class DiT(nn.Module):
         if self.long_skip_connection is not None:
             residual = x
 
-        for block in self.transformer_blocks:
-            if self.checkpoint_activations:
-                # https://pytorch.org/docs/stable/checkpoint.html#torch.utils.checkpoint.checkpoint
-                x = torch.utils.checkpoint.checkpoint(self.ckpt_wrapper(block), x, t, mask, rope, use_reentrant=False)
-            else:
-                x = block(x, t, mask=mask, rope=rope)
+        x = self._run_transformer_blocks(x, t, mask, rope)
 
         if self.long_skip_connection is not None:
             x = self.long_skip_connection(torch.cat((x, residual), dim=-1))
