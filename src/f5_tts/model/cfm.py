@@ -171,7 +171,12 @@ class CFM(nn.Module):
     )
 
     def __getstate__(self):
-        state = super().__getstate__()
+        # Match nn.Module.__getstate__ on newer PyTorch releases without relying on
+        # that method: torch 2.0 lacks it, while Python 3.10's object also provides no
+        # parent implementation. Explicitly stripping PyTorch's compiled call hook
+        # preserves the behavior of torch 2.1+.
+        state = self.__dict__.copy()
+        state.pop("_compiled_call_impl", None)
         for attr in self._CFM_COMPILE_ONLY_ATTRS:
             state.pop(attr, None)
         return state

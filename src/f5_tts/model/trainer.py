@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import gc
+import inspect
 import math
 import os
 from typing import Any, cast
@@ -32,6 +33,35 @@ try:
     FUSED_ADAMW_DEVICE_TYPES = frozenset(_fused_devices())
 except ImportError:  # torch < 2.x lacks the helper; keep the historical safe set.
     FUSED_ADAMW_DEVICE_TYPES = frozenset(("cuda", "cpu", "xpu", "privateuseone"))
+
+
+def _resolve_compile_dynamic(
+    requested: bool | None,
+    compile_fn: Any,
+) -> bool | None:
+    """Resolve ``dynamic=None`` across torch.compile API generations.
+
+    PyTorch 2.0 exposed ``dynamic=False`` as the callable default, while newer
+    releases use ``None`` for automatic dynamic-shape detection. Preserve an
+    explicit user choice on every release. For the auto setting, opt into
+    ``dynamic=True`` only when the callable's published signature proves that
+    omission would select the legacy static default.
+
+    Signature inspection follows ``functools.wraps`` metadata. If a custom or
+    monkeypatched callable has no trustworthy signature, leave the argument
+    unset rather than guessing at an API it may not support.
+    """
+    if requested is not None:
+        return requested
+
+    try:
+        dynamic_parameter = inspect.signature(compile_fn, follow_wrapped=True).parameters.get("dynamic")
+    except Exception:
+        return None
+
+    if dynamic_parameter is not None and dynamic_parameter.default is False:
+        return True
+    return None
 
 
 # trainer
@@ -259,11 +289,12 @@ class Trainer:
                 raise RuntimeError("torch.compile is unavailable in this PyTorch build")
             return
 
+        effective_compile_dynamic = _resolve_compile_dynamic(self.compile_dynamic, torch.compile)
         compile_kwargs = {
             "backend": self.compile_backend,
             "mode": self.compile_mode,
             "fullgraph": self.compile_fullgraph,
-            "dynamic": self.compile_dynamic,
+            "dynamic": effective_compile_dynamic,
         }
         compile_kwargs = {k: v for k, v in compile_kwargs.items() if v is not None}
 
@@ -307,7 +338,8 @@ class Trainer:
             compile_target = getattr(self, "compile_target", "cfm_loss_core")
             print(
                 f"torch.compile enabled (target={compile_target}, backend={self.compile_backend}, "
-                f"mode={self.compile_mode}, fullgraph={self.compile_fullgraph}, dynamic={self.compile_dynamic})"
+                f"mode={self.compile_mode}, fullgraph={self.compile_fullgraph}, "
+                f"dynamic={effective_compile_dynamic})"
             )
             if self.accelerator.num_processes > 1 and self.compile_fallback_to_eager:
                 print("DDP detected: runtime compile fallback disabled (errors will raise on all ranks).")

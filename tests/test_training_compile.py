@@ -542,6 +542,47 @@ def test_compiled_cfm_model_is_pickleable_via_torch_save_and_loads_eager():
         assert torch.equal(loaded.state_dict()[key], value), key
 
 
+def test_compile_state_serialization_does_not_require_nn_module_getstate(monkeypatch):
+    """CFM and DiT serialization must remain compatible with the torch 2.0 parent contract."""
+    model = _build_model()
+    transformer = cast(Any, model.transformer)
+    compiled_call_sentinels = {}
+    modules_and_compile_attrs = (
+        (model, model._CFM_COMPILE_ONLY_ATTRS),
+        (transformer, transformer._DIT_COMPILE_ONLY_ATTRS),
+    )
+
+    for module, compile_attrs in modules_and_compile_attrs:
+        compiled_call_sentinel = object()
+        compiled_call_sentinels[module] = compiled_call_sentinel
+        object.__setattr__(module, "_compiled_call_impl", compiled_call_sentinel)
+        for attr in compile_attrs:
+            object.__setattr__(module, attr, object())
+
+    # torch 2.0's nn.Module has no __getstate__. Remove the newer parent method to
+    # exercise that supported legacy contract without changing the installed torch.
+    monkeypatch.delattr(torch.nn.Module, "__getstate__", raising=False)
+
+    for module, compile_attrs in modules_and_compile_attrs:
+        state = module.__getstate__()
+        assert "_compiled_call_impl" not in state
+        assert all(attr not in state for attr in compile_attrs)
+
+        # __getstate__ must filter a copy, not mutate the live module.
+        assert module.__dict__["_compiled_call_impl"] is compiled_call_sentinels[module]
+        assert all(attr in module.__dict__ for attr in compile_attrs)
+        assert state["_modules"] is module.__dict__["_modules"]
+
+    # Exercise the EMA construction mechanism itself: deepcopy must also succeed
+    # while all ordinary child modules use torch 2.0's parent serialization contract.
+    copied = copy.deepcopy(model)
+    copied_transformer = cast(Any, copied.transformer)
+    assert "_compiled_call_impl" not in copied.__dict__
+    assert "_compiled_call_impl" not in copied_transformer.__dict__
+    assert copied.training_compile_state["enabled"] is False
+    assert copied_transformer.training_compile_state["enabled"] is False
+
+
 def test_clear_training_compile_after_deepcopy_leaves_forward_callable():
     """clear_training_compile() on a deep-copied compiled DiT must not install a sentinel.
 
