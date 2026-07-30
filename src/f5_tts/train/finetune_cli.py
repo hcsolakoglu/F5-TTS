@@ -97,6 +97,11 @@ def parse_args():
         action="store_true",
         help="Raise torch.compile errors instead of falling back to eager",
     )
+    parser.add_argument(
+        "--global_masked_mean",
+        action="store_true",
+        help="Weight every masked frame equally across gradient accumulation and DDP",
+    )
     return parser.parse_args()
 
 
@@ -236,6 +241,7 @@ def main():
         compile_fullgraph=args.compile_fullgraph,
         compile_dynamic=compile_dynamic,
         compile_fallback_to_eager=not args.compile_no_fallback,
+        global_masked_mean=args.global_masked_mean,
     )
 
     train_dataset = load_dataset(args.dataset_name, tokenizer, mel_spec_kwargs=mel_spec_kwargs)
