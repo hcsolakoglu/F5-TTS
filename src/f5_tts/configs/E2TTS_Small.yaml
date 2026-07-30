@@ -60,7 +60,7 @@ compile:
   # were slower/unstable in measured variable-shape runs and are not recommended here.
   mode: null
   fullgraph: False
-  dynamic: null  # variable lengths may recompile; compare null/True/False or fixed shapes
+  dynamic: null  # modern Torch auto-detects shapes; legacy static-default Torch resolves null to True
   fallback_to_eager: True  # fall back to eager if compile setup fails (runtime fallback disabled in DDP)
   # Reproducibility note: with dropout > 0 (the default), Inductor uses its own RNG, so
   # compiled dropout masks differ from eager. This is expected and statistically harmless.

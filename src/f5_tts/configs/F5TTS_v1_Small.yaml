@@ -71,8 +71,8 @@ compile:
   # were slower/unstable in measured variable-shape runs and are not recommended here.
   mode: null
   fullgraph: False  # NOTE: with fullgraph the recompile limit is a HARD error, not a fall back to eager
-  dynamic: null  # null lets Dynamo auto-promote varying dims after the 2nd distinct value;
-  # True compiles one symbolic graph up front, which halves recompiles and cold-compile time.
+  dynamic: null  # modern Torch auto-promotes after the 2nd shape; legacy static-default Torch resolves null to True.
+  # True compiles symbolic shapes up front, which halves recompiles and cold-compile time.
   # False specializes per shape and is catastrophic for variable-length training.
   fallback_to_eager: True  # fall back to eager if compile setup fails (runtime fallback disabled in DDP)
   # Reproducibility note: with dropout > 0 (the default), Inductor uses its own RNG, so
