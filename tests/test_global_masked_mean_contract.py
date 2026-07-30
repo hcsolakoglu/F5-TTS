@@ -7,6 +7,9 @@ import random
 import tempfile
 from types import SimpleNamespace
 
+# Multiprocessing "spawn" imports this module outside pytest's normal conftest
+# loading path. Import the lightweight optional-dependency stubs before F5-TTS.
+import conftest  # noqa: F401
 import pytest
 import torch
 import torch.distributed as dist
@@ -416,10 +419,14 @@ class _DeepSpeedPluginStub:
     def __init__(self, *, zero_stage=0, gradient_clipping=1.0):
         self.zero_stage = zero_stage
         self.gradient_clipping = gradient_clipping
+        self.deepspeed_config = {
+            "gradient_accumulation_steps": "auto",
+            "gradient_clipping": gradient_clipping,
+        }
 
     def get_value(self, key):
-        assert key == "gradient_clipping"
-        return self.gradient_clipping
+        assert key in {"gradient_accumulation_steps", "gradient_clipping"}
+        return self.deepspeed_config[key]
 
 
 class _BackendAccelerator:
@@ -463,7 +470,7 @@ def test_deepspeed_backend_validation_rejects_sharded_zero_until_checkpoint_and_
     trainer = _backend_trainer(zero_stage=zero_stage)
 
     with pytest.raises(NotImplementedError, match="ZeRO stage 0 only"):
-        trainer._validate_global_masked_mean_backend()
+        trainer._validate_global_masked_mean_config()
 
 
 def test_deepspeed_backend_validation_rejects_nonworld_data_parallel_group():
@@ -665,5 +672,5 @@ def test_production_helpers_match_global_batch_on_two_rank_gloo():
             args=(2, f"file://{tmpdir}/store"),
             nprocs=2,
             join=True,
-            start_method="fork",
+            start_method="spawn",
         )
