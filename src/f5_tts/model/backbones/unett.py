@@ -11,7 +11,7 @@ d - dimension
 from __future__ import annotations
 
 import threading
-from typing import Literal
+from typing import Literal, cast
 
 import torch
 import torch.nn.functional as F
@@ -52,17 +52,21 @@ class TextEmbedding(nn.Module):
             self.extra_modeling = False
 
     def forward(self, text: int["b nt"], seq_len, drop_text=False):
-        text = text + 1  # use 0 as filler token. preprocess of batch pad -1, see list_str_to_idx()
-        text = text[:, :seq_len]  # curtail if character tokens are more than the mel spec tokens
-        batch, text_len = text.shape[0], text.shape[1]
-        text = F.pad(text, (0, seq_len - text_len), value=0)
-        if self.mask_padding:
-            text_mask = text == 0
+        text_tensor = (
+            cast(torch.Tensor, text) + 1
+        )  # use 0 as filler token. preprocess of batch pad -1, see list_str_to_idx()
+        text_tensor = text_tensor[:, :seq_len]  # curtail if character tokens are more than the mel spec tokens
+        batch, text_len = text_tensor.shape[0], text_tensor.shape[1]
+        text_tensor = F.pad(text_tensor, (0, seq_len - text_len), value=0)
+        text_mask = text_tensor == 0
 
-        if drop_text:  # cfg for text
-            text = torch.zeros_like(text)
+        if torch.is_tensor(drop_text):
+            drop_text_flag = drop_text.to(device=text_tensor.device, dtype=torch.bool).reshape(())
+            text_tensor = torch.where(drop_text_flag, torch.zeros_like(text_tensor), text_tensor)
+        elif drop_text:  # cfg for text
+            text_tensor = torch.zeros_like(text_tensor)
 
-        text = self.text_embed(text)  # b n -> b n d
+        text_tensor = self.text_embed(text_tensor)  # b n -> b n d
 
         # possible extra modeling
         if self.extra_modeling:
@@ -70,18 +74,20 @@ class TextEmbedding(nn.Module):
             batch_start = torch.zeros((batch,), dtype=torch.long)
             pos_idx = get_pos_embed_indices(batch_start, seq_len, max_pos=self.precompute_max_pos)
             text_pos_embed = self.freqs_cis[pos_idx]
-            text = text + text_pos_embed
+            text_tensor = text_tensor + text_pos_embed
 
             # convnextv2 blocks
             if self.mask_padding:
-                text = text.masked_fill(text_mask.unsqueeze(-1).expand(-1, -1, text.size(-1)), 0.0)
+                text_tensor = text_tensor.masked_fill(text_mask.unsqueeze(-1).expand(-1, -1, text_tensor.size(-1)), 0.0)
                 for block in self.text_blocks:
-                    text = block(text)
-                    text = text.masked_fill(text_mask.unsqueeze(-1).expand(-1, -1, text.size(-1)), 0.0)
+                    text_tensor = block(text_tensor)
+                    text_tensor = text_tensor.masked_fill(
+                        text_mask.unsqueeze(-1).expand(-1, -1, text_tensor.size(-1)), 0.0
+                    )
             else:
-                text = self.text_blocks(text)
+                text_tensor = self.text_blocks(text_tensor)
 
-        return text
+        return text_tensor
 
 
 # noised input audio and context mixing embedding
@@ -94,18 +100,26 @@ class InputEmbedding(nn.Module):
         self.conv_pos_embed = ConvPositionEmbedding(dim=out_dim)
 
     def forward(self, x: float["b n d"], cond: float["b n d"], text_embed: float["b n d"], drop_audio_cond=False):
-        if drop_audio_cond:  # cfg for cond audio
-            cond = torch.zeros_like(cond)
+        x_tensor = cast(torch.Tensor, x)
+        cond_tensor = cast(torch.Tensor, cond)
+        text_embed_tensor = cast(torch.Tensor, text_embed)
+        if torch.is_tensor(drop_audio_cond):
+            drop_audio_cond_flag = drop_audio_cond.to(device=cond_tensor.device, dtype=torch.bool).reshape(())
+            cond_tensor = torch.where(drop_audio_cond_flag, torch.zeros_like(cond_tensor), cond_tensor)
+        elif drop_audio_cond:  # cfg for cond audio
+            cond_tensor = torch.zeros_like(cond_tensor)
 
-        x = self.proj(torch.cat((x, cond, text_embed), dim=-1))
-        x = self.conv_pos_embed(x) + x
-        return x
+        x_tensor = self.proj(torch.cat((x_tensor, cond_tensor, text_embed_tensor), dim=-1))
+        x_tensor = self.conv_pos_embed(x_tensor) + x_tensor
+        return x_tensor
 
 
 # Flat UNet Transformer backbone
 
 
 class UNetT(nn.Module):
+    supports_tensor_cfg_training_flags = True
+
     def __init__(
         self,
         *,
