@@ -686,11 +686,48 @@ def _direct_ddp_worker(rank, world_size, init_method):
         dist.destroy_process_group()
 
 
+def _malformed_ddp_worker(rank, world_size, init_method):
+    torch.set_num_threads(1)
+    dist.init_process_group(
+        "gloo",
+        rank=rank,
+        world_size=world_size,
+        init_method=init_method,
+        timeout=datetime.timedelta(seconds=30),
+    )
+    try:
+        batch, mask = _direct_batch(rank, 0, selected=2)
+        if rank == 0:
+            batch["mel_lengths"] = batch["mel_lengths"].to(dtype=torch.float32)
+        trainer = Trainer.__new__(Trainer)
+        trainer.grad_accumulation_steps = 1
+        trainer.accelerator = _DirectDDPAccelerator(world_size=world_size, gradient_accumulation_steps=1)
+        trainer._unwrapped_model = _MaskSampler([mask])
+
+        with pytest.raises(ValueError, match="global_masked_mean rejected an accumulation window"):
+            list(trainer._iter_global_masked_mean_batches([batch]))
+        dist.barrier()
+    finally:
+        dist.destroy_process_group()
+
+
 @pytest.mark.skipif(not dist.is_available() or not dist.is_gloo_available(), reason="gloo backend unavailable")
 def test_production_helpers_match_global_batch_on_two_rank_gloo():
     with tempfile.TemporaryDirectory(prefix="f5-global-contract-gloo-") as tmpdir:
         mp.start_processes(
             _direct_ddp_worker,
+            args=(2, f"file://{tmpdir}/store"),
+            nprocs=2,
+            join=True,
+            start_method="spawn",
+        )
+
+
+@pytest.mark.skipif(not dist.is_available() or not dist.is_gloo_available(), reason="gloo backend unavailable")
+def test_rank_local_malformed_batch_raises_collectively_before_backward():
+    with tempfile.TemporaryDirectory(prefix="f5-global-malformed-gloo-") as tmpdir:
+        mp.start_processes(
+            _malformed_ddp_worker,
             args=(2, f"file://{tmpdir}/store"),
             nprocs=2,
             join=True,
