@@ -25,7 +25,7 @@ try:
 
     FUSED_ADAMW_DEVICE_TYPES = frozenset(_fused_devices())
 except ImportError:
-    FUSED_ADAMW_DEVICE_TYPES = frozenset(("cuda", "cpu", "xpu", "privateuseone"))
+    FUSED_ADAMW_DEVICE_TYPES = frozenset(("cuda",))
 
 
 # trainer
