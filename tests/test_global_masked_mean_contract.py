@@ -152,6 +152,56 @@ def test_presampled_mask_matches_with_production_compile_entrypoint():
     torch.testing.assert_close(compiled.transformer.gain.grad, eager.transformer.gain.grad)
 
 
+def test_runtime_compile_failure_reports_permanent_eager_fallback(monkeypatch):
+    from torch._dynamo.exc import Unsupported
+
+    def fake_compile(function, **kwargs):
+        del function, kwargs
+
+        def fail_compiled_call(*args):
+            del args
+            raise Unsupported("forced runtime compiler failure")
+
+        return fail_compiled_call
+
+    monkeypatch.setattr(torch, "compile", fake_compile)
+    model = _tiny_cfm()
+    model.compile_training_core(runtime_fallback=True)
+    x1 = torch.arange(16, dtype=torch.float32).reshape(2, 4, 2) / 8
+    text = torch.tensor([[1, 2], [3, 4]])
+    mask = torch.tensor([[True, True, True, True], [True, True, True, False]])
+    rand_span_mask = torch.tensor([[True, False, True, False], [False, True, True, False]])
+    x0 = torch.zeros_like(x1)
+    time = torch.tensor([0.25, 0.75])
+
+    loss, loss_sum, denominator, _, _ = model._run_loss_core_components(
+        x1,
+        text,
+        mask,
+        rand_span_mask,
+        x0,
+        time,
+        False,
+        False,
+    )
+
+    assert torch.isfinite(loss)
+    assert torch.isfinite(loss_sum)
+    assert denominator > 0
+    assert model.training_compile_state["enabled"] is False
+    assert model.training_compile_state["fallback_active"] is True
+    assert "forced runtime compiler failure" in model.training_compile_state["error"]
+
+    trainer = Trainer.__new__(Trainer)
+    trainer._unwrapped_model = model
+    trainer.accelerator = SimpleNamespace(is_main_process=False)
+    trainer.compile_active = True
+    trainer.compile_fallback_active = False
+    trainer._check_compile_runtime_fallback()
+    assert trainer.compile_active is False
+    assert trainer.compile_fallback_active is True
+
+
 def test_forward_rejects_presampled_mask_with_wrong_shape():
     model = _tiny_cfm()
     inp = torch.zeros((2, 4, 2))
