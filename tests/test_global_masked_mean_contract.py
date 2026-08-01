@@ -258,6 +258,28 @@ def test_window_iterator_uses_int64_denominator_tensor_and_exact_boundaries():
     assert [value.dtype for value in trainer.accelerator.reduced] == [torch.int64, torch.int64]
 
 
+def test_window_iterator_accepts_preprocessed_pinyin_token_lists():
+    mask = torch.tensor([[True, True, False]])
+    trainer = _iterator_trainer([mask], gradient_accumulation_steps=1)
+    batch = _batch(mel_channels=2, seq_len=3)
+    batch["text"] = [[" ", "ni3", "hao3"]]
+
+    [yielded] = list(trainer._iter_global_masked_mean_batches([batch]))
+
+    assert yielded[0] is batch
+    assert yielded[1] is mask
+    assert yielded[4] is True
+
+
+def test_window_iterator_rejects_non_string_preprocessed_text_tokens():
+    trainer = _iterator_trainer([torch.ones((1, 3), dtype=torch.bool)], gradient_accumulation_steps=1)
+    batch = _batch(mel_channels=2, seq_len=3)
+    batch["text"] = [["ni3", 3]]
+
+    with pytest.raises(ValueError, match="strings or lists of strings"):
+        list(trainer._iter_global_masked_mean_batches([batch]))
+
+
 def test_window_scale_includes_configured_g_and_data_parallel_world_size():
     masks = [torch.tensor([[True, True, False]])]
     trainer = _iterator_trainer(

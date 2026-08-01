@@ -58,17 +58,22 @@ class _OverflowModel(nn.Module):
         return loss, loss_sum, denominator, mel, mel
 
 
-class _SkippingSGD(torch.optim.SGD):
-    """Simulate GradScaler detecting overflow and suppressing optimizer.step."""
+class _ControlledSGD(torch.optim.SGD):
+    """Capture the production gradient and optionally simulate an AMP skip."""
 
-    def __init__(self, params):
+    def __init__(self, params, *, skip_update):
         super().__init__(params, lr=0.01)
+        self.skip_update = skip_update
         self.attempted_steps = 0
+        self.last_gradient = None
 
     def step(self, closure=None):
-        del closure
         self.attempted_steps += 1
-        return None
+        [parameter] = self.param_groups[0]["params"]
+        self.last_gradient = parameter.grad.detach().clone()
+        if self.skip_update:
+            return None
+        return super().step(closure)
 
 
 class _CountingEMA:
@@ -130,7 +135,7 @@ def _trainer(*, overflow, checkpoint_cursor):
     trainer = Trainer.__new__(Trainer)
     trainer.model = model
     trainer._unwrapped_model = model
-    trainer.optimizer = _SkippingSGD(model.parameters())
+    trainer.optimizer = _ControlledSGD(model.parameters(), skip_update=overflow)
     trainer.ema_model = _CountingEMA()
     trainer.accelerator = _OverflowAccelerator(optimizer_step_was_skipped=overflow)
     trainer.global_masked_mean = True
@@ -154,6 +159,21 @@ def _trainer(*, overflow, checkpoint_cursor):
         (update, consumed_updates, last)
     )
     return trainer
+
+
+def test_successful_train_scales_the_production_loss_sum_before_backward(monkeypatch):
+    monkeypatch.setattr(trainer_module, "DataLoader", lambda *args, **kwargs: _OneBatchLoader())
+    trained = _trainer(overflow=False, checkpoint_cursor=(0, 0))
+
+    trained.train(object(), num_workers=0)
+
+    # loss_sum = weight**2 * 6 and the production scale is 1 / 6, so
+    # d(loss_sum * scale) / d(weight) is exactly 2 * 0.5 = 1. A plausible
+    # loss * scale mutation would instead produce 1 / 6.
+    torch.testing.assert_close(trained.optimizer.last_gradient, torch.tensor(1.0))
+    torch.testing.assert_close(trained.model.weight, torch.tensor(0.49))
+    assert trained.ema_model.updates == 1
+    assert trained.saved[-1] == (1, 1, True)
 
 
 def test_overflow_consumes_window_without_advancing_update_or_ema_and_resume_skips_it(monkeypatch):
