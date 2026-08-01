@@ -526,8 +526,12 @@ class Trainer:
         elif isinstance(text, list):
             if len(text) != mel.shape[0]:
                 return "text list size must match the mel batch size"
-            if any(not isinstance(item, str) for item in text):
-                return "text list entries must be strings"
+            if any(
+                not isinstance(item, str)
+                and (not isinstance(item, list) or any(not isinstance(token, str) for token in item))
+                for item in text
+            ):
+                return "text list entries must be strings or lists of strings"
         else:
             return "text must be a tensor or list"
         return None
