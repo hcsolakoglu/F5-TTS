@@ -46,16 +46,19 @@ class _OverflowModel(nn.Module):
         text,
         lens,
         noise_scheduler,
-        rand_span_mask,
-        return_loss_components,
+        rand_span_mask=None,
+        return_loss_components=False,
     ):
         del text, lens, noise_scheduler
-        assert return_loss_components is True
         self.forward_calls += 1
+        if rand_span_mask is None:
+            rand_span_mask = torch.ones(mel.shape[0], mel.shape[-1], dtype=torch.bool)
         denominator = rand_span_mask.sum(dtype=torch.float32) * mel.shape[-1]
         loss_sum = self.weight.square() * denominator
         loss = loss_sum / denominator
-        return loss, loss_sum, denominator, mel, mel
+        if return_loss_components:
+            return loss, loss_sum, denominator, mel, mel
+        return loss, mel, mel
 
 
 class _ControlledSGD(torch.optim.SGD):
@@ -101,8 +104,8 @@ class _OverflowAccelerator:
         assert device_placement is False
         return dataloader
 
-    def prepare(self, value):
-        return value
+    def prepare(self, *objects):
+        return objects if len(objects) > 1 else objects[0]
 
     def gather(self, value):
         return value
@@ -110,6 +113,10 @@ class _OverflowAccelerator:
     def reduce(self, value, reduction):
         assert reduction == "sum"
         return value
+
+    def accumulate(self, model):
+        del model
+        return contextlib.nullcontext()
 
     def no_sync(self, model):
         return contextlib.nullcontext()
@@ -130,7 +137,7 @@ class _OverflowAccelerator:
         self.end_calls += 1
 
 
-def _trainer(*, overflow, checkpoint_cursor):
+def _trainer(*, overflow, checkpoint_cursor, global_masked_mean=True):
     model = _OverflowModel()
     trainer = Trainer.__new__(Trainer)
     trainer.model = model
@@ -138,7 +145,7 @@ def _trainer(*, overflow, checkpoint_cursor):
     trainer.optimizer = _ControlledSGD(model.parameters(), skip_update=overflow)
     trainer.ema_model = _CountingEMA()
     trainer.accelerator = _OverflowAccelerator(optimizer_step_was_skipped=overflow)
-    trainer.global_masked_mean = True
+    trainer.global_masked_mean = global_masked_mean
     trainer.grad_accumulation_steps = 1
     trainer.max_grad_norm = 0
     trainer.log_samples = False
@@ -154,7 +161,7 @@ def _trainer(*, overflow, checkpoint_cursor):
     trainer.last_per_updates = 100
     trainer.save_per_updates = 100
     trainer.saved = []
-    trainer.load_checkpoint = lambda: checkpoint_cursor
+    trainer.load_checkpoint = lambda *args, **kwargs: checkpoint_cursor
     trainer.save_checkpoint = lambda update, consumed_updates, last=False: trainer.saved.append(
         (update, consumed_updates, last)
     )
@@ -198,3 +205,14 @@ def test_overflow_consumes_window_without_advancing_update_or_ema_and_resume_ski
     assert resumed.optimizer.attempted_steps == 0
     assert resumed.ema_model.updates == 0
     assert resumed.saved[-1] == (0, 1, True)
+
+
+def test_non_global_masked_mean_overflow_does_not_advance_update_or_ema(monkeypatch):
+    monkeypatch.setattr(trainer_module, "DataLoader", lambda *args, **kwargs: _OneBatchLoader())
+    overflowed = _trainer(overflow=True, checkpoint_cursor=(0, 0), global_masked_mean=False)
+
+    overflowed.train(object(), num_workers=0)
+
+    assert overflowed.optimizer.attempted_steps == 1
+    assert overflowed.ema_model.updates == 0
+    assert overflowed.saved[-1] == (0, 1, True)

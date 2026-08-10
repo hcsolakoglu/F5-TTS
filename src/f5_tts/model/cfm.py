@@ -84,7 +84,7 @@ def _compile_failure_types() -> tuple[type[BaseException], ...]:
     try:
         from torch._dynamo import exc as dynamo_exc
 
-        for name in ("BackendCompilerFailed", "Unsupported", "InternalTorchDynamoError", "TorchRuntimeError"):
+        for name in ("BackendCompilerFailed", "Unsupported", "InternalTorchDynamoError"):
             candidate = getattr(dynamo_exc, name, None)
             if isinstance(candidate, type) and issubclass(candidate, BaseException):
                 types.append(candidate)

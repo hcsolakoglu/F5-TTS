@@ -3,11 +3,14 @@ from __future__ import annotations
 import gc
 import inspect
 import math
+import operator
 import os
+import random
 from contextlib import contextmanager, nullcontext
 from typing import Any, cast
 
 import torch
+import torch.distributed as dist
 import torchaudio
 import wandb
 from accelerate import Accelerator
@@ -15,10 +18,11 @@ from accelerate.utils import DistributedDataParallelKwargs, DistributedType, sen
 from ema_pytorch import EMA
 from torch.optim import AdamW
 from torch.optim.lr_scheduler import LinearLR, SequentialLR
-from torch.utils.data import DataLoader, Dataset, SequentialSampler
+from torch.utils.data import DataLoader, Dataset, Sampler, SequentialSampler
 from tqdm import tqdm
 
 from f5_tts.model import CFM
+from f5_tts.model.cfm import _is_cuda_oom
 from f5_tts.model.dataset import DynamicBatchSampler, collate_fn
 from f5_tts.model.utils import default, exists
 
@@ -58,6 +62,27 @@ try:
     FUSED_ADAMW_DEVICE_TYPES = frozenset(_fused_devices())
 except ImportError:
     FUSED_ADAMW_DEVICE_TYPES = frozenset(("cuda",))
+
+
+class _EpochRandomSampler(Sampler[int]):
+    """Random sampler whose order is stable and addressable by epoch."""
+
+    def __init__(self, data_source, seed: int):
+        self.data_source = data_source
+        self.seed = int(seed)
+        self.epoch = 0
+
+    def __iter__(self):
+        generator = torch.Generator()
+        generator.manual_seed(self.seed + self.epoch)
+        indices = torch.randperm(len(self.data_source), generator=generator).tolist()
+        return iter(indices)
+
+    def __len__(self):
+        return len(self.data_source)
+
+    def set_epoch(self, epoch: int):
+        self.epoch = int(epoch)
 
 
 # trainer
@@ -102,6 +127,7 @@ class Trainer:
         compile_fallback_to_eager: bool = True,
         global_masked_mean: bool = False,
     ):
+        grad_accumulation_steps = self._validate_gradient_accumulation_steps(grad_accumulation_steps)
         ddp_kwargs = DistributedDataParallelKwargs(find_unused_parameters=True)
 
         if logger == "wandb" and not wandb.api.api_key:
@@ -212,6 +238,118 @@ class Trainer:
     @property
     def is_main(self):
         return self.accelerator.is_main_process
+
+    @staticmethod
+    def _validate_gradient_accumulation_steps(value):
+        """Normalize and validate the count before constructing Accelerate."""
+        if isinstance(value, bool):
+            raise ValueError("gradient_accumulation_steps must be a positive integer")
+        try:
+            normalized = operator.index(value)
+        except TypeError as exc:
+            raise ValueError("gradient_accumulation_steps must be a positive integer") from exc
+        if normalized < 1:
+            raise ValueError("gradient_accumulation_steps must be a positive integer")
+        return normalized
+
+    @staticmethod
+    def _normalize_checkpoint_args(update, consumed_updates=None, last=False):
+        """Keep the pre-cursor ``save_checkpoint(update, last=False)`` call valid."""
+        if isinstance(consumed_updates, bool):
+            if last:
+                raise TypeError("last was provided twice to save_checkpoint")
+            last = consumed_updates
+            consumed_updates = update
+        if consumed_updates is None:
+            consumed_updates = update
+        return update, consumed_updates, last
+
+    @staticmethod
+    def _set_dataloader_epoch(dataloader, epoch: int):
+        """Set epoch on Accelerate's wrapper and every nested sampler."""
+        pending = [dataloader]
+        seen = set()
+        while pending:
+            current = pending.pop(0)
+            if current is None or id(current) in seen:
+                continue
+            seen.add(id(current))
+            set_epoch = getattr(current, "set_epoch", None)
+            if callable(set_epoch):
+                set_epoch(epoch)
+            for attribute in ("batch_sampler", "sampler"):
+                nested = getattr(current, attribute, None)
+                if nested is not None:
+                    pending.append(nested)
+
+    def _prepare_global_masked_mean_dataloader(self, dataloader):
+        """Prepare GMM data without Accelerate's duplicate-batch padding.
+
+        ``even_batches=True`` can replay samples when the number of batches is
+        not divisible by the process count. GMM has no validity mask for such
+        synthetic samples, so reject an incomplete process group rather than
+        silently biasing the denominator or dropping a tail batch.
+        """
+        self.accelerator.even_batches = False
+        if getattr(self.accelerator, "dispatch_batches", False):
+            raise ValueError(
+                "global_masked_mean=True requires dispatch_batches=False so accumulation windows "
+                "can remain on the host until each microbatch is processed."
+            )
+        num_processes = int(getattr(self.accelerator, "num_processes", 1))
+        split_batches = bool(getattr(self.accelerator, "split_batches", False))
+        if num_processes > 1 and not split_batches and len(dataloader) % num_processes:
+            raise ValueError(
+                "global_masked_mean requires the prepared dataloader batch count to be divisible by "
+                f"the process count ({num_processes}); received {len(dataloader)} batches. "
+                "Increase/drop the final batch explicitly instead of allowing duplicate padding."
+            )
+        prepared = self.accelerator.prepare_data_loader(dataloader, device_placement=False)
+        self._validate_global_masked_dataloader(prepared)
+        return prepared
+
+    def _capture_rng_states(self):
+        """Capture per-process RNG state so resumed training does not replay masks."""
+        local_state = {
+            "python": random.getstate(),
+            "torch": torch.get_rng_state(),
+        }
+        if torch.cuda.is_available():
+            local_state["cuda"] = torch.cuda.get_rng_state_all()
+        dataloader_generator = getattr(self, "_train_dataloader_generator", None)
+        if dataloader_generator is not None:
+            local_state["dataloader_generator"] = dataloader_generator.get_state()
+
+        if dist.is_available() and dist.is_initialized():
+            states = [None] * dist.get_world_size()
+            dist.all_gather_object(states, local_state)
+            return states
+        return [local_state]
+
+    def _restore_rng_states(self, states):
+        """Restore the current process RNG state when checkpoint topology matches."""
+        if states is None:
+            return
+        expected_processes = int(getattr(self.accelerator, "num_processes", 1))
+        if len(states) != expected_processes:
+            raise ValueError(
+                "checkpoint RNG state was saved for "
+                f"{len(states)} processes, but the current run uses {expected_processes}; "
+                "resume with the same process count or start from model weights only."
+            )
+        process_index = int(getattr(self.accelerator, "process_index", 0))
+        state = states[process_index]
+        random.setstate(state["python"])
+        torch.set_rng_state(state["torch"])
+        if "cuda" in state and torch.cuda.is_available():
+            cuda_state = state["cuda"]
+            if isinstance(cuda_state, (list, tuple)):
+                torch.cuda.set_rng_state_all(list(cuda_state))
+            else:  # backward compatibility with checkpoints containing one CUDA state
+                torch.cuda.set_rng_state(cuda_state)
+        dataloader_generator = getattr(self, "_train_dataloader_generator", None)
+        if dataloader_generator is not None and "dataloader_generator" in state:
+            dataloader_generator.set_state(state["dataloader_generator"])
 
     # ---- torch.compile support (optional, default-off) ----
 
@@ -459,6 +597,8 @@ class Trainer:
             window = []
             local_loss_denom = torch.zeros((), device=self.accelerator.device, dtype=torch.int64)
             local_error = None
+            local_oom = None
+            local_exception = None
             for batch in batches:
                 batch_error = self._validate_global_masked_batch(batch)
                 rand_span_mask = None
@@ -469,6 +609,10 @@ class Trainer:
                         batch_loss_denom = rand_span_mask.sum(dtype=torch.int64) * mel.shape[1]
                         local_loss_denom = local_loss_denom + batch_loss_denom
                     except Exception as exc:
+                        if local_exception is None:
+                            local_exception = exc
+                        if _is_cuda_oom(exc):
+                            local_oom = exc
                         batch_error = f"training-mask preparation failed: {exc}"
                 if batch_error is not None and local_error is None:
                     local_error = batch_error
@@ -478,13 +622,24 @@ class Trainer:
                 (
                     local_loss_denom,
                     torch.tensor(int(local_error is not None), device=self.accelerator.device, dtype=torch.int64),
+                    torch.tensor(int(local_oom is not None), device=self.accelerator.device, dtype=torch.int64),
                 )
             )
             global_stats = self._reduce_global_masked_value(local_stats)
-            global_denom_value, global_error_count = global_stats.cpu().tolist()
+            global_denom_value, global_error_count, global_oom_count = global_stats.cpu().tolist()
             if global_error_count:
+                if global_oom_count:
+                    if local_oom is not None:
+                        raise local_oom
+                    raise RuntimeError(
+                        "global_masked_mean rejected an accumulation window because another rank reported "
+                        "CUDA out of memory during training-mask preparation."
+                    )
                 detail = local_error or "another rank reported malformed training input"
-                raise ValueError(f"global_masked_mean rejected an accumulation window: {detail}")
+                message = f"global_masked_mean rejected an accumulation window: {detail}"
+                if local_exception is not None:
+                    raise ValueError(message) from local_exception
+                raise ValueError(message)
             if global_denom_value == 0:
                 raise RuntimeError(
                     "global_masked_mean produced an empty accumulation window; "
@@ -541,6 +696,10 @@ class Trainer:
                 for item in text
             ):
                 return "text list entries must be strings or lists of strings"
+            if any(isinstance(item, list) for item in text) and getattr(
+                self._unwrapped_model, "vocab_char_map", None
+            ) is None:
+                return "nested text token lists require a vocabulary map"
         else:
             return "text must be a tensor or list"
         return None
@@ -580,7 +739,9 @@ class Trainer:
                 f"received per-rank lengths {lengths}."
             )
 
-    def save_checkpoint(self, update, consumed_updates, last=False):
+    def save_checkpoint(self, update, consumed_updates=None, last=False):
+        update, consumed_updates, last = self._normalize_checkpoint_args(update, consumed_updates, last)
+        rng_states = self._capture_rng_states()
         self.accelerator.wait_for_everyone()
         if self.is_main:
             checkpoint = dict(
@@ -590,6 +751,7 @@ class Trainer:
                 scheduler_state_dict=self.scheduler.state_dict(),
                 update=update,
                 consumed_updates=consumed_updates,
+                rng_state=rng_states,
             )
             if not os.path.exists(self.checkpoint_path):
                 os.makedirs(self.checkpoint_path)
@@ -616,13 +778,13 @@ class Trainer:
                         os.remove(os.path.join(self.checkpoint_path, oldest_checkpoint))
                         print(f"Removed old checkpoint: {oldest_checkpoint}")
 
-    def load_checkpoint(self):
+    def load_checkpoint(self, *, return_cursor=False):
         if (
             not exists(self.checkpoint_path)
             or not os.path.exists(self.checkpoint_path)
             or not any(filename.endswith((".pt", ".safetensors")) for filename in os.listdir(self.checkpoint_path))
         ):
-            return 0, 0
+            return (0, 0) if return_cursor else 0
 
         self.accelerator.wait_for_everyone()
         if "model_last.pt" in os.listdir(self.checkpoint_path):
@@ -652,10 +814,10 @@ class Trainer:
             checkpoint = load_file(f"{self.checkpoint_path}/{latest_checkpoint}", device="cpu")
             checkpoint = {"ema_model_state_dict": checkpoint}
         elif latest_checkpoint.endswith(".pt"):
-            # checkpoint = torch.load(f"{self.checkpoint_path}/{latest_checkpoint}", map_location=self.accelerator.device)  # rather use accelerator.load_state ಥ_ಥ
-            checkpoint = torch.load(
-                f"{self.checkpoint_path}/{latest_checkpoint}", weights_only=True, map_location="cpu"
-            )
+            load_kwargs: dict[str, Any] = {"map_location": "cpu"}
+            if "weights_only" in inspect.signature(torch.load).parameters:
+                load_kwargs["weights_only"] = True
+            checkpoint = torch.load(f"{self.checkpoint_path}/{latest_checkpoint}", **load_kwargs)
 
         # patch for backward compatibility, 305e3ea
         for key in ["ema_model.mel_spec.mel_stft.mel_scale.fb", "ema_model.mel_spec.mel_stft.spectrogram.window"]:
@@ -697,9 +859,10 @@ class Trainer:
             update = 0
             consumed_updates = 0
 
+        self._restore_rng_states(checkpoint.get("rng_state"))
         del checkpoint
         gc.collect()
-        return update, consumed_updates
+        return (update, consumed_updates) if return_cursor else update
 
     def train(self, train_dataset: Dataset, num_workers=16, resumable_with_seed: int = None):
         if self.log_samples:
@@ -712,15 +875,15 @@ class Trainer:
             log_samples_path = f"{self.checkpoint_path}/samples"
             os.makedirs(log_samples_path, exist_ok=True)
 
-        if exists(resumable_with_seed):
-            generator = torch.Generator()
-            generator.manual_seed(resumable_with_seed)
-        else:
-            generator = None
-
+        self._train_dataloader_generator = None
         persistent_workers = num_workers > 0
 
         if self.batch_size_type == "sample":
+            sample_sampler = None
+            if exists(resumable_with_seed):
+                self._train_dataloader_generator = torch.Generator()
+                self._train_dataloader_generator.manual_seed(resumable_with_seed)
+                sample_sampler = _EpochRandomSampler(train_dataset, resumable_with_seed)
             train_dataloader = DataLoader(
                 train_dataset,
                 collate_fn=collate_fn,
@@ -728,8 +891,9 @@ class Trainer:
                 pin_memory=True,
                 persistent_workers=persistent_workers,
                 batch_size=self.batch_size_per_gpu,
-                shuffle=True,
-                generator=generator,
+                shuffle=sample_sampler is None,
+                sampler=sample_sampler,
+                generator=self._train_dataloader_generator,
             )
         elif self.batch_size_type == "frame":
             self.accelerator.even_batches = False
@@ -770,19 +934,13 @@ class Trainer:
             # dataloader places each yielded batch on the accelerator, which
             # would retain G large mel batches and undermine accumulation's
             # memory bound. The window iterator transfers one batch at a time.
-            if self.accelerator.dispatch_batches:
-                raise ValueError(
-                    "global_masked_mean=True requires dispatch_batches=False so accumulation windows "
-                    "can remain on the host until each microbatch is processed."
-                )
-            train_dataloader = self.accelerator.prepare_data_loader(train_dataloader, device_placement=False)
+            train_dataloader = self._prepare_global_masked_mean_dataloader(train_dataloader)
             self.scheduler = self.accelerator.prepare(self.scheduler)
-            self._validate_global_masked_dataloader(train_dataloader)
         else:
             train_dataloader, self.scheduler = self.accelerator.prepare(
                 train_dataloader, self.scheduler
             )  # actual multi_gpu updates = single_gpu updates / gpu nums
-        start_update, start_consumed_updates = self.load_checkpoint()
+        start_update, start_consumed_updates = self.load_checkpoint(return_cursor=True)
         global_update = start_update
         consumed_updates = start_consumed_updates
 
@@ -805,9 +963,7 @@ class Trainer:
                 progress_bar_initial = 0
                 current_dataloader = train_dataloader
 
-            # Set epoch for the batch sampler if it exists
-            if hasattr(train_dataloader, "batch_sampler") and hasattr(train_dataloader.batch_sampler, "set_epoch"):
-                train_dataloader.batch_sampler.set_epoch(epoch)
+            self._set_dataloader_epoch(current_dataloader, epoch)
 
             progress_bar = tqdm(
                 range(math.ceil(len(train_dataloader) / self.grad_accumulation_steps)),
@@ -866,7 +1022,9 @@ class Trainer:
                         self.accelerator.clip_grad_norm_(self.model.parameters(), self.max_grad_norm)
 
                     self.optimizer.step()
-                    self.scheduler.step()
+                    optimizer_step_was_skipped = bool(getattr(self.accelerator, "optimizer_step_was_skipped", False))
+                    if not optimizer_step_was_skipped:
+                        self.scheduler.step()
                     self.optimizer.zero_grad()
 
                 if self.global_masked_mean and self.accelerator.sync_gradients:
@@ -880,8 +1038,8 @@ class Trainer:
                 else:
                     loss_to_log = loss.item()
 
-                update_completed = self.accelerator.sync_gradients and (
-                    not self.global_masked_mean or not self.accelerator.optimizer_step_was_skipped
+                update_completed = self.accelerator.sync_gradients and not bool(
+                    getattr(self.accelerator, "optimizer_step_was_skipped", False)
                 )
                 if self.accelerator.sync_gradients:
                     consumed_updates += 1

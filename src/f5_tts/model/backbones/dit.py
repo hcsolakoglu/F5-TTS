@@ -324,7 +324,7 @@ class DiT(nn.Module):
     # and deserialized models must fall back to eager execution rather than silently share
     # the source closure or crash on pickle. This mirrors nn.Module's own handling of
     # ``_compiled_call_impl`` in __getstate__.
-    _DIT_COMPILE_ONLY_ATTRS = ("_dit_compile_target", "_compiled_dit_block_forwards")
+    _DIT_COMPILE_ONLY_ATTRS = ("_dit_compile_target", "_compiled_dit_block_forwards", "_cache_local")
 
     def __getstate__(self):
         # Match nn.Module.__getstate__ on newer PyTorch releases without relying on

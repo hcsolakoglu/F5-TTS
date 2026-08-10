@@ -241,9 +241,10 @@ def test_forward_rejects_non_boolean_presampled_mask(bad_mask):
 
 
 class _MaskSampler:
-    def __init__(self, masks):
+    def __init__(self, masks, *, vocab_char_map=None):
         self.masks = iter(masks)
         self.calls = []
+        self.vocab_char_map = vocab_char_map
 
     def sample_training_mask(self, lens, seq_len):
         self.calls.append((lens.clone(), seq_len))
@@ -276,14 +277,21 @@ def _batch(*, mel_channels=2, seq_len=5):
     }
 
 
-def _iterator_trainer(masks, *, gradient_accumulation_steps=3, num_processes=1, remote_denominator=0):
+def _iterator_trainer(
+    masks,
+    *,
+    gradient_accumulation_steps=3,
+    num_processes=1,
+    remote_denominator=0,
+    vocab_char_map=None,
+):
     trainer = Trainer.__new__(Trainer)
     trainer.grad_accumulation_steps = gradient_accumulation_steps
     trainer.accelerator = _IteratorAccelerator(
         num_processes=num_processes,
         remote_denominator=remote_denominator,
     )
-    trainer._unwrapped_model = _MaskSampler(masks)
+    trainer._unwrapped_model = _MaskSampler(masks, vocab_char_map=vocab_char_map)
     return trainer
 
 
@@ -310,7 +318,11 @@ def test_window_iterator_uses_int64_denominator_tensor_and_exact_boundaries():
 
 def test_window_iterator_accepts_preprocessed_pinyin_token_lists():
     mask = torch.tensor([[True, True, False]])
-    trainer = _iterator_trainer([mask], gradient_accumulation_steps=1)
+    trainer = _iterator_trainer(
+        [mask],
+        gradient_accumulation_steps=1,
+        vocab_char_map={" ": 0, "ni3": 1, "hao3": 2},
+    )
     batch = _batch(mel_channels=2, seq_len=3)
     batch["text"] = [[" ", "ni3", "hao3"]]
 
@@ -319,6 +331,15 @@ def test_window_iterator_accepts_preprocessed_pinyin_token_lists():
     assert yielded[0] is batch
     assert yielded[1] is mask
     assert yielded[4] is True
+
+
+def test_window_iterator_rejects_nested_tokens_without_vocabulary_map():
+    trainer = _iterator_trainer([torch.ones((1, 3), dtype=torch.bool)], gradient_accumulation_steps=1)
+    batch = _batch(mel_channels=2, seq_len=3)
+    batch["text"] = [[" ", "ni3", "hao3"]]
+
+    with pytest.raises(ValueError, match="nested text token lists require a vocabulary map"):
+        list(trainer._iter_global_masked_mean_batches([batch]))
 
 
 def test_window_iterator_rejects_non_string_preprocessed_text_tokens():
@@ -759,6 +780,60 @@ def _malformed_ddp_worker(rank, world_size, init_method):
         dist.barrier()
     finally:
         dist.destroy_process_group()
+
+
+def _rank_oom_worker(rank, world_size, init_method):
+    torch.set_num_threads(1)
+    dist.init_process_group(
+        "gloo",
+        rank=rank,
+        world_size=world_size,
+        init_method=init_method,
+        timeout=datetime.timedelta(seconds=30),
+    )
+    try:
+        class _RankMaskSampler:
+            num_channels = 2
+            vocab_char_map = None
+
+            def sample_training_mask(self, lens, seq_len):
+                if rank == 0:
+                    oom_type = getattr(torch.cuda, "OutOfMemoryError", RuntimeError)
+                    raise oom_type("CUDA out of memory. synthetic rank failure")
+                return torch.ones((lens.shape[0], seq_len), dtype=torch.bool)
+
+        batch, _ = _direct_batch(rank, 0, selected=2)
+        trainer = Trainer.__new__(Trainer)
+        trainer.grad_accumulation_steps = 1
+        trainer.accelerator = _DirectDDPAccelerator(world_size=world_size, gradient_accumulation_steps=1)
+        trainer._unwrapped_model = _RankMaskSampler()
+        try:
+            list(trainer._iter_global_masked_mean_batches([batch]))
+        except BaseException as exc:
+            status = (type(exc).__name__, str(exc))
+        else:  # pragma: no cover - a missing collective error would land here
+            status = ("no-error", "")
+
+        statuses = [None] * world_size
+        dist.all_gather_object(statuses, status)
+        assert all(status[1] for status in statuses)
+        assert "out of memory" in statuses[0][1].lower()
+        assert "another rank" in statuses[1][1].lower()
+        dist.barrier()
+    finally:
+        dist.destroy_process_group()
+
+
+@pytest.mark.skipif(not dist.is_available() or not dist.is_gloo_available(), reason="gloo backend unavailable")
+def test_rank_local_cuda_oom_is_preserved_without_peer_hang():
+    with tempfile.TemporaryDirectory(prefix="f5-global-oom-gloo-") as tmpdir:
+        mp.start_processes(
+            _rank_oom_worker,
+            args=(2, f"file://{tmpdir}/store"),
+            nprocs=2,
+            join=True,
+            start_method="spawn",
+        )
 
 
 @pytest.mark.skipif(not dist.is_available() or not dist.is_gloo_available(), reason="gloo backend unavailable")

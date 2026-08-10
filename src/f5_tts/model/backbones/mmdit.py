@@ -163,6 +163,19 @@ class MMDiT(nn.Module):
     def text_uncond(self, value):
         self._get_cache_local().text_uncond = value
 
+    _MMDIT_EPHEMERAL_ATTRS = ("_cache_local",)
+
+    def __getstate__(self):
+        state = self.__dict__.copy()
+        for attr in self._MMDIT_EPHEMERAL_ATTRS:
+            state.pop(attr, None)
+        return state
+
+    def __setstate__(self, state):
+        super().__setstate__(state)
+        for attr in self._MMDIT_EPHEMERAL_ATTRS:
+            object.__setattr__(self, attr, None)
+
     def initialize_weights(self):
         # Zero-out AdaLN layers in MMDiT blocks:
         for block in self.transformer_blocks:

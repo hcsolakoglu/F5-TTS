@@ -91,3 +91,18 @@ Moreover, if you couldn't access W&B and want to log metrics offline, you can se
 ```
 export WANDB_MODE=offline
 ```
+
+## Global masked-mean training
+
+`global_masked_mean=True` computes one masked-frame mean across each distributed
+accumulation window. Accelerate duplicate-padding is disabled for this mode. A
+multi-process dataloader whose batch count is not divisible by process count is
+rejected before preparation instead of replaying real samples or silently
+dropping a tail group. Choose a batch size or explicit dataset policy that
+produces equal per-rank batch counts.
+
+Checkpoint resume restores the update cursor, epoch-addressable sample order, and
+per-process Python, CPU Torch, CUDA, and DataLoader worker-generator state when
+the process count matches the checkpoint. Resuming with a different process count
+fails explicitly because sampler and RNG trajectories cannot be reconstructed
+safely.

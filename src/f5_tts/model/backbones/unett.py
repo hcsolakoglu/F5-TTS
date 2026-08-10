@@ -226,6 +226,20 @@ class UNetT(nn.Module):
     def text_uncond(self, value):
         self._get_cache_local().text_uncond = value
 
+    _UNETT_EPHEMERAL_ATTRS = ("_cache_local",)
+
+    def __getstate__(self):
+        state = self.__dict__.copy()
+        state.pop("_compiled_call_impl", None)
+        for attr in self._UNETT_EPHEMERAL_ATTRS:
+            state.pop(attr, None)
+        return state
+
+    def __setstate__(self, state):
+        super().__setstate__(state)
+        for attr in self._UNETT_EPHEMERAL_ATTRS:
+            object.__setattr__(self, attr, None)
+
     def get_input_embed(
         self,
         x,  # b n d
