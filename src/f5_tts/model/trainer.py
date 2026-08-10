@@ -696,9 +696,10 @@ class Trainer:
                 for item in text
             ):
                 return "text list entries must be strings or lists of strings"
-            if any(isinstance(item, list) for item in text) and getattr(
-                self._unwrapped_model, "vocab_char_map", None
-            ) is None:
+            if (
+                any(isinstance(item, list) for item in text)
+                and getattr(self._unwrapped_model, "vocab_char_map", None) is None
+            ):
                 return "nested text token lists require a vocabulary map"
         else:
             return "text must be a tensor or list"

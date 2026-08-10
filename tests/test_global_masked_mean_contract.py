@@ -792,6 +792,7 @@ def _rank_oom_worker(rank, world_size, init_method):
         timeout=datetime.timedelta(seconds=30),
     )
     try:
+
         class _RankMaskSampler:
             num_channels = 2
             vocab_char_map = None

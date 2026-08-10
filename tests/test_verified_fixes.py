@@ -222,9 +222,7 @@ def test_load_checkpoint_restores_cursor_and_rng_state(tmp_path):
     assert target.load_checkpoint(return_cursor=True) == (3, 5)
     assert random.random() == expected_python
     torch.testing.assert_close(torch.rand(()), expected_torch)
-    torch.testing.assert_close(
-        torch.rand((), generator=target._train_dataloader_generator), expected_worker
-    )
+    torch.testing.assert_close(torch.rand((), generator=target._train_dataloader_generator), expected_worker)
 
 
 @pytest.mark.parametrize(
