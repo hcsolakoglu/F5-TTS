@@ -709,13 +709,15 @@ class Trainer:
         else:
             generator = None
 
+        persistent_workers = num_workers > 0
+
         if self.batch_size_type == "sample":
             train_dataloader = DataLoader(
                 train_dataset,
                 collate_fn=collate_fn,
                 num_workers=num_workers,
                 pin_memory=True,
-                persistent_workers=True,
+                persistent_workers=persistent_workers,
                 batch_size=self.batch_size_per_gpu,
                 shuffle=True,
                 generator=generator,
@@ -735,7 +737,7 @@ class Trainer:
                 collate_fn=collate_fn,
                 num_workers=num_workers,
                 pin_memory=True,
-                persistent_workers=True,
+                persistent_workers=persistent_workers,
                 batch_sampler=batch_sampler,
             )
         else:
