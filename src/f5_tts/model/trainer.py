@@ -345,8 +345,10 @@ class Trainer:
 
     def _resolved_ema_config(self):
         config = {}
-        for name, parameter in inspect.signature(EMA).parameters.items():
-            if name in {"model", "ema_model"} or parameter.default is inspect.Parameter.empty:
+        # ema-pytorch 0.8+ wraps the class call signature as (model, *args,
+        # **kwargs), while the constructor still exposes its real defaults.
+        for name, parameter in inspect.signature(EMA.__init__).parameters.items():
+            if name in {"self", "model", "ema_model"} or parameter.default is inspect.Parameter.empty:
                 continue
             config[name] = parameter.default
         config.update(getattr(self, "ema_kwargs", {}) or {})
