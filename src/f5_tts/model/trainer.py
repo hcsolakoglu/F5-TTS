@@ -52,6 +52,14 @@ def _resolve_compile_dynamic(
     return None
 
 
+try:
+    from torch.optim.optimizer import _get_fused_kernels_supported_devices as _fused_devices
+
+    FUSED_ADAMW_DEVICE_TYPES = frozenset(_fused_devices())
+except ImportError:
+    FUSED_ADAMW_DEVICE_TYPES = frozenset(("cuda",))
+
+
 # trainer
 
 
@@ -194,7 +202,8 @@ class Trainer:
 
             self.optimizer = bnb.optim.AdamW8bit(model.parameters(), lr=learning_rate)
         else:
-            self.optimizer = AdamW(model.parameters(), lr=learning_rate, fused=True)
+            use_fused = self.accelerator.device.type in FUSED_ADAMW_DEVICE_TYPES
+            self.optimizer = AdamW(model.parameters(), lr=learning_rate, fused=use_fused)
         self.model, self.optimizer = self.accelerator.prepare(self.model, self.optimizer)
         self._unwrapped_model = self.accelerator.unwrap_model(self.model)
         self._validate_global_masked_mean_backend()
