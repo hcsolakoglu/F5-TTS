@@ -19,6 +19,7 @@ from accelerate.utils import DistributedType
 from torch import nn
 from torch.nn.parallel import DistributedDataParallel
 
+import f5_tts.model.cfm as cfm_module
 from f5_tts.model.cfm import CFM
 from f5_tts.model.dataset import DynamicBatchSampler
 from f5_tts.model.trainer import Trainer
@@ -53,6 +54,22 @@ def _tiny_cfm() -> CFM:
         audio_drop_prob=0.0,
         cond_drop_prob=0.0,
     )
+
+
+def test_sample_clears_transformer_cache_when_ode_fails(monkeypatch):
+    model = _tiny_cfm()
+    cache_clears = []
+    monkeypatch.setattr(model.transformer, "clear_cache", lambda: cache_clears.append(True), raising=False)
+
+    def fail_odeint(*args, **kwargs):
+        raise RuntimeError("synthetic ODE failure")
+
+    monkeypatch.setattr(cfm_module, "odeint", fail_odeint)
+
+    with pytest.raises(RuntimeError, match="synthetic ODE failure"):
+        model.sample(torch.zeros((1, 3, 2)), ["test"], duration=5, steps=2)
+
+    assert cache_clears == [True]
 
 
 def test_sample_training_mask_is_boolean_and_never_selects_padding():
@@ -261,6 +278,11 @@ class _IteratorAccelerator:
     def reduce(self, value, reduction):
         assert reduction == "sum"
         self.reduced.append(value.clone())
+        if value.ndim == 1:
+            if value.dtype != torch.int64:
+                if value.tolist() == [0, 1, 0]:
+                    return torch.tensor([0, self.num_processes, 0], device=value.device, dtype=value.dtype)
+                return value
         remote = torch.zeros_like(value)
         if remote.ndim == 0:
             remote = remote + self.remote_denominator
@@ -313,7 +335,10 @@ def test_window_iterator_uses_int64_denominator_tensor_and_exact_boundaries():
     assert [int(entry[3]) for entry in yielded] == [12, 12, 12, 10, 10]
     assert [entry[3].dtype for entry in yielded] == [torch.int64] * 5
     assert [float(entry[2]) for entry in yielded] == pytest.approx([3 / 12] * 3 + [3 / 10] * 2)
-    assert [value.dtype for value in trainer.accelerator.reduced] == [torch.int64, torch.int64]
+    assert [value.dtype for value in trainer.accelerator.reduced if value.ndim == 1 and value[0].item() > 0] == [
+        torch.int64,
+        torch.int64,
+    ]
 
 
 def test_window_iterator_accepts_preprocessed_pinyin_token_lists():

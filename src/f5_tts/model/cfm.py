@@ -103,6 +103,11 @@ def _compile_failure_types() -> tuple[type[BaseException], ...]:
 
 
 class CFM(nn.Module):
+    # The production Trainer supplies the resolved model config as the behavior
+    # signature. Persistent model state uses Module.state_dict; compile execution
+    # settings are signed separately by Trainer.
+    supports_exact_resume = True
+
     def __init__(
         self,
         transformer: nn.Module,
@@ -156,6 +161,20 @@ class CFM(nn.Module):
         object.__setattr__(self, "_compile_runtime_fallback", True)
         object.__setattr__(self, "_compile_fallback_active", False)
         object.__setattr__(self, "_compile_error", None)
+
+    @property
+    def exact_resume_signature(self):
+        """Behavioral configuration not represented by Module.state_dict()."""
+        return {
+            "version": 1,
+            "sigma": self.sigma,
+            "audio_drop_prob": self.audio_drop_prob,
+            "cond_drop_prob": self.cond_drop_prob,
+            "frac_lengths_mask": self.frac_lengths_mask,
+            "num_channels": self.num_channels,
+            "odeint_kwargs": self.odeint_kwargs,
+            "vocab_char_map": self.vocab_char_map,
+        }
 
     # torch.compile returns Python callables that close over this exact CFM instance.
     # deepcopy treats functions as atomic, so copying a compiled CFM without stripping
@@ -672,8 +691,10 @@ class CFM(nn.Module):
         if sway_sampling_coef is not None:
             t = t + sway_sampling_coef * (torch.cos(torch.pi / 2 * t) - 1 + t)
 
-        trajectory = odeint(fn, y0, t, **self.odeint_kwargs)
-        self.transformer.clear_cache()
+        try:
+            trajectory = odeint(fn, y0, t, **self.odeint_kwargs)
+        finally:
+            self.transformer.clear_cache()
 
         sampled = trajectory[-1]
         out = sampled

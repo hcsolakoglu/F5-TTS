@@ -29,10 +29,14 @@ class _CudaAccelerator:
         self.distributed_type = DistributedType.NO
         self.sync_gradients = True
         self.reduced_dtypes = []
+        self.reduced_status_dtypes = []
 
     def reduce(self, value, reduction):
         assert reduction == "sum"
-        self.reduced_dtypes.append(value.dtype)
+        if value.dtype == torch.int64:
+            self.reduced_dtypes.append(value.dtype)
+        else:
+            self.reduced_status_dtypes.append(value.dtype)
         return value
 
     def no_sync(self, model):
@@ -149,6 +153,7 @@ def _cuda_candidate_and_reference(mask_counts, *, gradient_accumulation_steps, a
         "yielded_masks": yielded_masks,
         "input_masks": masks,
         "reduced_dtypes": accelerator.reduced_dtypes,
+        "reduced_status_dtypes": accelerator.reduced_status_dtypes,
     }
 
 
@@ -173,6 +178,7 @@ def test_cuda_fp32_full_and_partial_updates_match_global_reference(mask_counts, 
         denominator.dtype == torch.int64 and denominator.device.type == "cuda" for denominator in result["denominators"]
     )
     assert result["reduced_dtypes"] == [torch.int64]
+    assert result["reduced_status_dtypes"] and all(dtype == torch.int32 for dtype in result["reduced_status_dtypes"])
     for yielded, expected in zip(result["yielded_masks"], result["input_masks"]):
         assert torch.equal(yielded, expected)
 

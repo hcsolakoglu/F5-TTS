@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 import contextlib
+from typing import Any, cast
 
+import pytest
 import torch
 from accelerate.utils import DistributedType
 from torch import nn
@@ -25,6 +27,23 @@ class _OneBatchLoader:
         return 1
 
     def __iter__(self):
+        yield self.batch
+
+
+class _TwoBatchLoader:
+    def __init__(self):
+        self.batch_sampler = object()
+        self.batch = {
+            "mel": torch.ones((1, 2, 3)),
+            "mel_lengths": torch.tensor([3]),
+            "text": ["overflow"],
+        }
+
+    def __len__(self):
+        return 2
+
+    def __iter__(self):
+        yield self.batch
         yield self.batch
 
 
@@ -79,6 +98,32 @@ class _ControlledSGD(torch.optim.SGD):
         return super().step(closure)
 
 
+class _CountingScheduler:
+    def __init__(self, optimizer, *, start_factor, end_factor, total_iters):
+        self.optimizer = optimizer
+        self.start_factor = start_factor
+        self.end_factor = end_factor
+        self.total_iters = total_iters
+        self.step_calls = 0
+        self.base_lrs = [group["lr"] for group in optimizer.param_groups]
+
+    def step(self):
+        self.step_calls += 1
+        progress = min(self.step_calls, self.total_iters) / self.total_iters
+        factor = self.start_factor + (self.end_factor - self.start_factor) * progress
+        for base_lr, group in zip(self.base_lrs, self.optimizer.param_groups):
+            group["lr"] = base_lr * factor
+
+    def state_dict(self):
+        return {"step_calls": self.step_calls}
+
+    def get_last_lr(self):
+        return [group["lr"] for group in self.optimizer.param_groups]
+
+    def load_state_dict(self, state):
+        self.step_calls = state["step_calls"]
+
+
 class _CountingEMA:
     def __init__(self):
         self.updates = 0
@@ -101,7 +146,7 @@ class _OverflowAccelerator:
         self.end_calls = 0
 
     def prepare_data_loader(self, dataloader, device_placement):
-        assert device_placement is False
+        assert device_placement in (False, True)
         return dataloader
 
     def prepare(self, *objects):
@@ -137,7 +182,7 @@ class _OverflowAccelerator:
         self.end_calls += 1
 
 
-def _trainer(*, overflow, checkpoint_cursor, global_masked_mean=True):
+def _trainer(*, overflow, checkpoint_cursor, global_masked_mean=True, grad_accumulation_steps=1):
     model = _OverflowModel()
     trainer = Trainer.__new__(Trainer)
     trainer.model = model
@@ -146,7 +191,7 @@ def _trainer(*, overflow, checkpoint_cursor, global_masked_mean=True):
     trainer.ema_model = _CountingEMA()
     trainer.accelerator = _OverflowAccelerator(optimizer_step_was_skipped=overflow)
     trainer.global_masked_mean = global_masked_mean
-    trainer.grad_accumulation_steps = 1
+    trainer.grad_accumulation_steps = grad_accumulation_steps
     trainer.max_grad_norm = 0
     trainer.log_samples = False
     trainer.batch_size_type = "sample"
@@ -168,11 +213,94 @@ def _trainer(*, overflow, checkpoint_cursor, global_masked_mean=True):
     return trainer
 
 
+def test_scheduler_manual_mode_steps_once_per_optimizer_update(monkeypatch):
+    monkeypatch.setattr(trainer_module, "DataLoader", lambda *args, **kwargs: _TwoBatchLoader())
+    monkeypatch.setattr(trainer_module, "LinearLR", _CountingScheduler)
+
+    trainer = cast(Any, _trainer(overflow=False, checkpoint_cursor=(0, 0), grad_accumulation_steps=2))
+    trainer.accelerator.step_scheduler_with_optimizer = False
+    trainer.train(cast(Any, object()), num_workers=0)
+
+    assert trainer.scheduler.step_calls == 1
+
+
+def test_training_loop_coordinates_dataloader_construction_failure(monkeypatch):
+    def fail_loader(*args, **kwargs):
+        raise RuntimeError("synthetic dataloader construction failure")
+
+    monkeypatch.setattr(trainer_module, "DataLoader", fail_loader)
+    trainer = _trainer(overflow=False, checkpoint_cursor=(0, 0))
+    trainer.accelerator.num_processes = 2
+    status_shapes = []
+
+    def reduce(value, reduction):
+        assert reduction == "sum"
+        status_shapes.append(tuple(value.shape))
+        if value.shape == (2,):
+            return torch.tensor([1, 0], dtype=value.dtype)
+        return value
+
+    trainer.accelerator.reduce = reduce
+
+    with pytest.raises(RuntimeError, match="dataloader construction"):
+        trainer.train(cast(Any, object()), num_workers=0)
+    assert (2,) in status_shapes
+
+
+def test_training_loop_coordinates_device_transfer_failure(monkeypatch):
+    monkeypatch.setattr(trainer_module, "DataLoader", lambda *args, **kwargs: _TwoBatchLoader())
+    monkeypatch.setattr(
+        trainer_module,
+        "send_to_device",
+        lambda *args, **kwargs: (_ for _ in ()).throw(RuntimeError("synthetic device transfer failure")),
+    )
+    trainer = _trainer(overflow=False, checkpoint_cursor=(0, 0))
+    trainer.accelerator.num_processes = 2
+    status_shapes = []
+    status_calls = 0
+
+    def reduce(value, reduction):
+        nonlocal status_calls
+        assert reduction == "sum"
+        status_shapes.append(tuple(value.shape))
+        if value.shape == (2,):
+            status_calls += 1
+        return value
+
+    trainer.accelerator.reduce = reduce
+
+    with pytest.raises(RuntimeError, match="batch device transfer"):
+        trainer.train(cast(Any, object()), num_workers=0)
+    assert status_calls >= 1
+    assert status_shapes[-1] == (2,)
+
+
+def test_scheduler_counts_successful_updates_and_skips_overflow(monkeypatch):
+    monkeypatch.setattr(trainer_module, "DataLoader", lambda *args, **kwargs: _OneBatchLoader())
+    monkeypatch.setattr(trainer_module, "LinearLR", _CountingScheduler)
+
+    successful = cast(Any, _trainer(overflow=False, checkpoint_cursor=(0, 0)))
+    successful.train(cast(Any, object()), num_workers=0)
+
+    assert successful.optimizer.attempted_steps == 1
+    assert successful.scheduler.step_calls == 1
+    assert successful.saved[-1] == (1, 1, True)
+    assert successful.optimizer.param_groups[0]["lr"] == pytest.approx(1e-10)
+
+    overflowed = cast(Any, _trainer(overflow=True, checkpoint_cursor=(0, 0)))
+    overflowed.train(cast(Any, object()), num_workers=0)
+
+    assert overflowed.optimizer.attempted_steps == 1
+    assert overflowed.scheduler.step_calls == 0
+    assert overflowed.saved[-1] == (0, 1, True)
+    assert overflowed.optimizer.param_groups[0]["lr"] == pytest.approx(0.01)
+
+
 def test_successful_train_scales_the_production_loss_sum_before_backward(monkeypatch):
     monkeypatch.setattr(trainer_module, "DataLoader", lambda *args, **kwargs: _OneBatchLoader())
-    trained = _trainer(overflow=False, checkpoint_cursor=(0, 0))
+    trained = cast(Any, _trainer(overflow=False, checkpoint_cursor=(0, 0)))
 
-    trained.train(object(), num_workers=0)
+    trained.train(cast(Any, object()), num_workers=0)
 
     # loss_sum = weight**2 * 6 and the production scale is 1 / 6, so
     # d(loss_sum * scale) / d(weight) is exactly 2 * 0.5 = 1. A plausible

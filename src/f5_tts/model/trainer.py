@@ -6,7 +6,9 @@ import math
 import operator
 import os
 import random
+import warnings
 from contextlib import contextmanager, nullcontext
+from enum import Enum
 from typing import Any, cast
 
 import torch
@@ -23,7 +25,11 @@ from tqdm import tqdm
 
 from f5_tts.model import CFM
 from f5_tts.model.cfm import _is_cuda_oom
-from f5_tts.model.dataset import DynamicBatchSampler, collate_fn
+from f5_tts.model.dataset import (
+    DynamicBatchSampler,
+    _get_exact_resume_dataset_signature,
+    collate_fn,
+)
 from f5_tts.model.utils import default, exists
 
 
@@ -111,13 +117,13 @@ class Trainer:
         wandb_resume_id: str = None,
         log_samples: bool = False,
         last_per_updates=None,
-        accelerate_kwargs: dict = dict(),
-        ema_kwargs: dict = dict(),
+        accelerate_kwargs: dict | None = None,
+        ema_kwargs: dict | None = None,
         bnb_optimizer: bool = False,
         mel_spec_type: str = "vocos",  # "vocos" | "bigvgan"
         is_local_vocoder: bool = False,  # use local path vocoder
         local_vocoder_path: str = "",  # local vocoder path
-        model_cfg_dict: dict = dict(),  # training config
+        model_cfg_dict: dict | None = None,  # training config
         compile_enabled: bool = False,
         compile_backend: str | None = "inductor",
         compile_target: str = "cfm_loss_core",
@@ -133,15 +139,39 @@ class Trainer:
         if logger == "wandb" and not wandb.api.api_key:
             logger = None
         self.log_samples = log_samples
+        accelerate_kwargs = {} if accelerate_kwargs is None else dict(accelerate_kwargs)
+        ema_kwargs = {} if ema_kwargs is None else dict(ema_kwargs)
+        model_cfg_dict = {} if model_cfg_dict is None else dict(model_cfg_dict)
+        self.model_cfg_dict = self._resume_primitive(model_cfg_dict)
+        self.ema_kwargs = self._resume_primitive(ema_kwargs)
+        self._ema_component_signature = {
+            "type": f"{EMA.__module__}.{EMA.__qualname__}",
+            "config": self._resolved_ema_config(),
+        }
+        gradient_accumulation_plugin = accelerate_kwargs.pop("gradient_accumulation_plugin", None)
+        configured_accumulation_steps = accelerate_kwargs.pop("gradient_accumulation_steps", None)
+        if gradient_accumulation_plugin is not None:
+            if configured_accumulation_steps is not None:
+                raise ValueError("pass either gradient_accumulation_steps or gradient_accumulation_plugin, not both")
+            accumulation_kwargs = {"gradient_accumulation_plugin": gradient_accumulation_plugin}
+        else:
+            if configured_accumulation_steps is not None:
+                grad_accumulation_steps = self._validate_gradient_accumulation_steps(configured_accumulation_steps)
+            accumulation_kwargs = {"gradient_accumulation_steps": grad_accumulation_steps}
 
         self.accelerator = Accelerator(
             log_with=logger if logger == "wandb" else None,
             kwargs_handlers=[ddp_kwargs],
-            gradient_accumulation_steps=grad_accumulation_steps,
+            **accumulation_kwargs,
             **accelerate_kwargs,
         )
         self.global_masked_mean = global_masked_mean
-        self.grad_accumulation_steps = grad_accumulation_steps
+        self._requested_grad_accumulation_steps = grad_accumulation_steps
+        (
+            self.grad_accumulation_steps,
+            self._sync_with_dataloader,
+            self._adjust_scheduler,
+        ) = self._get_effective_gradient_accumulation_contract()
         self.max_grad_norm = max_grad_norm
         self._validate_global_masked_mean_config()
 
@@ -192,6 +222,8 @@ class Trainer:
                 )
 
         self.epochs = epochs
+        self.learning_rate = learning_rate
+        self.bnb_optimizer = bnb_optimizer
         self.num_warmup_updates = num_warmup_updates
         self.save_per_updates = save_per_updates
         self.keep_last_n_checkpoints = keep_last_n_checkpoints
@@ -252,6 +284,143 @@ class Trainer:
             raise ValueError("gradient_accumulation_steps must be a positive integer")
         return normalized
 
+    def _get_effective_gradient_accumulation_contract(self):
+        gradient_state = getattr(self.accelerator, "gradient_state", None)
+        requested = getattr(
+            self,
+            "_requested_grad_accumulation_steps",
+            getattr(self, "grad_accumulation_steps", 1),
+        )
+        effective_steps = getattr(
+            gradient_state,
+            "num_steps",
+            getattr(self.accelerator, "gradient_accumulation_steps", requested),
+        )
+        effective_steps = self._validate_gradient_accumulation_steps(effective_steps)
+        sync_with_dataloader = bool(getattr(gradient_state, "sync_with_dataloader", True))
+        adjust_scheduler = bool(getattr(gradient_state, "adjust_scheduler", False))
+        return effective_steps, sync_with_dataloader, adjust_scheduler
+
+    @staticmethod
+    def _resume_primitive(value):
+        if isinstance(value, Enum):
+            return Trainer._resume_primitive(value.value)
+        if value is None or isinstance(value, (str, int, float, bool)):
+            return value
+        if isinstance(value, (tuple, list)):
+            return [Trainer._resume_primitive(item) for item in value]
+        if isinstance(value, (set, frozenset)):
+            items = [Trainer._resume_primitive(item) for item in value]
+            return {"set": sorted(items, key=repr)}
+        if isinstance(value, dict):
+            return {str(key): Trainer._resume_primitive(item) for key, item in value.items() if key != "params"}
+        if isinstance(value, torch.dtype):
+            return str(value)
+        return f"{type(value).__module__}.{type(value).__qualname__}"
+
+    @staticmethod
+    def _exact_signature_primitive(value):
+        if isinstance(value, Enum):
+            return Trainer._exact_signature_primitive(value.value)
+        if value is None or isinstance(value, (str, int, float, bool)):
+            return value
+        if isinstance(value, (tuple, list)):
+            return [Trainer._exact_signature_primitive(item) for item in value]
+        if isinstance(value, (set, frozenset)):
+            items = [Trainer._exact_signature_primitive(item) for item in value]
+            return {"set": sorted(items, key=repr)}
+        if isinstance(value, dict):
+            return {str(key): Trainer._exact_signature_primitive(item) for key, item in value.items()}
+        if isinstance(value, torch.dtype):
+            return str(value)
+        raise ValueError(
+            "exact resume signatures must contain only primitive values, mappings, sequences, sets, enums, or dtypes"
+        )
+
+    @staticmethod
+    def _qualified_type(value):
+        if value is None:
+            return None
+        return f"{type(value).__module__}.{type(value).__qualname__}"
+
+    def _resolved_ema_config(self):
+        config = {}
+        for name, parameter in inspect.signature(EMA).parameters.items():
+            if name in {"model", "ema_model"} or parameter.default is inspect.Parameter.empty:
+                continue
+            config[name] = parameter.default
+        config.update(getattr(self, "ema_kwargs", {}) or {})
+        config["include_online_model"] = False
+        return self._resume_primitive(config)
+
+    def _model_configuration_signature(self):
+        config = getattr(self, "model_cfg_dict", None)
+        if isinstance(config, dict) and "model" in config:
+            return config["model"]
+        return config or None
+
+    def _component_resume_signature(self, component, configured_signature=None):
+        """Describe an opted-in component without inspecting arbitrary Python state."""
+        if component is None:
+            return None
+        explicit = getattr(component, "exact_resume_signature", None)
+        if callable(explicit):
+            explicit = explicit()
+        signature: dict[str, Any] = {
+            "type": self._qualified_type(component),
+            "state_protocol": "torch.nn.Module.state_dict",
+        }
+        if explicit is not None:
+            signature["explicit"] = self._exact_signature_primitive(explicit)
+        if configured_signature:
+            signature["config"] = self._exact_signature_primitive(configured_signature)
+        return signature
+
+    @staticmethod
+    def _validate_component_state_protocol(component, name: str):
+        get_extra_state = getattr(type(component), "get_extra_state", None)
+        set_extra_state = getattr(type(component), "set_extra_state", None)
+        has_get_extra_state = get_extra_state is not None and get_extra_state is not torch.nn.Module.get_extra_state
+        has_set_extra_state = set_extra_state is not None and set_extra_state is not torch.nn.Module.set_extra_state
+        if has_get_extra_state != has_set_extra_state:
+            raise ValueError(
+                f"resume_mode='exact' requires {name} to implement both get_extra_state() and set_extra_state()"
+            )
+
+    def _build_optimizer_signature(self):
+        optimizer = getattr(self, "optimizer", None)
+        underlying = getattr(optimizer, "optimizer", optimizer)
+        param_groups = []
+        for group in getattr(underlying, "param_groups", []):
+            param_groups.append(self._resume_primitive(group))
+        return {
+            "type": self._qualified_type(underlying),
+            "bnb_optimizer": bool(getattr(self, "bnb_optimizer", False)),
+            "learning_rate": self._resume_primitive(getattr(self, "learning_rate", None)),
+            "param_groups": param_groups,
+        }
+
+    def _build_dataset_processing_signature(self, train_dataset):
+        mel_spectrogram = getattr(train_dataset, "mel_spectrogram", None)
+        return {
+            "preprocessed_mel": getattr(train_dataset, "preprocessed_mel", None),
+            "content_signature": self._resume_primitive(getattr(train_dataset, "exact_resume_content_signature", None)),
+            "preprocessing_signature": self._resume_primitive(
+                getattr(
+                    train_dataset,
+                    "exact_resume_preprocessing_signature",
+                    getattr(mel_spectrogram, "exact_resume_signature", None),
+                )
+            ),
+            "target_sample_rate": self._resume_primitive(getattr(train_dataset, "target_sample_rate", None)),
+            "n_mel_channels": self._resume_primitive(getattr(train_dataset, "n_mel_channels", None)),
+            "hop_length": self._resume_primitive(getattr(train_dataset, "hop_length", None)),
+            "n_fft": self._resume_primitive(getattr(train_dataset, "n_fft", None)),
+            "win_length": self._resume_primitive(getattr(train_dataset, "win_length", None)),
+            "mel_spec_type": self._resume_primitive(getattr(train_dataset, "mel_spec_type", None)),
+            "mel_spectrogram_type": self._qualified_type(mel_spectrogram),
+        }
+
     @staticmethod
     def _normalize_checkpoint_args(update, consumed_updates=None, last=False):
         """Keep the pre-cursor ``save_checkpoint(update, last=False)`` call valid."""
@@ -298,14 +467,38 @@ class Trainer:
             )
         num_processes = int(getattr(self.accelerator, "num_processes", 1))
         split_batches = bool(getattr(self.accelerator, "split_batches", False))
-        if num_processes > 1 and not split_batches and len(dataloader) % num_processes:
+        if num_processes > 1 and split_batches:
             raise ValueError(
-                "global_masked_mean requires the prepared dataloader batch count to be divisible by "
-                f"the process count ({num_processes}); received {len(dataloader)} batches. "
-                "Increase/drop the final batch explicitly instead of allowing duplicate padding."
+                "global_masked_mean=True does not support split_batches=True in distributed training; "
+                "set split_batches=False to keep per-rank collective counts symmetric."
             )
-        prepared = self.accelerator.prepare_data_loader(dataloader, device_placement=False)
-        self._validate_global_masked_dataloader(prepared)
+        if num_processes > 1 and not split_batches:
+            dataloader_length = None
+            length_exception = None
+            try:
+                dataloader_length = len(dataloader)
+            except Exception as exc:
+                length_exception = exc
+            else:
+                if dataloader_length % num_processes:
+                    length_exception = ValueError(
+                        "global_masked_mean requires the prepared dataloader batch count to be divisible by "
+                        f"the process count ({num_processes}); received {dataloader_length} batches. "
+                        "Increase/drop the final batch explicitly instead of allowing duplicate padding."
+                    )
+            self._raise_if_global_masked_mean_failure("dataloader length", length_exception)
+            if dataloader_length is None:  # pragma: no cover - helper raises on the failed rank
+                raise RuntimeError("global_masked_mean dataloader length was unavailable")
+        prepared = None
+        prepare_exception = None
+        try:
+            prepared = self.accelerator.prepare_data_loader(dataloader, device_placement=False)
+        except Exception as exc:
+            prepare_exception = exc
+        self._raise_if_global_masked_mean_failure("dataloader preparation", prepare_exception)
+        if prepared is None:  # pragma: no cover - helper raises on every failed rank
+            raise RuntimeError("global_masked_mean dataloader preparation returned no loader")
+        self._prepared_global_masked_mean_batches = self._validate_global_masked_dataloader(prepared)
         return prepared
 
     def _capture_rng_states(self):
@@ -332,11 +525,19 @@ class Trainer:
             return
         expected_processes = int(getattr(self.accelerator, "num_processes", 1))
         if len(states) != expected_processes:
-            raise ValueError(
+            message = (
                 "checkpoint RNG state was saved for "
                 f"{len(states)} processes, but the current run uses {expected_processes}; "
                 "resume with the same process count or start from model weights only."
             )
+            if getattr(self, "resume_mode", "best_effort") == "exact":
+                raise ValueError(message)
+            warnings.warn(
+                f"{message} Skipping incompatible RNG restoration in best-effort mode.",
+                RuntimeWarning,
+                stacklevel=2,
+            )
+            return
         process_index = int(getattr(self.accelerator, "process_index", 0))
         state = states[process_index]
         random.setstate(state["python"])
@@ -350,6 +551,253 @@ class Trainer:
         dataloader_generator = getattr(self, "_train_dataloader_generator", None)
         if dataloader_generator is not None and "dataloader_generator" in state:
             dataloader_generator.set_state(state["dataloader_generator"])
+
+    def _capture_scaler_state(self):
+        scaler = getattr(self.accelerator, "scaler", None)
+        return None if scaler is None else scaler.state_dict()
+
+    def _restore_scaler_state(self, state):
+        if state is None:
+            return
+        scaler = getattr(self.accelerator, "scaler", None)
+        if scaler is not None:
+            scaler.load_state_dict(state)
+
+    def _build_resume_state_signature(self):
+        accelerator = self.accelerator
+        device = getattr(accelerator, "device", None)
+        device_type = getattr(device, "type", str(device))
+        mixed_precision = getattr(accelerator, "mixed_precision", "no")
+        mixed_precision = getattr(mixed_precision, "value", mixed_precision)
+        distributed_type = getattr(accelerator, "distributed_type", DistributedType.NO)
+        distributed_type = getattr(distributed_type, "value", distributed_type)
+        scaler = getattr(accelerator, "scaler", None)
+        return {
+            "version": 1,
+            "device_type": str(device_type),
+            "cuda_device_count": torch.cuda.device_count() if device_type == "cuda" else 0,
+            "mixed_precision": str(mixed_precision),
+            "scaler_type": None if scaler is None else type(scaler).__qualname__,
+            "distributed_type": str(distributed_type),
+            "num_processes": int(getattr(accelerator, "num_processes", 1)),
+            "num_machines": int(getattr(accelerator, "num_machines", 1)),
+            "rng_types": self._resume_primitive(getattr(accelerator, "rng_types", None)),
+            "use_seedable_sampler": self._resume_primitive(getattr(accelerator, "use_seedable_sampler", None)),
+        }
+
+    def _build_resume_signature(
+        self,
+        train_dataset,
+        num_workers: int,
+        resumable_with_seed,
+        prepared_batches: int,
+        split_batches: bool,
+        step_scheduler_with_optimizer: bool,
+        sync_with_dataloader: bool,
+        adjust_scheduler: bool,
+    ):
+        accelerator = self.accelerator
+        model = getattr(self, "_unwrapped_model", None) or getattr(self, "model", None)
+        ema_signature = getattr(self, "_ema_component_signature", None)
+        if ema_signature is None:
+            ema_signature = {
+                "type": self._qualified_type(getattr(self, "ema_model", None)),
+                "config": self._resume_primitive(getattr(self, "ema_kwargs", {}) or {}),
+            }
+        compile_config = {
+            "active": bool(getattr(self, "compile_active", False)),
+            "backend": self._resume_primitive(getattr(self, "compile_backend", None)),
+            "target": self._resume_primitive(getattr(self, "compile_target", None)),
+            "mode": self._resume_primitive(getattr(self, "compile_mode", None)),
+            "fullgraph": self._resume_primitive(getattr(self, "compile_fullgraph", None)),
+            "dynamic": self._resume_primitive(
+                getattr(self, "compile_effective_dynamic", getattr(self, "compile_dynamic", None))
+            ),
+            "fallback_to_eager": bool(getattr(self, "compile_fallback_to_eager", True)),
+            "fallback_active": bool(getattr(self, "compile_fallback_active", False)),
+        }
+        return {
+            "version": 2,
+            "dataset_type": f"{type(train_dataset).__module__}.{type(train_dataset).__qualname__}",
+            "dataset": _get_exact_resume_dataset_signature(train_dataset),
+            "dataset_processing": self._build_dataset_processing_signature(train_dataset),
+            "batch_size_type": self.batch_size_type,
+            "batch_size_per_gpu": self.batch_size_per_gpu,
+            "max_samples": self.max_samples,
+            "grad_accumulation_steps": self.grad_accumulation_steps,
+            "sync_with_dataloader": bool(sync_with_dataloader),
+            "adjust_scheduler": bool(adjust_scheduler),
+            "epochs": self.epochs,
+            "num_warmup_updates": self.num_warmup_updates,
+            "max_grad_norm": self._resume_primitive(getattr(self, "max_grad_norm", None)),
+            "global_masked_mean": bool(self.global_masked_mean),
+            "num_workers": int(num_workers),
+            "persistent_workers": bool(num_workers > 0),
+            "resumable_with_seed": None if resumable_with_seed is None else int(resumable_with_seed),
+            "sampler": "epoch_random_sample" if self.batch_size_type == "sample" else "dynamic_frame",
+            "prepared_batches": int(prepared_batches),
+            "split_batches": bool(split_batches),
+            "dispatch_batches": bool(getattr(accelerator, "dispatch_batches", False)),
+            "even_batches": getattr(accelerator, "even_batches", None),
+            "device_placement": not bool(self.global_masked_mean),
+            "step_scheduler_with_optimizer": bool(step_scheduler_with_optimizer),
+            "optimizer": self._build_optimizer_signature(),
+            "model_type": self._qualified_type(model),
+            "model_component": self._component_resume_signature(
+                model,
+                configured_signature=self._model_configuration_signature() if isinstance(model, CFM) else None,
+            ),
+            "ema_component": ema_signature,
+            "ema_kwargs": self._resume_primitive(getattr(self, "ema_kwargs", None)),
+            "duration_predictor_type": self._qualified_type(getattr(self, "duration_predictor", None)),
+            "duration_predictor_component": self._component_resume_signature(getattr(self, "duration_predictor", None)),
+            "noise_scheduler": self._resume_primitive(getattr(self, "noise_scheduler", None)),
+            "compile": compile_config,
+            "resume_state": self._build_resume_state_signature(),
+        }
+
+    def _validate_exact_component_signatures(self):
+        model = getattr(self, "_unwrapped_model", None) or getattr(self, "model", None)
+        duration_predictor = getattr(self, "duration_predictor", None)
+        components = {
+            "model": (
+                model,
+                self._component_resume_signature(
+                    model,
+                    configured_signature=self._model_configuration_signature() if isinstance(model, CFM) else None,
+                ),
+            ),
+            "duration predictor": (
+                duration_predictor,
+                self._component_resume_signature(duration_predictor),
+            ),
+        }
+        for name, (component, signature) in components.items():
+            if signature is None:
+                continue
+            if getattr(component, "supports_exact_resume", False) is not True:
+                raise ValueError(
+                    f"resume_mode='exact' requires {name}.supports_exact_resume=True; "
+                    "the opt-in certifies that state_dict() contains every training-affecting mutable value"
+                )
+            if not any(key in signature for key in ("explicit", "config")):
+                raise ValueError(
+                    f"resume_mode='exact' requires {name}.exact_resume_signature or a production model configuration"
+                )
+            if isinstance(component, CFM) and "config" not in signature:
+                raise ValueError("resume_mode='exact' requires the production model configuration for CFM")
+            self._validate_component_state_protocol(component, name)
+
+    def _validate_exact_dataset_components(self, train_dataset):
+        source = getattr(train_dataset, "data", train_dataset)
+        features = getattr(source, "features", None)
+        uses_audio_feature = features is not None and "audio" in features
+        source_columns = getattr(source, "column_names", None)
+        source_features = getattr(source, "features", None)
+        uses_audio_path = (source_columns is not None and "audio_path" in source_columns) or (
+            source_features is not None and "audio_path" in source_features
+        )
+        if (uses_audio_feature or uses_audio_path) and not getattr(train_dataset, "preprocessed_mel", False):
+            if getattr(train_dataset, "exact_resume_content_signature", None) is None:
+                raise ValueError("resume_mode='exact' requires exact_resume_content_signature for external audio data")
+
+        mel_spectrogram = getattr(train_dataset, "mel_spectrogram", None)
+        if mel_spectrogram is None or getattr(train_dataset, "preprocessed_mel", False):
+            return
+        if self._qualified_type(mel_spectrogram) == "f5_tts.model.modules.MelSpec":
+            return
+        preprocessing_signature = getattr(train_dataset, "exact_resume_preprocessing_signature", None)
+        if preprocessing_signature is None:
+            preprocessing_signature = getattr(mel_spectrogram, "exact_resume_signature", None)
+        if preprocessing_signature is None:
+            raise ValueError("resume_mode='exact' requires exact_resume_preprocessing_signature for custom mel modules")
+
+    def _validate_resume_signatures(self, checkpoint):
+        """Validate persisted state that is required for exact resume."""
+        if "update" not in checkpoint and "step" not in checkpoint:
+            return True, True
+        expected_state = getattr(self, "_resume_state_signature", None)
+        expected_resume = getattr(self, "_resume_signature", None)
+        saved_state = checkpoint.get("resume_state_signature")
+        saved_resume = checkpoint.get("resume_signature")
+        missing = (
+            expected_state is None
+            or expected_resume is None
+            or saved_state is None
+            or saved_resume is None
+            or "rng_state" not in checkpoint
+            or "scaler_state" not in checkpoint
+            or (
+                getattr(self, "duration_predictor", None) is not None
+                and checkpoint.get("duration_predictor_state_dict") is None
+            )
+        )
+        legacy_signature = (
+            expected_state is None or expected_resume is None or saved_state is None or saved_resume is None
+        )
+        mismatches = []
+        if not missing:
+            if saved_state != expected_state:
+                mismatches.append("execution topology or mixed-precision state")
+            if saved_resume != expected_resume:
+                mismatches.append("dataset or dataloader training contract")
+            if (getattr(self.accelerator, "scaler", None) is not None) != (checkpoint.get("scaler_state") is not None):
+                mismatches.append("AMP scaler state")
+        if missing or mismatches:
+            details_parts = list(mismatches)
+            if missing:
+                details_parts.append("missing persisted resume signature/state")
+            if (
+                getattr(self, "duration_predictor", None) is not None
+                and checkpoint.get("duration_predictor_state_dict") is None
+            ):
+                details_parts.append("duration_predictor_state_dict")
+            details = ", ".join(details_parts)
+            message = f"resume signature is incompatible: {details}"
+            if getattr(self, "resume_mode", "best_effort") == "exact":
+                raise ValueError(f"exact resume requires a matching {message}")
+            if legacy_signature and "rng_state" in checkpoint:
+                warnings.warn(
+                    "legacy checkpoint lacks full resume signatures; restoring its legacy RNG state in "
+                    "best-effort mode; exact resume is unavailable.",
+                    RuntimeWarning,
+                    stacklevel=2,
+                )
+                return True, False
+            warnings.warn(
+                f"{message}; skipping scaler and RNG restoration in best-effort mode.",
+                RuntimeWarning,
+                stacklevel=2,
+            )
+            return False, False
+        return True, True
+
+    @staticmethod
+    def _capture_local_rng_state():
+        """Capture RNG streams without entering a distributed collective."""
+        state = {
+            "python": random.getstate(),
+            "torch": torch.get_rng_state(),
+        }
+        if torch.cuda.is_available():
+            state["cuda"] = torch.cuda.get_rng_state_all()
+        return state
+
+    @staticmethod
+    def _restore_local_rng_state(state):
+        random.setstate(state["python"])
+        torch.set_rng_state(state["torch"])
+        if "cuda" in state and torch.cuda.is_available():
+            torch.cuda.set_rng_state_all(list(state["cuda"]))
+
+    @contextmanager
+    def _preserve_inference_rng_state(self):
+        """Prevent rank-local sample logging from advancing training RNG streams."""
+        state = self._capture_local_rng_state()
+        try:
+            yield
+        finally:
+            self._restore_local_rng_state(state)
 
     # ---- torch.compile support (optional, default-off) ----
 
@@ -463,6 +911,7 @@ class Trainer:
             return
 
         effective_compile_dynamic = _resolve_compile_dynamic(self.compile_dynamic, torch.compile)
+        self.compile_effective_dynamic = effective_compile_dynamic
         compile_kwargs = {
             "backend": self.compile_backend,
             "mode": self.compile_mode,
@@ -574,9 +1023,106 @@ class Trainer:
         local_value = local_value.detach().to(device=self.accelerator.device)
         return cast(torch.Tensor, self.accelerator.reduce(local_value, reduction="sum"))
 
+    def _raise_if_global_masked_mean_failure(self, phase: str, local_exception: Exception | None):
+        """Raise a phase error only after global masked-mean ranks synchronize status."""
+        if not getattr(self, "global_masked_mean", False):
+            if local_exception is not None:
+                raise local_exception
+            return
+
+        num_processes = int(getattr(self.accelerator, "num_processes", 1))
+        if num_processes <= 1:
+            if local_exception is not None:
+                raise local_exception
+            return
+
+        local_oom = local_exception is not None and _is_cuda_oom(local_exception)
+        local_stats = torch.tensor(
+            (int(local_exception is not None), int(local_oom)),
+            device=self.accelerator.device,
+            dtype=torch.int32,
+        )
+        global_stats = self._reduce_global_masked_value(local_stats)
+        global_error_count, global_oom_count = global_stats.cpu().tolist()
+        if not global_error_count:
+            return
+
+        if local_exception is not None:
+            if local_oom:
+                raise local_exception
+            raise RuntimeError(
+                f"global_masked_mean {phase} failed on this rank: {local_exception}"
+            ) from local_exception
+        if global_oom_count:
+            raise RuntimeError(f"global_masked_mean {phase} failed because another rank reported CUDA out of memory.")
+        raise RuntimeError(f"global_masked_mean {phase} failed because another rank raised an exception.")
+
+    def _iter_coordinated_batches(self, dataloader):
+        """Yield batches only after all ranks agree that fetching succeeded."""
+        dataloader_iter = None
+        iterator_exception = None
+        try:
+            dataloader_iter = cast(Any, iter(dataloader))
+        except Exception as exc:
+            iterator_exception = exc
+
+        num_processes = int(getattr(self.accelerator, "num_processes", 1))
+        while True:
+            batch = None
+            local_stop = False
+            local_exception = iterator_exception
+            local_oom = None
+            if local_exception is not None and _is_cuda_oom(local_exception):
+                local_oom = local_exception
+            if local_exception is None:
+                try:
+                    batch = next(cast(Any, dataloader_iter))
+                except StopIteration:
+                    local_stop = True
+                except Exception as exc:
+                    local_exception = exc
+                    if _is_cuda_oom(exc):
+                        local_oom = exc
+
+            local_stats = torch.tensor(
+                (
+                    int(local_exception is not None),
+                    int(local_stop),
+                    int(local_oom is not None),
+                ),
+                device=self.accelerator.device,
+                dtype=torch.int32,
+            )
+            global_stats = self._reduce_global_masked_value(local_stats)
+            global_error_count, global_stop_count, global_oom_count = global_stats.cpu().tolist()
+
+            if global_error_count:
+                if local_exception is not None:
+                    if local_oom is not None:
+                        raise local_oom
+                    raise RuntimeError(
+                        f"global_masked_mean dataloader fetch failed on this rank: {local_exception}"
+                    ) from local_exception
+                if global_oom_count:
+                    raise RuntimeError(
+                        "global_masked_mean dataloader fetch failed because another rank reported CUDA out of memory."
+                    )
+                raise RuntimeError(
+                    "global_masked_mean dataloader fetch failed because another rank raised an exception."
+                )
+
+            if global_stop_count:
+                if global_stop_count != num_processes:
+                    raise RuntimeError(
+                        "global_masked_mean dataloader yielded different numbers of batches across ranks."
+                    )
+                return
+
+            yield batch
+
     def _iter_global_masked_mean_batches(self, dataloader):
         """Yield pre-normalized accumulation windows without retaining graphs."""
-        dataloader_iter = iter(dataloader)
+        dataloader_iter = iter(self._iter_coordinated_batches(dataloader))
         sample_mask = getattr(self._unwrapped_model, "sample_training_mask", None)
         if not callable(sample_mask):
             raise TypeError("The training model does not expose sample_training_mask().")
@@ -729,7 +1275,16 @@ class Trainer:
 
     def _validate_global_masked_dataloader(self, dataloader):
         """Fail collectively if ranks would execute different forward counts."""
-        local_length = torch.tensor([len(dataloader)], device=self.accelerator.device, dtype=torch.int64)
+        dataloader_length = None
+        length_exception = None
+        try:
+            dataloader_length = len(dataloader)
+        except Exception as exc:
+            length_exception = exc
+        self._raise_if_global_masked_mean_failure("prepared dataloader length", length_exception)
+        if dataloader_length is None:  # pragma: no cover - helper raises on the failed rank
+            raise RuntimeError("global_masked_mean prepared dataloader length was unavailable")
+        local_length = torch.tensor([dataloader_length], device=self.accelerator.device, dtype=torch.int64)
         gathered_lengths = cast(torch.Tensor, self.accelerator.gather(local_length))
         if gathered_lengths[0].item() == 0:
             raise ValueError("global_masked_mean requires a non-empty training dataloader.")
@@ -739,21 +1294,34 @@ class Trainer:
                 "global_masked_mean requires the same number of dataloader batches on every rank; "
                 f"received per-rank lengths {lengths}."
             )
+        return dataloader_length
 
     def save_checkpoint(self, update, consumed_updates=None, last=False):
         update, consumed_updates, last = self._normalize_checkpoint_args(update, consumed_updates, last)
         rng_states = self._capture_rng_states()
+        scaler_state = self._capture_scaler_state()
+        resume_state_signature = self._build_resume_state_signature()
         self.accelerator.wait_for_everyone()
         if self.is_main:
+            unwrapped_model = self.accelerator.unwrap_model(self.model)
+            duration_predictor = getattr(self, "duration_predictor", None)
+            duration_predictor_state = None if duration_predictor is None else duration_predictor.state_dict()
             checkpoint = dict(
-                model_state_dict=self.accelerator.unwrap_model(self.model).state_dict(),
+                model_state_dict=unwrapped_model.state_dict(),
                 optimizer_state_dict=self.optimizer.state_dict(),
                 ema_model_state_dict=self.ema_model.state_dict(),
+                duration_predictor_state_dict=duration_predictor_state,
                 scheduler_state_dict=self.scheduler.state_dict(),
                 update=update,
                 consumed_updates=consumed_updates,
                 rng_state=rng_states,
+                scaler_state=scaler_state,
+                resume_state_signature=resume_state_signature,
+                resume_signature=getattr(self, "_resume_signature", None),
             )
+            scheduler_signature = getattr(self, "_scheduler_signature", None)
+            if scheduler_signature is not None:
+                checkpoint["scheduler_signature"] = scheduler_signature
             if not os.path.exists(self.checkpoint_path):
                 os.makedirs(self.checkpoint_path)
             if last:
@@ -809,6 +1377,7 @@ class Trainer:
                 # If no training checkpoints, use pretrained model
                 latest_checkpoint = next(f for f in all_checkpoints if f.startswith("pretrained_"))
 
+        checkpoint: dict[str, Any] = {}
         if latest_checkpoint.endswith(".safetensors"):  # always a pretrained checkpoint
             from safetensors.torch import load_file
 
@@ -819,6 +1388,9 @@ class Trainer:
             if "weights_only" in inspect.signature(torch.load).parameters:
                 load_kwargs["weights_only"] = True
             checkpoint = torch.load(f"{self.checkpoint_path}/{latest_checkpoint}", **load_kwargs)
+
+        self._validate_scheduler_signature(checkpoint)
+        resume_rng_compatible, resume_scaler_compatible = self._validate_resume_signatures(checkpoint)
 
         # patch for backward compatibility, 305e3ea
         for key in ["ema_model.mel_spec.mel_stft.mel_scale.fb", "ema_model.mel_spec.mel_stft.spectrogram.window"]:
@@ -841,10 +1413,13 @@ class Trainer:
                 if key in checkpoint["model_state_dict"]:
                     del checkpoint["model_state_dict"][key]
 
-            self.accelerator.unwrap_model(self.model).load_state_dict(checkpoint["model_state_dict"])
+            unwrapped_model = self.accelerator.unwrap_model(self.model)
+            unwrapped_model.load_state_dict(checkpoint["model_state_dict"])
             self.optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
             if self.scheduler:
                 self.scheduler.load_state_dict(checkpoint["scheduler_state_dict"])
+            if resume_scaler_compatible:
+                self._restore_scaler_state(checkpoint.get("scaler_state"))
             update = checkpoint["update"]
             # Optimizer overflows consume an accumulation window without
             # completing an update. Older checkpoints predate that distinction
@@ -856,16 +1431,150 @@ class Trainer:
                 for k, v in checkpoint["ema_model_state_dict"].items()
                 if k not in ["initted", "update", "step"]
             }
-            self.accelerator.unwrap_model(self.model).load_state_dict(checkpoint["model_state_dict"])
+            unwrapped_model = self.accelerator.unwrap_model(self.model)
+            unwrapped_model.load_state_dict(checkpoint["model_state_dict"])
             update = 0
             consumed_updates = 0
 
-        self._restore_rng_states(checkpoint.get("rng_state"))
+        duration_predictor = getattr(self, "duration_predictor", None)
+        if duration_predictor is not None and checkpoint.get("duration_predictor_state_dict") is not None:
+            duration_predictor.load_state_dict(checkpoint["duration_predictor_state_dict"])
+
+        if resume_rng_compatible:
+            self._restore_rng_states(checkpoint.get("rng_state"))
         del checkpoint
         gc.collect()
         return (update, consumed_updates) if return_cursor else update
 
-    def train(self, train_dataset: Dataset, num_workers=16, resumable_with_seed: int = None):
+    def _validate_scheduler_signature(self, checkpoint):
+        """Reject exact resume when the saved LR horizon is absent or changed."""
+        if getattr(self, "resume_mode", "best_effort") != "exact":
+            return
+        if "update" not in checkpoint and "step" not in checkpoint:
+            return
+        expected = getattr(self, "_scheduler_signature", None)
+        saved = checkpoint.get("scheduler_signature")
+        if expected is None or saved != expected:
+            raise ValueError(
+                "exact resume requires a matching scheduler signature; "
+                "the prepared dataloader or schedule configuration changed"
+            )
+
+    def _reject_exact_compile_fallback(self):
+        if getattr(self, "resume_mode", "best_effort") == "exact" and getattr(self, "compile_fallback_active", False):
+            raise RuntimeError(
+                "resume_mode='exact' cannot continue after torch.compile fell back to eager; "
+                "the uninterrupted and resumed execution contracts would differ"
+            )
+
+    def _validate_resume_contract(self, train_dataset, num_workers: int, resumable_with_seed, resume_mode: str):
+        """Validate the promised fidelity of checkpoint resume before creating workers."""
+        self.resume_mode = resume_mode
+        self._reject_exact_compile_fallback()
+        if resume_mode not in {"best_effort", "exact"}:
+            raise ValueError("resume_mode must be either 'best_effort' or 'exact'")
+        if resume_mode == "best_effort":
+            return
+        if num_workers != 0:
+            raise ValueError("resume_mode='exact' currently requires num_workers=0")
+        if resumable_with_seed is None:
+            raise ValueError("resume_mode='exact' requires resumable_with_seed")
+        if getattr(self, "batch_size_type", None) != "sample":
+            raise ValueError("resume_mode='exact' currently supports batch_size_type='sample' only")
+        if not isinstance(train_dataset, Dataset):
+            raise ValueError("resume_mode='exact' requires a map-style torch Dataset")
+        if getattr(train_dataset, "supports_exact_resume", False) is not True:
+            raise ValueError(
+                "resume_mode='exact' requires train_dataset.supports_exact_resume=True; "
+                "arbitrary dataset and augmentation state cannot be inferred safely"
+            )
+        if _get_exact_resume_dataset_signature(train_dataset) is None:
+            raise ValueError(
+                "resume_mode='exact' requires train_dataset.exact_resume_signature or an immutable HF fingerprint"
+            )
+        self._validate_exact_component_signatures()
+        self._validate_exact_dataset_components(train_dataset)
+        accelerator = getattr(self, "accelerator", None)
+        device = getattr(accelerator, "device", torch.device("cpu"))
+        device_type = getattr(device, "type", str(device))
+        if device_type not in {"cpu", "cuda"}:
+            raise ValueError(
+                "resume_mode='exact' supports only CPU and CUDA RNG streams; "
+                f"backend {device_type!r} requires an explicit backend RNG contract"
+            )
+        distributed_type = getattr(accelerator, "distributed_type", DistributedType.NO)
+        distributed_type = getattr(distributed_type, "value", str(distributed_type))
+        if distributed_type not in {
+            DistributedType.NO.value,
+            DistributedType.MULTI_CPU.value,
+            DistributedType.MULTI_GPU.value,
+        }:
+            raise ValueError(
+                "resume_mode='exact' supports only unsharded single-process or CPU/CUDA DDP; "
+                f"distributed backend {distributed_type!r} requires a backend-aware checkpoint protocol"
+            )
+        if accelerator is None:
+            sync_with_dataloader = True
+        else:
+            _, sync_with_dataloader, _ = self._get_effective_gradient_accumulation_contract()
+        if not sync_with_dataloader:
+            raise ValueError(
+                "resume_mode='exact' requires gradient accumulation to synchronize at dataloader boundaries"
+            )
+        if getattr(self, "duration_predictor", None) is not None and getattr(accelerator, "num_processes", 1) > 1:
+            raise ValueError(
+                "resume_mode='exact' does not support a duration_predictor with multiple processes; "
+                "its per-process state is not globally checkpointed"
+            )
+
+    @staticmethod
+    def _compute_scheduler_horizon(
+        *,
+        prepared_batches: int,
+        grad_accumulation_steps: int,
+        epochs: int,
+        num_warmup_updates: int,
+        num_processes: int,
+        split_batches: bool,
+        step_scheduler_with_optimizer: bool = True,
+        sync_with_dataloader: bool = True,
+        adjust_scheduler: bool = False,
+    ) -> tuple[int, int, int]:
+        """Compute raw scheduler steps after Accelerate data-loader preparation."""
+        if prepared_batches <= 0:
+            raise ValueError("the prepared training dataloader must contain at least one batch")
+        if grad_accumulation_steps <= 0 or epochs <= 0 or num_processes <= 0:
+            raise ValueError("scheduler horizon arguments must be positive")
+        if num_warmup_updates < 0:
+            raise ValueError("num_warmup_updates must be non-negative")
+
+        del adjust_scheduler  # Wrapper call cadence does not change underlying scheduler horizon.
+        scheduler_step_factor = 1 if split_batches or not step_scheduler_with_optimizer else num_processes
+        if sync_with_dataloader:
+            updates_per_epoch = math.ceil(prepared_batches / grad_accumulation_steps)
+            total_updates = updates_per_epoch * epochs
+        else:
+            total_updates = (prepared_batches * epochs) // grad_accumulation_steps
+        if total_updates <= 0:
+            raise ValueError("the training horizon must contain at least one optimizer update")
+        total_raw_steps = total_updates * scheduler_step_factor
+        warmup_raw_steps = num_warmup_updates * scheduler_step_factor
+        if warmup_raw_steps >= total_raw_steps:
+            raise ValueError(
+                "num_warmup_updates must be smaller than the total prepared scheduler horizon "
+                f"({warmup_raw_steps} >= {total_raw_steps} raw steps)."
+            )
+        return total_raw_steps, warmup_raw_steps, scheduler_step_factor
+
+    def train(
+        self,
+        train_dataset: Dataset,
+        num_workers=16,
+        resumable_with_seed: int | None = None,
+        resume_mode: str = "best_effort",
+    ):
+        self.resume_mode = resume_mode
+        self._validate_resume_contract(train_dataset, num_workers, resumable_with_seed, resume_mode)
         if self.log_samples:
             from f5_tts.infer.utils_infer import cfg_strength, load_vocoder, nfe_step, sway_sampling_coef
 
@@ -879,51 +1588,116 @@ class Trainer:
         self._train_dataloader_generator = None
         persistent_workers = num_workers > 0
 
-        if self.batch_size_type == "sample":
-            sample_sampler = None
-            if exists(resumable_with_seed):
-                self._train_dataloader_generator = torch.Generator()
-                self._train_dataloader_generator.manual_seed(resumable_with_seed)
-                sample_sampler = _EpochRandomSampler(train_dataset, resumable_with_seed)
-            train_dataloader = DataLoader(
-                train_dataset,
-                collate_fn=collate_fn,
-                num_workers=num_workers,
-                pin_memory=True,
-                persistent_workers=persistent_workers,
-                batch_size=self.batch_size_per_gpu,
-                shuffle=sample_sampler is None,
-                sampler=sample_sampler,
-                generator=self._train_dataloader_generator,
-            )
-        elif self.batch_size_type == "frame":
-            self.accelerator.even_batches = False
-            sampler = SequentialSampler(train_dataset)
-            batch_sampler = DynamicBatchSampler(
-                sampler,
-                self.batch_size_per_gpu,
-                max_samples=self.max_samples,
-                random_seed=resumable_with_seed,  # This enables reproducible shuffling
-                drop_residual=False,
-            )
-            train_dataloader = DataLoader(
-                train_dataset,
-                collate_fn=collate_fn,
-                num_workers=num_workers,
-                pin_memory=True,
-                persistent_workers=persistent_workers,
-                batch_sampler=batch_sampler,
-            )
-        else:
-            raise ValueError(f"batch_size_type must be either 'sample' or 'frame', but received {self.batch_size_type}")
+        train_dataloader = None
+        dataloader_exception = None
+        try:
+            if self.batch_size_type == "sample":
+                sample_sampler = None
+                if exists(resumable_with_seed):
+                    resume_seed = cast(int, resumable_with_seed)
+                    self._train_dataloader_generator = torch.Generator()
+                    self._train_dataloader_generator.manual_seed(resume_seed)
+                    sample_sampler = _EpochRandomSampler(train_dataset, resume_seed)
+                train_dataloader = DataLoader(
+                    train_dataset,
+                    collate_fn=collate_fn,
+                    num_workers=num_workers,
+                    pin_memory=True,
+                    persistent_workers=persistent_workers,
+                    batch_size=self.batch_size_per_gpu,
+                    shuffle=sample_sampler is None,
+                    sampler=sample_sampler,
+                    generator=self._train_dataloader_generator,
+                )
+            elif self.batch_size_type == "frame":
+                self.accelerator.even_batches = False
+                sampler = SequentialSampler(train_dataset)
+                batch_sampler = DynamicBatchSampler(
+                    sampler,
+                    self.batch_size_per_gpu,
+                    max_samples=self.max_samples,
+                    random_seed=resumable_with_seed,  # This enables reproducible shuffling
+                    drop_residual=False,
+                )
+                train_dataloader = DataLoader(
+                    train_dataset,
+                    collate_fn=collate_fn,
+                    num_workers=num_workers,
+                    pin_memory=True,
+                    persistent_workers=persistent_workers,
+                    batch_sampler=batch_sampler,
+                )
+            else:
+                raise ValueError(
+                    f"batch_size_type must be either 'sample' or 'frame', but received {self.batch_size_type}"
+                )
+        except Exception as exc:
+            dataloader_exception = exc
+        self._raise_if_global_masked_mean_failure("dataloader construction", dataloader_exception)
+        if train_dataloader is None:  # pragma: no cover - helper raises on the failed rank
+            raise RuntimeError("global_masked_mean dataloader construction returned no loader")
 
-        #  accelerator.prepare() dispatches batches to devices;
-        #  which means the length of dataloader calculated before, should consider the number of devices
-        warmup_updates = (
-            self.num_warmup_updates * self.accelerator.num_processes
-        )  # consider a fixed warmup steps while using accelerate multi-gpu ddp
-        # otherwise by default with split_batches=False, warmup steps change with num_processes
-        total_updates = math.ceil(len(train_dataloader) / self.grad_accumulation_steps) * self.epochs
+        # Prepare the dataloader before sizing the scheduler. Accelerate changes
+        # both its length and the number of raw scheduler steps per optimizer update.
+        if self.global_masked_mean:
+            # Buffer accumulation windows on the host. A normally prepared
+            # dataloader places each yielded batch on the accelerator, which
+            # would retain G large mel batches and undermine accumulation's
+            # memory bound. The window iterator transfers one batch at a time.
+            train_dataloader = self._prepare_global_masked_mean_dataloader(train_dataloader)
+            prepared_batches = self._prepared_global_masked_mean_batches
+        else:
+            train_dataloader = self.accelerator.prepare_data_loader(train_dataloader, device_placement=True)
+            prepared_batches = len(train_dataloader)
+
+        effective_grad_accumulation_steps, sync_with_dataloader, adjust_scheduler = (
+            self._get_effective_gradient_accumulation_contract()
+        )
+        self.grad_accumulation_steps = effective_grad_accumulation_steps
+        if self.global_masked_mean and not sync_with_dataloader:
+            raise ValueError(
+                "global_masked_mean requires gradient accumulation to synchronize at dataloader boundaries"
+            )
+
+        split_batches = bool(getattr(self.accelerator, "split_batches", False))
+        step_scheduler_with_optimizer = bool(getattr(self.accelerator, "step_scheduler_with_optimizer", True))
+        total_updates, warmup_updates, scheduler_step_factor = self._compute_scheduler_horizon(
+            prepared_batches=prepared_batches,
+            grad_accumulation_steps=self.grad_accumulation_steps,
+            epochs=self.epochs,
+            num_warmup_updates=self.num_warmup_updates,
+            num_processes=self.accelerator.num_processes,
+            split_batches=split_batches,
+            step_scheduler_with_optimizer=step_scheduler_with_optimizer,
+            sync_with_dataloader=sync_with_dataloader,
+            adjust_scheduler=adjust_scheduler,
+        )
+        self._scheduler_signature = {
+            "version": 2,
+            "prepared_batches": prepared_batches,
+            "grad_accumulation_steps": self.grad_accumulation_steps,
+            "epochs": self.epochs,
+            "num_warmup_updates": self.num_warmup_updates,
+            "num_processes": self.accelerator.num_processes,
+            "split_batches": split_batches,
+            "step_scheduler_with_optimizer": step_scheduler_with_optimizer,
+            "sync_with_dataloader": sync_with_dataloader,
+            "adjust_scheduler": adjust_scheduler,
+            "scheduler_step_factor": scheduler_step_factor,
+            "total_raw_steps": total_updates,
+            "warmup_raw_steps": warmup_updates,
+        }
+        self._resume_state_signature = self._build_resume_state_signature()
+        self._resume_signature = self._build_resume_signature(
+            train_dataset=train_dataset,
+            num_workers=num_workers,
+            resumable_with_seed=resumable_with_seed,
+            prepared_batches=prepared_batches,
+            split_batches=split_batches,
+            step_scheduler_with_optimizer=step_scheduler_with_optimizer,
+            sync_with_dataloader=sync_with_dataloader,
+            adjust_scheduler=adjust_scheduler,
+        )
         decay_updates = total_updates - warmup_updates
         decay_scheduler = LinearLR(self.optimizer, start_factor=1.0, end_factor=1e-8, total_iters=decay_updates)
         if warmup_updates > 0:
@@ -935,27 +1709,23 @@ class Trainer:
             # Torch 2.5 leaves the optimizer at the warmup start factor when a
             # zero-length scheduler is included in SequentialLR.
             self.scheduler = decay_scheduler
-        if self.global_masked_mean:
-            # Buffer accumulation windows on the host. A normally prepared
-            # dataloader places each yielded batch on the accelerator, which
-            # would retain G large mel batches and undermine accumulation's
-            # memory bound. The window iterator transfers one batch at a time.
-            train_dataloader = self._prepare_global_masked_mean_dataloader(train_dataloader)
-            self.scheduler = self.accelerator.prepare(self.scheduler)
-        else:
-            train_dataloader, self.scheduler = self.accelerator.prepare(
-                train_dataloader, self.scheduler
-            )  # actual multi_gpu updates = single_gpu updates / gpu nums
+        self.scheduler = self.accelerator.prepare(self.scheduler)
         start_update, start_consumed_updates = self.load_checkpoint(return_cursor=True)
         global_update = start_update
         consumed_updates = start_consumed_updates
 
+        skipped_batch = 0
+        skipped_dataloader = train_dataloader
+        orig_epoch_step = len(train_dataloader)
         if exists(resumable_with_seed):
-            orig_epoch_step = len(train_dataloader)
-            updates_per_epoch = math.ceil(orig_epoch_step / self.grad_accumulation_steps)
-            skipped_epoch = int(start_consumed_updates // updates_per_epoch)
-            updates_into_epoch = start_consumed_updates % updates_per_epoch
-            skipped_batch = min(updates_into_epoch * self.grad_accumulation_steps, orig_epoch_step)
+            if sync_with_dataloader:
+                updates_per_epoch = math.ceil(orig_epoch_step / self.grad_accumulation_steps)
+                skipped_epoch = int(start_consumed_updates // updates_per_epoch)
+                updates_into_epoch = start_consumed_updates % updates_per_epoch
+                skipped_batch = min(updates_into_epoch * self.grad_accumulation_steps, orig_epoch_step)
+            else:
+                consumed_batches = start_consumed_updates * self.grad_accumulation_steps
+                skipped_epoch, skipped_batch = divmod(consumed_batches, orig_epoch_step)
             skipped_dataloader = self.accelerator.skip_first_batches(train_dataloader, num_batches=skipped_batch)
         else:
             skipped_epoch = 0
@@ -963,7 +1733,12 @@ class Trainer:
         for epoch in range(skipped_epoch, self.epochs):
             self.model.train()
             if exists(resumable_with_seed) and epoch == skipped_epoch:
-                progress_bar_initial = math.ceil(skipped_batch / self.grad_accumulation_steps)
+                if sync_with_dataloader:
+                    progress_bar_initial = math.ceil(skipped_batch / self.grad_accumulation_steps)
+                else:
+                    progress_bar_initial = (
+                        epoch * len(train_dataloader) + skipped_batch
+                    ) // self.grad_accumulation_steps - (epoch * len(train_dataloader)) // self.grad_accumulation_steps
                 current_dataloader = skipped_dataloader
             else:
                 progress_bar_initial = 0
@@ -971,8 +1746,15 @@ class Trainer:
 
             self._set_dataloader_epoch(current_dataloader, epoch)
 
+            if sync_with_dataloader:
+                epoch_update_count = math.ceil(len(train_dataloader) / self.grad_accumulation_steps)
+            else:
+                epoch_start = epoch * len(train_dataloader)
+                epoch_update_count = (
+                    epoch_start + len(train_dataloader)
+                ) // self.grad_accumulation_steps - epoch_start // self.grad_accumulation_steps
             progress_bar = tqdm(
-                range(math.ceil(len(train_dataloader) / self.grad_accumulation_steps)),
+                range(epoch_update_count),
                 desc=f"Epoch {epoch + 1}/{self.epochs}",
                 unit="update",
                 disable=not self.accelerator.is_local_main_process,
@@ -987,38 +1769,65 @@ class Trainer:
             loss_sum_accum = None
             for batch, rand_span_mask, loss_scale, global_loss_denom, is_boundary in training_batches:
                 if self.global_masked_mean:
-                    batch = send_to_device(batch, self.accelerator.device, non_blocking=True)
+                    device_exception = None
+                    device_batch = None
+                    try:
+                        device_batch = send_to_device(batch, self.accelerator.device, non_blocking=True)
+                    except Exception as exc:
+                        device_exception = exc
+                    self._raise_if_global_masked_mean_failure("batch device transfer", device_exception)
+                    if device_batch is None:  # pragma: no cover - helper raises on every failed rank
+                        raise RuntimeError("global_masked_mean device transfer returned no batch")
+                    batch = device_batch
                 with self._accumulation_context(is_boundary):
                     text_inputs = batch["text"]
                     mel_spec = batch["mel"].permute(0, 2, 1)
                     mel_lengths = batch["mel_lengths"]
 
-                    # TODO. add duration predictor training
+                    duration_exception = None
                     if self.duration_predictor is not None and self.accelerator.is_local_main_process:
-                        dur_loss = self.duration_predictor(mel_spec, lens=batch.get("durations"))
-                        self.accelerator.log({"duration loss": dur_loss.item()}, step=global_update)
+                        try:
+                            dur_loss = self.duration_predictor(mel_spec, lens=batch.get("durations"))
+                            self.accelerator.log({"duration loss": dur_loss.item()}, step=global_update)
+                        except Exception as exc:
+                            duration_exception = exc
+                    if self.global_masked_mean and self.duration_predictor is not None:
+                        self._raise_if_global_masked_mean_failure("duration predictor", duration_exception)
+                    elif duration_exception is not None:
+                        raise duration_exception
 
                     if self.global_masked_mean:
                         assert rand_span_mask is not None
                         assert loss_scale is not None
-                        loss, loss_sum, loss_denom, cond, pred = self.model(
-                            mel_spec,
-                            text=text_inputs,
-                            lens=mel_lengths,
-                            noise_scheduler=self.noise_scheduler,
-                            rand_span_mask=rand_span_mask,
-                            return_loss_components=True,
-                        )
+                        forward_exception = None
+                        forward_result = None
+                        try:
+                            forward_result = self.model(
+                                mel_spec,
+                                text=text_inputs,
+                                lens=mel_lengths,
+                                noise_scheduler=self.noise_scheduler,
+                                rand_span_mask=rand_span_mask,
+                                return_loss_components=True,
+                            )
+                        except Exception as exc:
+                            forward_exception = exc
+                        self._raise_if_global_masked_mean_failure("forward", forward_exception)
+                        if forward_result is None:  # pragma: no cover - helper raises on every failed rank
+                            raise RuntimeError("global_masked_mean forward returned no result")
+                        loss, loss_sum, loss_denom, cond, pred = forward_result
                         loss_sum_accum = (
                             loss_sum.detach() if loss_sum_accum is None else loss_sum_accum + loss_sum.detach()
                         )
                         self._check_compile_runtime_fallback()
+                        self._reject_exact_compile_fallback()
                         self.accelerator.backward(loss_sum * loss_scale)
                     else:
                         loss, cond, pred = self.model(
                             mel_spec, text=text_inputs, lens=mel_lengths, noise_scheduler=self.noise_scheduler
                         )
                         self._check_compile_runtime_fallback()
+                        self._reject_exact_compile_fallback()
                         self.accelerator.backward(loss)
 
                     deepspeed_clips_in_backward = (
@@ -1029,8 +1838,10 @@ class Trainer:
 
                     self.optimizer.step()
                     optimizer_step_was_skipped = bool(getattr(self.accelerator, "optimizer_step_was_skipped", False))
-                    if not optimizer_step_was_skipped:
-                        self.scheduler.step()
+                    if self.accelerator.sync_gradients or adjust_scheduler:
+                        accelerated_scheduler = hasattr(self.scheduler, "gradient_state")
+                        if accelerated_scheduler or not optimizer_step_was_skipped:
+                            self.scheduler.step()
                     self.optimizer.zero_grad()
 
                 if self.global_masked_mean and self.accelerator.sync_gradients:
@@ -1099,7 +1910,11 @@ class Trainer:
                         was_training = sample_model.training
                         sample_model.eval()
                         try:
-                            with torch.inference_mode(), self.accelerator.autocast():
+                            with (
+                                self._preserve_inference_rng_state(),
+                                torch.inference_mode(),
+                                self.accelerator.autocast(),
+                            ):
                                 generated, _ = sample_model.sample(
                                     cond=mel_spec[0][:ref_audio_len].unsqueeze(0),
                                     text=infer_text,

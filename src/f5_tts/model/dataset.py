@@ -14,6 +14,24 @@ from f5_tts.model.modules import MelSpec
 from f5_tts.model.utils import default
 
 
+def _is_exact_resume_safe_dataset(dataset) -> bool:
+    """Accept only explicit or stateless map-style datasets for exact resume."""
+    if getattr(dataset, "supports_exact_resume", False) is True:
+        return True
+    return isinstance(dataset, Dataset_) and getattr(dataset, "_format_type", None) != "custom"
+
+
+def _get_exact_resume_dataset_signature(dataset) -> str | None:
+    """Return an explicit or immutable source signature for exact resume."""
+    signature = getattr(dataset, "exact_resume_signature", None)
+    if signature is not None:
+        return str(signature)
+    fingerprint = getattr(dataset, "_fingerprint", None)
+    if fingerprint is not None:
+        return f"hf:{fingerprint}"
+    return None
+
+
 class HFDataset(Dataset):
     def __init__(
         self,
@@ -24,10 +42,23 @@ class HFDataset(Dataset):
         n_fft=1024,
         win_length=1024,
         mel_spec_type="vocos",
+        exact_resume_content_signature: str | None = None,
     ):
         self.data = hf_dataset
+        self.supports_exact_resume = _is_exact_resume_safe_dataset(hf_dataset)
+        self.exact_resume_signature = _get_exact_resume_dataset_signature(hf_dataset)
+        self.exact_resume_content_signature = (
+            exact_resume_content_signature
+            if exact_resume_content_signature is not None
+            else getattr(hf_dataset, "exact_resume_content_signature", None)
+        )
         self.target_sample_rate = target_sample_rate
+        self.n_mel_channels = n_mel_channels
         self.hop_length = hop_length
+        self.n_fft = n_fft
+        self.win_length = win_length
+        self.mel_spec_type = mel_spec_type
+        self.preprocessed_mel = False
 
         self.mel_spectrogram = MelSpec(
             n_fft=n_fft,
@@ -92,15 +123,31 @@ class CustomDataset(Dataset):
         mel_spec_type="vocos",
         preprocessed_mel=False,
         mel_spec_module: nn.Module | None = None,
+        exact_resume_content_signature: str | None = None,
     ):
         self.data = custom_dataset
+        self.exact_resume_signature = _get_exact_resume_dataset_signature(custom_dataset)
+        self.exact_resume_content_signature = (
+            exact_resume_content_signature
+            if exact_resume_content_signature is not None
+            else getattr(custom_dataset, "exact_resume_content_signature", None)
+        )
         self.durations = durations
         self.target_sample_rate = target_sample_rate
         self.hop_length = hop_length
+        self.n_mel_channels = n_mel_channels
         self.n_fft = n_fft
         self.win_length = win_length
         self.mel_spec_type = mel_spec_type
         self.preprocessed_mel = preprocessed_mel
+        self.exact_resume_preprocessing_signature = getattr(mel_spec_module, "exact_resume_signature", None)
+        mel_spec_is_stateless = (
+            preprocessed_mel
+            or mel_spec_module is None
+            or isinstance(mel_spec_module, MelSpec)
+            or getattr(mel_spec_module, "supports_exact_resume", False) is True
+        )
+        self.supports_exact_resume = _is_exact_resume_safe_dataset(custom_dataset) and mel_spec_is_stateless
 
         if not preprocessed_mel:
             self.mel_spectrogram = default(
@@ -251,6 +298,7 @@ def load_dataset(
     audio_type: str = "raw",
     mel_spec_module: nn.Module | None = None,
     mel_spec_kwargs: dict = dict(),
+    exact_resume_content_signature: str | None = None,
 ) -> CustomDataset | HFDataset:
     """
     dataset_type    - "CustomDataset" if you want to use tokenizer name and default data path to load for train_dataset
@@ -278,10 +326,12 @@ def load_dataset(
             durations=durations,
             preprocessed_mel=preprocessed_mel,
             mel_spec_module=mel_spec_module,
+            exact_resume_content_signature=exact_resume_content_signature,
             **mel_spec_kwargs,
         )
 
     elif dataset_type == "CustomDatasetPath":
+        preprocessed_mel = False
         try:
             train_dataset = load_from_disk(f"{dataset_name}/raw")
         except:  # noqa: E722
@@ -291,7 +341,11 @@ def load_dataset(
             data_dict = json.load(f)
         durations = data_dict["duration"]
         train_dataset = CustomDataset(
-            train_dataset, durations=durations, preprocessed_mel=preprocessed_mel, **mel_spec_kwargs
+            train_dataset,
+            durations=durations,
+            preprocessed_mel=preprocessed_mel,
+            exact_resume_content_signature=exact_resume_content_signature,
+            **mel_spec_kwargs,
         )
 
     elif dataset_type == "HFDataset":
@@ -302,6 +356,7 @@ def load_dataset(
         pre, post = dataset_name.split("_")
         train_dataset = HFDataset(
             load_dataset(f"{pre}/{pre}", split=f"train.{post}", cache_dir=str(files("f5_tts").joinpath("../../data"))),
+            exact_resume_content_signature=exact_resume_content_signature,
         )
 
     return train_dataset
