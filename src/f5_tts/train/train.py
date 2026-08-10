@@ -83,11 +83,18 @@ def main(model_cfg):
         global_masked_mean=model_cfg.optim.get("global_masked_mean", False),
     )
 
-    train_dataset = load_dataset(model_cfg.datasets.name, tokenizer, mel_spec_kwargs=model_cfg.model.mel_spec)
+    exact_resume_content_signature = model_cfg.datasets.get("exact_resume_content_signature", None)
+    train_dataset = load_dataset(
+        model_cfg.datasets.name,
+        tokenizer,
+        mel_spec_kwargs=model_cfg.model.mel_spec,
+        exact_resume_content_signature=exact_resume_content_signature,
+    )
     trainer.train(
         train_dataset,
         num_workers=model_cfg.datasets.num_workers,
         resumable_with_seed=666,  # seed for shuffling dataset
+        resume_mode=model_cfg.ckpts.get("resume_mode", "best_effort"),
     )
 
 

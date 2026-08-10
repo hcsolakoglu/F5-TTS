@@ -95,14 +95,75 @@ export WANDB_MODE=offline
 ## Global masked-mean training
 
 `global_masked_mean=True` computes one masked-frame mean across each distributed
-accumulation window. Accelerate duplicate-padding is disabled for this mode. A
-multi-process dataloader whose batch count is not divisible by process count is
-rejected before preparation instead of replaying real samples or silently
-dropping a tail group. Choose a batch size or explicit dataset policy that
-produces equal per-rank batch counts.
+accumulation window. Accelerate duplicate-padding is disabled for this mode, and
+`split_batches=True` is rejected because equal dataloader lengths do not guarantee
+an equal number of incomplete-tail iterations. A multi-process dataloader whose
+batch count is not divisible by process count is also rejected before preparation
+instead of replaying real samples or silently dropping a tail group. Choose a batch
+size or explicit dataset policy that produces equal per-rank batch counts.
 
-Checkpoint resume restores the update cursor, epoch-addressable sample order, and
-per-process Python, CPU Torch, CUDA, and DataLoader worker-generator state when
-the process count matches the checkpoint. Resuming with a different process count
-fails explicitly because sampler and RNG trajectories cannot be reconstructed
-safely.
+For this mode, dataloader construction and preparation, batch fetching, batch
+validation, batch device transfer, training-mask preparation, duration prediction,
+and the model forward phase coordinate rank-local exceptions before any rank enters
+backward. A worker failure or malformed batch therefore fails all ranks with a
+launcher-visible error instead of leaving healthy ranks waiting in a collective.
+Failures inside backward or a dead process remain launcher-fatal by design; they
+cannot be made safely recoverable with a later in-loop status collective.
+
+Scheduler horizons are computed after Accelerate prepares the dataloader and read
+`gradient_state.num_steps`, `sync_with_dataloader`, and `adjust_scheduler` rather
+than trusting only Trainer's requested GAS. The raw scheduler horizon accounts for
+Accelerate's process step multiplier, including `split_batches` and
+`step_scheduler_with_optimizer`. With `sync_with_dataloader=False`, best-effort
+resume uses a global raw-batch cursor and floor horizon; `global_masked_mean` rejects
+that mode because its host accumulation window cannot cross an epoch boundary, and
+exact resume rejects it because pending gradient state is not checkpointed.
+When Accelerate reports `adjust_scheduler=True`, the wrapped scheduler is called on
+every accumulation microbatch. Non-boundary calls update Accelerate's wrapper
+bookkeeping but do not advance the underlying scheduler, whose horizon remains the
+number of successful optimizer boundaries. Exact resume stores this horizon
+signature and rejects a changed prepared loader or schedule configuration.
+
+Checkpoint resume defaults to `resume_mode="best_effort"`: it restores the update
+cursor and compatible process-local state when the persisted resume signature
+matches. Legacy checkpoints without the new signatures may restore their legacy
+RNG payload in best-effort mode after the existing topology-count check, but they
+cannot claim exact resume. If the dataset, loader contract, execution topology,
+precision, or AMP scaler state is incompatible, it skips incompatible scaler/RNG
+restoration and emits a warning. `resume_mode="exact"` additionally requires the
+checkpoint to contain matching model, optimizer, scheduler, RNG, AMP scaler, and
+resume signatures. The resume signature includes an immutable HF dataset fingerprint or
+an explicit `exact_resume_signature`, dataset preprocessing/mel configuration,
+sampler/batch configuration, effective accumulation plugin settings, optimizer and
+compile configuration, prepared loader flags, loss mode, and execution topology.
+
+The supported exact subset is deliberately narrow: an unsharded single process,
+pure CPU/Gloo DDP, or CUDA DDP resumed with the same rank-to-device topology; a
+map-style dataset that explicitly sets
+`supports_exact_resume=True` and provides an immutable HF fingerprint or
+`exact_resume_signature`, `num_workers=0`, `batch_size_type="sample"`, and a
+`resumable_with_seed`, with accumulation synchronized at dataloader boundaries.
+FSDP, DeepSpeed, Megatron-LM, multi-worker loading, frame batching, and non-CPU/CUDA
+RNG backends are rejected at `train()` entry before dataloader or checkpoint work.
+Built-in wrappers expose the dataset marker only for stateless map-style HF
+datasets; arbitrary wrappers and custom mel modules must opt in explicitly.
+
+HF datasets with raw external audio also require an explicit content signature. The
+production loader accepts it through `datasets.exact_resume_content_signature`, for
+example `++datasets.exact_resume_content_signature=raw-audio-manifest-v1`; the value
+must identify an immutable manifest or equivalent content hash. Custom mel modules
+require an explicit preprocessing signature.
+
+Custom models and duration predictors must set `supports_exact_resume=True` and
+provide an `exact_resume_signature`. This opt-in certifies that every mutable value
+which can affect training is registered in `state_dict()`; non-parameter state uses
+PyTorch's paired `get_extra_state()` / `set_extra_state()` protocol. Trainer does not
+guess by serializing arbitrary Python attributes. The production CFM path uses its
+resolved model config as the behavior signature, and EMA signatures include resolved
+library defaults plus user overrides. A duration predictor is supported only in a
+single process because its per-process state is not globally checkpointed.
+
+A repeatable two-rank Gloo coordination probe is available at
+`tests/probes/coordinated_train_failure_probe.py` and requires exactly two ranks. It
+asserts phase-specific peer propagation for DataLoader construction, preparation,
+device transfer, and forward failures.
