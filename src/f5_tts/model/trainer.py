@@ -925,11 +925,16 @@ class Trainer:
         # otherwise by default with split_batches=False, warmup steps change with num_processes
         total_updates = math.ceil(len(train_dataloader) / self.grad_accumulation_steps) * self.epochs
         decay_updates = total_updates - warmup_updates
-        warmup_scheduler = LinearLR(self.optimizer, start_factor=1e-8, end_factor=1.0, total_iters=warmup_updates)
         decay_scheduler = LinearLR(self.optimizer, start_factor=1.0, end_factor=1e-8, total_iters=decay_updates)
-        self.scheduler = SequentialLR(
-            self.optimizer, schedulers=[warmup_scheduler, decay_scheduler], milestones=[warmup_updates]
-        )
+        if warmup_updates > 0:
+            warmup_scheduler = LinearLR(self.optimizer, start_factor=1e-8, end_factor=1.0, total_iters=warmup_updates)
+            self.scheduler = SequentialLR(
+                self.optimizer, schedulers=[warmup_scheduler, decay_scheduler], milestones=[warmup_updates]
+            )
+        else:
+            # Torch 2.5 leaves the optimizer at the warmup start factor when a
+            # zero-length scheduler is included in SequentialLR.
+            self.scheduler = decay_scheduler
         if self.global_masked_mean:
             # Buffer accumulation windows on the host. A normally prepared
             # dataloader places each yielded batch on the accelerator, which
