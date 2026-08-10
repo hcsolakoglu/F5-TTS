@@ -135,17 +135,37 @@ class Trainer:
 
         self.duration_predictor = duration_predictor
 
+        self._uses_torch_adamw = not bnb_optimizer
         if bnb_optimizer:
             import bitsandbytes as bnb
 
             self.optimizer = bnb.optim.AdamW8bit(model.parameters(), lr=learning_rate)
+        elif self.accelerator.device.type != "cuda":
+            self.optimizer = AdamW(model.parameters(), lr=learning_rate)
         else:
-            self.optimizer = AdamW(model.parameters(), lr=learning_rate, fused=True)
+            try:
+                self.optimizer = AdamW(model.parameters(), lr=learning_rate, fused=True)
+            except RuntimeError as exc:
+                if not str(exc).startswith("`fused=True` requires all the params to be"):
+                    raise
+                if self.is_main:
+                    print(f"Fused AdamW is unavailable; using PyTorch's default implementation. Error: {exc}")
+                self.optimizer = AdamW(model.parameters(), lr=learning_rate)
         self.model, self.optimizer = self.accelerator.prepare(self.model, self.optimizer)
 
     @property
     def is_main(self):
         return self.accelerator.is_main_process
+
+    def _normalize_adamw_fused_policy(self, optimizer_state_dict):
+        if not self._uses_torch_adamw:
+            return
+
+        # `fused` is device-specific execution policy, not portable optimizer state.
+        for saved_group, current_group in zip(
+            optimizer_state_dict["param_groups"], self.optimizer.param_groups, strict=True
+        ):
+            saved_group["fused"] = current_group.get("fused")
 
     def save_checkpoint(self, update, last=False):
         self.accelerator.wait_for_everyone()
@@ -212,6 +232,7 @@ class Trainer:
                 # If no training checkpoints, use pretrained model
                 latest_checkpoint = next(f for f in all_checkpoints if f.startswith("pretrained_"))
 
+        checkpoint: dict = {}
         if latest_checkpoint.endswith(".safetensors"):  # always a pretrained checkpoint
             from safetensors.torch import load_file
 
@@ -222,7 +243,6 @@ class Trainer:
             checkpoint = torch.load(
                 f"{self.checkpoint_path}/{latest_checkpoint}", weights_only=True, map_location="cpu"
             )
-
         # patch for backward compatibility, 305e3ea
         for key in ["ema_model.mel_spec.mel_stft.mel_scale.fb", "ema_model.mel_spec.mel_stft.spectrogram.window"]:
             if key in checkpoint["ema_model_state_dict"]:
@@ -245,7 +265,9 @@ class Trainer:
                     del checkpoint["model_state_dict"][key]
 
             self.accelerator.unwrap_model(self.model).load_state_dict(checkpoint["model_state_dict"])
-            self.optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
+            optimizer_state_dict = checkpoint["optimizer_state_dict"]
+            self._normalize_adamw_fused_policy(optimizer_state_dict)
+            self.optimizer.load_state_dict(optimizer_state_dict)
             if self.scheduler:
                 self.scheduler.load_state_dict(checkpoint["scheduler_state_dict"])
             update = checkpoint["update"]
