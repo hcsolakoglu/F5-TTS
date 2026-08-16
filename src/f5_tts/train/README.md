@@ -64,7 +64,17 @@ If use tensorboard as logger, install it first with `pip install tensorboard`.
 
 <ins>The `use_ema = True` might be harmful for early-stage finetuned checkpoints</ins> (which goes just few updates, thus ema weights still dominated by pretrained ones), try turn it off with finetune gradio option or `load_model(..., use_ema=False)`, see if offer better results.
 
-### 3. W&B Logging
+### 3. Global masked-loss normalization
+
+Set `optim.global_masked_mean=true` when masked frames should contribute equally across every microbatch and DDP rank in an accumulation window:
+
+```bash
+accelerate launch src/f5_tts/train/train.py --config-name F5TTS_v1_Base.yaml ++optim.global_masked_mean=true
+```
+
+This mode is opt-in and currently supports single-process and vanilla CPU/GPU DDP training. It keeps each accumulation window on the host while one mel microbatch at a time is transferred to the device. Accelerate duplicate padding is disabled; every rank must receive the same nonduplicated number of batches or training fails before the first backward pass. DeepSpeed, FSDP, Megatron-LM, split/dispatch batches, and empty windows also fail explicitly.
+
+### 4. W&B Logging
 
 The `wandb/` dir will be created under path you run training/finetuning scripts.
 

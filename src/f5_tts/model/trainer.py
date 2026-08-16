@@ -3,12 +3,14 @@ from __future__ import annotations
 import gc
 import math
 import os
+from contextlib import contextmanager, nullcontext
+from typing import cast
 
 import torch
 import torchaudio
 import wandb
 from accelerate import Accelerator
-from accelerate.utils import DistributedDataParallelKwargs
+from accelerate.utils import DataLoaderConfiguration, DistributedDataParallelKwargs, DistributedType, send_to_device
 from ema_pytorch import EMA
 from torch.optim import AdamW
 from torch.optim.lr_scheduler import LinearLR, SequentialLR
@@ -53,6 +55,7 @@ class Trainer:
         is_local_vocoder: bool = False,  # use local path vocoder
         local_vocoder_path: str = "",  # local vocoder path
         model_cfg_dict: dict = dict(),  # training config
+        global_masked_mean: bool = False,
     ):
         ddp_kwargs = DistributedDataParallelKwargs(find_unused_parameters=True)
 
@@ -60,12 +63,28 @@ class Trainer:
             logger = None
         self.log_samples = log_samples
 
+        accelerate_kwargs = dict(accelerate_kwargs)
+        if global_masked_mean:
+            dataloader_config = accelerate_kwargs.get("dataloader_config")
+            if dataloader_config is not None:
+                if dataloader_config.even_batches:
+                    raise ValueError("global_masked_mean requires dataloader_config.even_batches=False")
+            elif "even_batches" in accelerate_kwargs:
+                if accelerate_kwargs["even_batches"] is not False:
+                    raise ValueError("global_masked_mean requires even_batches=False")
+            else:
+                accelerate_kwargs["dataloader_config"] = DataLoaderConfiguration(even_batches=False)
+
         self.accelerator = Accelerator(
             log_with=logger if logger == "wandb" else None,
             kwargs_handlers=[ddp_kwargs],
             gradient_accumulation_steps=grad_accumulation_steps,
             **accelerate_kwargs,
         )
+        self.global_masked_mean = global_masked_mean
+        if self.global_masked_mean and grad_accumulation_steps < 1:
+            raise ValueError("global_masked_mean requires grad_accumulation_steps >= 1")
+        self._validate_global_masked_mean_backend()
 
         self.logger = logger
         if self.logger == "wandb":
@@ -86,6 +105,7 @@ class Trainer:
                     "max_grad_norm": max_grad_norm,
                     "noise_scheduler": noise_scheduler,
                     "bnb_optimizer": bnb_optimizer,
+                    "global_masked_mean": global_masked_mean,
                 }
             model_cfg_dict["gpus"] = self.accelerator.num_processes
             self.accelerator.init_trackers(
@@ -142,12 +162,154 @@ class Trainer:
         else:
             self.optimizer = AdamW(model.parameters(), lr=learning_rate, fused=True)
         self.model, self.optimizer = self.accelerator.prepare(self.model, self.optimizer)
+        self._unwrapped_model = self.accelerator.unwrap_model(self.model)
 
     @property
     def is_main(self):
         return self.accelerator.is_main_process
 
-    def save_checkpoint(self, update, last=False):
+    def _validate_global_masked_mean_backend(self):
+        if not self.global_masked_mean:
+            return
+
+        supported = {DistributedType.NO, DistributedType.MULTI_CPU, DistributedType.MULTI_GPU}
+        if self.accelerator.distributed_type not in supported:
+            raise NotImplementedError(
+                "global_masked_mean currently supports single-process and vanilla DDP training only; "
+                f"received {self.accelerator.distributed_type.value}."
+            )
+        if self.accelerator.even_batches:
+            raise ValueError("global_masked_mean requires Accelerate even_batches=False to prevent duplicates.")
+        if self.accelerator.split_batches:
+            raise NotImplementedError("global_masked_mean does not support split_batches=True.")
+        if self.accelerator.dispatch_batches:
+            raise NotImplementedError("global_masked_mean does not support dispatch_batches=True.")
+
+    def _reduce_global_masked_value(self, local_value: torch.Tensor) -> torch.Tensor:
+        local_value = local_value.detach().to(device=self.accelerator.device)
+        return cast(torch.Tensor, self.accelerator.reduce(local_value, reduction="sum"))
+
+    def _iter_global_masked_mean_batches(self, dataloader):
+        """Yield accumulation windows normalized before any backward pass."""
+        dataloader_iter = iter(dataloader)
+        sample_mask = self._unwrapped_model.sample_training_mask
+
+        while True:
+            batches = []
+            for _ in range(self.grad_accumulation_steps):
+                try:
+                    batches.append(next(dataloader_iter))
+                except StopIteration:
+                    break
+            if not batches:
+                return
+
+            window = []
+            local_loss_count = torch.zeros((), device=self.accelerator.device, dtype=torch.int64)
+            local_error = None
+            for batch in batches:
+                batch_error = self._validate_global_masked_batch(batch)
+                rand_span_mask = None
+                if batch_error is None:
+                    try:
+                        mel = batch["mel"]
+                        rand_span_mask = sample_mask(batch["mel_lengths"], mel.shape[-1])
+                        local_loss_count += rand_span_mask.sum(dtype=torch.int64) * mel.shape[1]
+                    except Exception as exc:
+                        batch_error = f"training-mask preparation failed: {exc}"
+                if batch_error is not None and local_error is None:
+                    local_error = batch_error
+                window.append((batch, rand_span_mask))
+
+            local_stats = torch.stack(
+                (
+                    local_loss_count,
+                    torch.tensor(int(local_error is not None), device=self.accelerator.device, dtype=torch.int64),
+                )
+            )
+            global_stats = self._reduce_global_masked_value(local_stats)
+            global_loss_count_value, global_error_count = global_stats.cpu().tolist()
+            if global_error_count:
+                detail = local_error or "another rank reported malformed training input"
+                raise ValueError(f"global_masked_mean rejected an accumulation window: {detail}")
+            if global_loss_count_value == 0:
+                raise RuntimeError(
+                    "global_masked_mean produced an empty accumulation window; "
+                    "no optimizer update can be defined without masked elements."
+                )
+
+            global_loss_count = global_stats[0]
+            loss_scale = global_loss_count.to(dtype=torch.float32).reciprocal()
+            loss_scale *= self.grad_accumulation_steps * self.accelerator.num_processes
+            for index, (batch, rand_span_mask) in enumerate(window):
+                assert rand_span_mask is not None
+                yield batch, rand_span_mask, loss_scale, global_loss_count, index == len(window) - 1
+
+    def _validate_global_masked_batch(self, batch) -> str | None:
+        """Return rank-local input errors without raising before the count collective."""
+        if not isinstance(batch, dict):
+            return f"expected a batch dictionary, received {type(batch).__name__}"
+        if "mel" not in batch or "mel_lengths" not in batch or "text" not in batch:
+            return "batch must contain mel, mel_lengths, and text"
+
+        mel = batch["mel"]
+        mel_lengths = batch["mel_lengths"]
+        if not isinstance(mel, torch.Tensor) or mel.ndim != 3 or not mel.is_floating_point():
+            return "mel must be a floating-point rank-3 tensor shaped [batch, channels, frames]"
+        if mel.shape[0] == 0:
+            return "mel batch must not be empty"
+        if not isinstance(mel_lengths, torch.Tensor) or mel_lengths.ndim != 1:
+            return "mel_lengths must be a rank-1 tensor"
+        if mel_lengths.shape[0] != mel.shape[0]:
+            return "mel_lengths count must match the mel batch size"
+        if mel_lengths.dtype == torch.bool or mel_lengths.is_floating_point() or mel_lengths.is_complex():
+            return f"mel_lengths must use an integer dtype, received {mel_lengths.dtype}"
+        if bool(((mel_lengths <= 0) | (mel_lengths > mel.shape[-1])).any().item()):
+            return f"mel_lengths values must be between 1 and the padded frame length ({mel.shape[-1]})"
+
+        text = batch["text"]
+        if isinstance(text, torch.Tensor):
+            if text.ndim == 0 or text.shape[0] != mel.shape[0]:
+                return "tensor text batch size must match the mel batch size"
+            if text.dtype == torch.bool or text.is_floating_point() or text.is_complex():
+                return f"tensor text must use an integer dtype, received {text.dtype}"
+        elif isinstance(text, list):
+            if len(text) != mel.shape[0]:
+                return "text list size must match the mel batch size"
+            if any(
+                not isinstance(item, str)
+                and (not isinstance(item, list) or any(not isinstance(token, str) for token in item))
+                for item in text
+            ):
+                return "text list entries must be strings or lists of strings"
+        else:
+            return "text must be a tensor or list"
+        return None
+
+    @contextmanager
+    def _accumulation_context(self, is_boundary: bool | None):
+        if is_boundary is None:
+            with self.accelerator.accumulate(self.model):
+                yield
+            return
+
+        self.accelerator.sync_gradients = is_boundary
+        sync_context = nullcontext() if is_boundary else self.accelerator.no_sync(self.model)
+        with sync_context:
+            yield
+
+    def _validate_global_masked_dataloader(self, dataloader):
+        local_length = torch.tensor([len(dataloader)], device=self.accelerator.device, dtype=torch.int64)
+        gathered_lengths = cast(torch.Tensor, self.accelerator.gather(local_length))
+        if int(gathered_lengths[0]) == 0:
+            raise ValueError("global_masked_mean requires a non-empty training dataloader.")
+        if bool((gathered_lengths != gathered_lengths[0]).any().item()):
+            raise RuntimeError(
+                "global_masked_mean requires equal dataloader lengths on every rank; "
+                f"received {gathered_lengths.cpu().tolist()}."
+            )
+
+    def save_checkpoint(self, update, last=False, *, consumed_batches: int | None = None):
         self.accelerator.wait_for_everyone()
         if self.is_main:
             checkpoint = dict(
@@ -157,6 +319,8 @@ class Trainer:
                 scheduler_state_dict=self.scheduler.state_dict(),
                 update=update,
             )
+            if consumed_batches is not None:
+                checkpoint["consumed_batches"] = consumed_batches
             if not os.path.exists(self.checkpoint_path):
                 os.makedirs(self.checkpoint_path)
             if last:
@@ -183,6 +347,7 @@ class Trainer:
                         print(f"Removed old checkpoint: {oldest_checkpoint}")
 
     def load_checkpoint(self):
+        self._loaded_consumed_batches = 0
         if (
             not exists(self.checkpoint_path)
             or not os.path.exists(self.checkpoint_path)
@@ -249,6 +414,7 @@ class Trainer:
             if self.scheduler:
                 self.scheduler.load_state_dict(checkpoint["scheduler_state_dict"])
             update = checkpoint["update"]
+            self._loaded_consumed_batches = checkpoint.get("consumed_batches", update * self.grad_accumulation_steps)
         else:
             checkpoint["model_state_dict"] = {
                 k.replace("ema_model.", ""): v
@@ -311,28 +477,34 @@ class Trainer:
         else:
             raise ValueError(f"batch_size_type must be either 'sample' or 'frame', but received {self.batch_size_type}")
 
-        #  accelerator.prepare() dispatches batches to devices;
-        #  which means the length of dataloader calculated before, should consider the number of devices
-        warmup_updates = (
-            self.num_warmup_updates * self.accelerator.num_processes
-        )  # consider a fixed warmup steps while using accelerate multi-gpu ddp
-        # otherwise by default with split_batches=False, warmup steps change with num_processes
+        if self.global_masked_mean:
+            train_dataloader = self.accelerator.prepare_data_loader(train_dataloader, device_placement=False)
+            self._validate_global_masked_dataloader(train_dataloader)
+
+        # Scheduler length must use the prepared rank-local loader. AcceleratedScheduler
+        # advances its wrapped scheduler once per process at each synchronized update.
+        warmup_updates = self.num_warmup_updates * self.accelerator.num_processes
         total_updates = math.ceil(len(train_dataloader) / self.grad_accumulation_steps) * self.epochs
-        decay_updates = total_updates - warmup_updates
+        scheduler_updates = total_updates * self.accelerator.num_processes if self.global_masked_mean else total_updates
+        decay_updates = scheduler_updates - warmup_updates
         warmup_scheduler = LinearLR(self.optimizer, start_factor=1e-8, end_factor=1.0, total_iters=warmup_updates)
         decay_scheduler = LinearLR(self.optimizer, start_factor=1.0, end_factor=1e-8, total_iters=decay_updates)
         self.scheduler = SequentialLR(
             self.optimizer, schedulers=[warmup_scheduler, decay_scheduler], milestones=[warmup_updates]
         )
-        train_dataloader, self.scheduler = self.accelerator.prepare(
-            train_dataloader, self.scheduler
-        )  # actual multi_gpu updates = single_gpu updates / gpu nums
+        if self.global_masked_mean:
+            self.scheduler = self.accelerator.prepare(self.scheduler)
+        else:
+            train_dataloader, self.scheduler = self.accelerator.prepare(
+                train_dataloader, self.scheduler
+            )  # actual multi_gpu updates = single_gpu updates / gpu nums
         start_update = self.load_checkpoint()
         global_update = start_update
+        consumed_batches = self._loaded_consumed_batches if self.global_masked_mean else 0
 
         if exists(resumable_with_seed):
             orig_epoch_step = len(train_dataloader)
-            start_step = start_update * self.grad_accumulation_steps
+            start_step = consumed_batches if self.global_masked_mean else start_update * self.grad_accumulation_steps
             skipped_epoch = int(start_step // orig_epoch_step)
             skipped_batch = start_step % orig_epoch_step
             skipped_dataloader = self.accelerator.skip_first_batches(train_dataloader, num_batches=skipped_batch)
@@ -360,8 +532,16 @@ class Trainer:
                 initial=progress_bar_initial,
             )
 
-            for batch in current_dataloader:
-                with self.accelerator.accumulate(self.model):
+            if self.global_masked_mean:
+                training_batches = self._iter_global_masked_mean_batches(current_dataloader)
+            else:
+                training_batches = ((batch, None, None, None, None) for batch in current_dataloader)
+            window_loss_sum = torch.zeros((), device=self.accelerator.device, dtype=torch.float32)
+
+            for batch, rand_span_mask, loss_scale, global_loss_count, is_boundary in training_batches:
+                if self.global_masked_mean:
+                    batch = send_to_device(batch, self.accelerator.device)
+                with self._accumulation_context(is_boundary):
                     text_inputs = batch["text"]
                     mel_spec = batch["mel"].permute(0, 2, 1)
                     mel_lengths = batch["mel_lengths"]
@@ -371,9 +551,21 @@ class Trainer:
                         dur_loss = self.duration_predictor(mel_spec, lens=batch.get("durations"))
                         self.accelerator.log({"duration loss": dur_loss.item()}, step=global_update)
 
-                    loss, cond, pred = self.model(
-                        mel_spec, text=text_inputs, lens=mel_lengths, noise_scheduler=self.noise_scheduler
-                    )
+                    if self.global_masked_mean:
+                        loss_sum, _, cond, pred = self.model(
+                            mel_spec,
+                            text=text_inputs,
+                            lens=mel_lengths,
+                            noise_scheduler=self.noise_scheduler,
+                            rand_span_mask=rand_span_mask,
+                            return_loss_components=True,
+                        )
+                        window_loss_sum += loss_sum.detach()
+                        loss = loss_sum * loss_scale
+                    else:
+                        loss, cond, pred = self.model(
+                            mel_spec, text=text_inputs, lens=mel_lengths, noise_scheduler=self.noise_scheduler
+                        )
                     self.accelerator.backward(loss)
 
                     if self.max_grad_norm > 0 and self.accelerator.sync_gradients:
@@ -383,27 +575,48 @@ class Trainer:
                     self.scheduler.step()
                     self.optimizer.zero_grad()
 
-                if self.accelerator.sync_gradients:
+                if self.global_masked_mean:
+                    consumed_batches += 1
+                update_completed = self.accelerator.sync_gradients and (
+                    not self.global_masked_mean or not self.accelerator.optimizer_step_was_skipped
+                )
+                logged_loss = loss.detach()
+                if self.global_masked_mean:
+                    if self.accelerator.sync_gradients:
+                        global_loss_sum = self._reduce_global_masked_value(window_loss_sum)
+                        logged_loss = global_loss_sum / global_loss_count
+                        window_loss_sum.zero_()
+                    else:
+                        logged_loss = None
+
+                if update_completed:
                     if self.is_main:
                         self.ema_model.update()
 
                     global_update += 1
                     progress_bar.update(1)
-                    progress_bar.set_postfix(update=str(global_update), loss=loss.item())
+                    progress_bar.set_postfix(update=str(global_update), loss=logged_loss.item())
 
-                if self.accelerator.is_local_main_process:
+                if logged_loss is not None and self.accelerator.is_local_main_process:
                     self.accelerator.log(
-                        {"loss": loss.item(), "lr": self.scheduler.get_last_lr()[0]}, step=global_update
+                        {"loss": logged_loss.item(), "lr": self.scheduler.get_last_lr()[0]}, step=global_update
                     )
-                if self.logger == "tensorboard" and self.accelerator.is_main_process:
-                    self.writer.add_scalar("loss", loss.item(), global_update)
+                if logged_loss is not None and self.logger == "tensorboard" and self.accelerator.is_main_process:
+                    self.writer.add_scalar("loss", logged_loss.item(), global_update)
                     self.writer.add_scalar("lr", self.scheduler.get_last_lr()[0], global_update)
 
-                if global_update % self.last_per_updates == 0 and self.accelerator.sync_gradients:
-                    self.save_checkpoint(global_update, last=True)
+                if global_update % self.last_per_updates == 0 and update_completed:
+                    self.save_checkpoint(
+                        global_update,
+                        last=True,
+                        consumed_batches=consumed_batches if self.global_masked_mean else None,
+                    )
 
-                if global_update % self.save_per_updates == 0 and self.accelerator.sync_gradients:
-                    self.save_checkpoint(global_update)
+                if global_update % self.save_per_updates == 0 and update_completed:
+                    self.save_checkpoint(
+                        global_update,
+                        consumed_batches=consumed_batches if self.global_masked_mean else None,
+                    )
 
                     if self.log_samples and self.accelerator.is_local_main_process:
                         ref_audio_len = mel_lengths[0]
@@ -437,6 +650,10 @@ class Trainer:
                         )
                         self.model.train()
 
-        self.save_checkpoint(global_update, last=True)
+        self.save_checkpoint(
+            global_update,
+            last=True,
+            consumed_batches=consumed_batches if self.global_masked_mean else None,
+        )
 
         self.accelerator.end_training()

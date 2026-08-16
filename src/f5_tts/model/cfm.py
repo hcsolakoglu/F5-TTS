@@ -228,6 +228,26 @@ class CFM(nn.Module):
 
         return out, trajectory
 
+    def sample_training_mask(self, lens: torch.Tensor, seq_len: int) -> torch.Tensor:
+        """Sample a padded span mask without building a training graph."""
+        if seq_len < 0:
+            raise ValueError(f"seq_len must be non-negative, but received {seq_len}")
+        if lens.ndim != 1:
+            raise ValueError(f"lens must be one-dimensional, but received shape {tuple(lens.shape)}")
+        if lens.dtype == torch.bool or lens.is_floating_point() or lens.is_complex():
+            raise TypeError(f"lens must use an integer dtype, but received {lens.dtype}")
+        if bool(((lens < 0) | (lens > seq_len)).any().item()):
+            raise ValueError(f"lens values must be between 0 and seq_len ({seq_len})")
+
+        lens = lens.to(device=self.device, dtype=torch.long)
+        valid_mask = lens_to_mask(lens, length=seq_len)
+        return self._sample_training_mask(lens, seq_len, valid_mask)
+
+    def _sample_training_mask(self, lens: torch.Tensor, seq_len: int, valid_mask: torch.Tensor) -> torch.Tensor:
+        frac_lengths = torch.zeros((lens.shape[0],), device=self.device).float().uniform_(*self.frac_lengths_mask)
+        rand_span_mask = mask_from_frac_lengths(lens, frac_lengths, length=seq_len)
+        return rand_span_mask & valid_mask
+
     def forward(
         self,
         inp: float["b n d"] | float["b nw"],  # mel or raw wave
@@ -235,6 +255,8 @@ class CFM(nn.Module):
         *,
         lens: int["b"] | None = None,
         noise_scheduler: str | None = None,
+        rand_span_mask: torch.Tensor | None = None,
+        return_loss_components: bool = False,
     ):
         # handle raw wave
         if inp.ndim == 2:
@@ -254,15 +276,22 @@ class CFM(nn.Module):
 
         # lens and mask
         if not exists(lens):  # if lens not acquired by trainer from collate_fn
-            lens = torch.full((batch,), seq_len, device=device)
+            lens = torch.full((batch,), seq_len, device=device, dtype=torch.long)
+        else:
+            lens = lens.to(device=device, dtype=torch.long)
         mask = lens_to_mask(lens, length=seq_len)
 
-        # get a random span to mask out for training conditionally
-        frac_lengths = torch.zeros((batch,), device=self.device).float().uniform_(*self.frac_lengths_mask)
-        rand_span_mask = mask_from_frac_lengths(lens, frac_lengths)
-
-        if exists(mask):
-            rand_span_mask &= mask
+        if rand_span_mask is None:
+            rand_span_mask = self._sample_training_mask(lens, seq_len, mask)
+        else:
+            expected_shape = (batch, seq_len)
+            if tuple(rand_span_mask.shape) != expected_shape:
+                raise ValueError(
+                    f"rand_span_mask must have shape {expected_shape}, but received {tuple(rand_span_mask.shape)}"
+                )
+            if rand_span_mask.dtype != torch.bool:
+                raise TypeError(f"rand_span_mask must have dtype torch.bool, but received {rand_span_mask.dtype}")
+            rand_span_mask = rand_span_mask.to(device=device) & mask
 
         # mel is x1
         x1 = inp
@@ -295,8 +324,13 @@ class CFM(nn.Module):
             x=φ, cond=cond, text=text, time=time, drop_audio_cond=drop_audio_cond, drop_text=drop_text, mask=mask
         )
 
-        # flow matching loss
-        loss = F.mse_loss(pred, flow, reduction="none")
-        loss = loss[rand_span_mask]
+        if return_loss_components:
+            elementwise_loss = F.mse_loss(pred.float(), flow.float(), reduction="none")
+            loss_sum = elementwise_loss[rand_span_mask].sum()
+            loss_count = rand_span_mask.sum(dtype=torch.int64) * elementwise_loss.shape[-1]
+            return loss_sum, loss_count, cond, pred
+
+        # Preserve the historical reduction for every default-off caller.
+        loss = F.mse_loss(pred, flow, reduction="none")[rand_span_mask]
 
         return loss.mean(), cond, pred
