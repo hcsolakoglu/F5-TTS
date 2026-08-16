@@ -11,6 +11,7 @@ import torch
 import torch._dynamo as dynamo
 import yaml
 
+import f5_tts.model.cfm as cfm_module
 from f5_tts.model import CFM, DiT, UNetT
 from f5_tts.train.finetune_cli import parse_args
 
@@ -256,6 +257,42 @@ def test_forward_api_remains_tuple_and_state_dict_stays_clean():
 
     assert state_dict_keys_after == state_dict_keys_before
     assert not any("_orig_mod" in key or "compile" in key or "compiled" in key for key in state_dict_keys_after)
+
+
+def test_unselected_nonfinite_noise_does_not_poison_loss(monkeypatch):
+    # Nonfinites outside the masked span (here: corrupted transformer output at
+    # unselected positions) must not reach the loss. Masked-multiply reduction
+    # propagates them (0 * NaN == NaN); the torch.where selection keeps the
+    # boolean-indexing semantics of the historical eager reduction while staying
+    # compile-friendly.
+    model = _build_model()
+    mel, text, lens = _sample_batch()
+    span = torch.zeros(mel.shape[:2], dtype=torch.bool)
+    span[:, : max(1, span.shape[1] // 2)] = True
+
+    def _span_of_two_lengths(seq_len, frac_lengths, length=None):
+        del seq_len, frac_lengths, length
+        return span
+
+    original_transformer_forward = model.transformer.forward
+
+    def _pred_with_corrupted_unselected(*args, **kwargs):
+        pred = original_transformer_forward(*args, **kwargs)
+        return pred.masked_fill(~span[..., None], float("nan"))
+
+    monkeypatch.setattr(cfm_module, "mask_from_frac_lengths", _span_of_two_lengths)
+    monkeypatch.setattr(torch, "randn_like", lambda value: torch.zeros_like(value))
+    monkeypatch.setattr(model.transformer, "forward", _pred_with_corrupted_unselected)
+
+    # Route through the compiled components core: with compile off, _run_loss_core
+    # dispatches to the upstream-exact boolean-indexing path, which trivially
+    # excludes unselected values and would not exercise the reduction under test.
+    model.compile_training_core(backend="eager", fullgraph=False, dynamic=None)
+
+    loss, cond, pred = model(mel, text=text, lens=lens)
+
+    assert torch.isfinite(loss)
+    assert torch.isfinite(pred[span]).all()
 
 
 def test_compiled_loss_core_matches_eager_loss_outputs_and_gradients():

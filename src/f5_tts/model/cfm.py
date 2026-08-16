@@ -484,14 +484,16 @@ class CFM(nn.Module):
         )
 
         # flow matching loss: masked mean over valid span tokens and feature dim.
-        # Boolean indexing (loss[rand_span_mask]) causes a graph break under torch.compile;
-        # the elementwise multiply form is numerically equivalent and compile-friendly.
-        # denom.clamp(min=1.0) keeps the loss finite when no token is selected.
-        # Accumulate the squared error in fp32 so fp16 AMP/global loss-sum
-        # training cannot overflow before GradScaler sees the loss.
+        # Boolean indexing (loss[rand_span_mask]) causes a graph break under torch.compile.
+        # Select via torch.where instead of masked-multiply: multiplying by a zero mask
+        # propagates NaN/Inf from unselected (e.g. padded) positions into loss_sum
+        # (0 * NaN == NaN), while torch.where keeps the boolean-indexing semantics and
+        # stays graph-break-free. denom.clamp(min=1.0) keeps the loss finite when no
+        # token is selected. Accumulate the squared error in fp32 so fp16 AMP/global
+        # loss-sum training cannot overflow before GradScaler sees the loss.
         loss = F.mse_loss(pred.float(), flow.float(), reduction="none")
+        loss_sum = torch.where(rand_span_mask[..., None], loss, torch.zeros_like(loss)).sum()
         loss_mask = rand_span_mask[..., None].to(loss.dtype)
-        loss_sum = (loss * loss_mask).sum()
         denom = (loss_mask.sum() * loss.shape[-1]).clamp(min=1.0)
         loss = loss_sum / denom
 
