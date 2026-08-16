@@ -1,0 +1,79 @@
+{
+  "all_counters": {
+    "aot_autograd": {
+      "autograd_cache_hit": 3,
+      "autograd_cache_miss": 1,
+      "autograd_cache_saved": 1,
+      "ok": 4,
+      "total": 4
+    },
+    "aten_mm_info": {
+      "aten.addmm_120_192_96": 6,
+      "aten.addmm_120_256_128": 2,
+      "aten.addmm_120_256_96": 18,
+      "aten.addmm_120_80_96": 1,
+      "aten.addmm_120_96_192": 6,
+      "aten.addmm_3_576_96": 6,
+      "aten.addmm_3_96_256": 1,
+      "aten.addmm_3_96_96": 1,
+      "aten.mm_120_128_256": 2,
+      "aten.mm_120_96_256": 6,
+      "aten.mm_120_96_288": 1,
+      "aten.mm_3_192_96": 1
+    },
+    "graph_break": {},
+    "inductor": {
+      "async_compile_cache_hit": 482,
+      "async_compile_cache_miss": 738,
+      "extern_calls": 892,
+      "fxgraph_cache_hit": 7,
+      "fxgraph_cache_miss": 1,
+      "pattern_matcher_count": 483,
+      "pattern_matcher_nodes": 582,
+      "triton_bundler_load_static_autotuner": 227,
+      "triton_bundler_save_kernel": 216,
+      "triton_bundler_save_static_autotuner": 1
+    },
+    "stats": {
+      "calls_captured": 2821,
+      "unique_graphs": 4
+    }
+  },
+  "candidate": "cfm_fullgraph_autodyn",
+  "candidate_config": {
+    "compile": true,
+    "dynamic": null,
+    "fullgraph": true,
+    "target": "cfm_loss_core"
+  },
+  "compile_state": {
+    "enabled": true,
+    "error": null,
+    "fallback_active": false,
+    "target": "cfm_loss_core"
+  },
+  "correctness": true,
+  "error": null,
+  "fallback": false,
+  "finite_loss": true,
+  "first_update_s": 0.02701225900091231,
+  "gate_loss_compiled": 1.2124046087265015,
+  "gate_loss_eager": 1.212404489517212,
+  "gpu_name": "NVIDIA GeForce RTX 3070",
+  "grad_close": true,
+  "graph_break_counters": {},
+  "keys_clean": true,
+  "loss_close": true,
+  "max_memory_allocated_mb": 57.517578125,
+  "max_memory_reserved_mb": 78.0,
+  "mean_update_s": 0.43278456809639465,
+  "median_update_s": 0.008443891012575477,
+  "n_updates": 12,
+  "p90_update_s": 2.260430843825452,
+  "recompiles": null,
+  "setup_ok": true,
+  "torch_version": "2.11.0+cu128",
+  "unique_batch_shapes": 26,
+  "unique_graphs": 4,
+  "wall_s": 5.194757323944941
+}

@@ -1,0 +1,100 @@
+{
+  "all_counters": {
+    "aot_autograd": {
+      "autograd_cache_miss": 4,
+      "autograd_cache_saved": 2,
+      "ok": 2,
+      "total": 4
+    },
+    "aten_mm_info": {
+      "aten.addmm_1_576_96": 1,
+      "aten.addmm_s13*s27_192_96": 1,
+      "aten.addmm_s13*s27_256_96": 3,
+      "aten.addmm_s13*s27_96_192": 1,
+      "aten.addmm_s13*s27_96_256": 1,
+      "aten.addmm_s13_576_96": 1,
+      "aten.addmm_s24_192_96": 1,
+      "aten.addmm_s24_256_96": 3,
+      "aten.addmm_s24_96_192": 1,
+      "aten.addmm_s24_96_256": 1,
+      "aten.mm_192_96_s13*s27": 1,
+      "aten.mm_192_96_s24": 1,
+      "aten.mm_1_96_576": 1,
+      "aten.mm_256_96_s13*s27": 3,
+      "aten.mm_256_96_s24": 3,
+      "aten.mm_576_96_1": 1,
+      "aten.mm_576_96_s13": 1,
+      "aten.mm_96_192_s13*s27": 1,
+      "aten.mm_96_192_s24": 1,
+      "aten.mm_96_256_s13*s27": 1,
+      "aten.mm_96_256_s24": 1,
+      "aten.mm_s13*s27_192_96": 1,
+      "aten.mm_s13*s27_256_96": 1,
+      "aten.mm_s13*s27_96_192": 1,
+      "aten.mm_s13*s27_96_256": 3,
+      "aten.mm_s13_96_576": 1,
+      "aten.mm_s24_192_96": 1,
+      "aten.mm_s24_256_96": 1,
+      "aten.mm_s24_96_192": 1,
+      "aten.mm_s24_96_256": 3
+    },
+    "frames": {
+      "ok": 2,
+      "total": 2
+    },
+    "graph_break": {},
+    "inductor": {
+      "async_compile_cache_hit": 40,
+      "async_compile_cache_miss": 80,
+      "benchmarking.InductorBenchmarker.benchmark": 32,
+      "benchmarking.InductorBenchmarker.benchmark_gpu": 32,
+      "extern_calls": 62,
+      "fxgraph_cache_miss": 4,
+      "pattern_matcher_count": 132,
+      "pattern_matcher_nodes": 162,
+      "triton_bundler_save_kernel": 496,
+      "triton_bundler_save_static_autotuner": 4
+    },
+    "stats": {
+      "calls_captured": 416,
+      "unique_graphs": 2
+    }
+  },
+  "candidate": "dit_blocks_nofullgraph_dynamic",
+  "candidate_config": {
+    "compile": true,
+    "dynamic": true,
+    "fullgraph": false,
+    "target": "dit_blocks"
+  },
+  "compile_state": {
+    "enabled": true,
+    "error": null,
+    "fallback_active": false,
+    "target": "dit_blocks"
+  },
+  "correctness": true,
+  "error": null,
+  "fallback": false,
+  "finite_loss": true,
+  "first_update_s": 0.030299319012556225,
+  "gate_loss_compiled": 1.212404489517212,
+  "gate_loss_eager": 1.212404489517212,
+  "gpu_name": "NVIDIA GeForce RTX 3070",
+  "grad_close": true,
+  "graph_break_counters": {},
+  "keys_clean": true,
+  "loss_close": true,
+  "max_memory_allocated_mb": 58.99755859375,
+  "max_memory_reserved_mb": 80.0,
+  "mean_update_s": 0.3900321614200948,
+  "median_update_s": 0.012255012494279072,
+  "n_updates": 12,
+  "p90_update_s": 3.174086477403762,
+  "recompiles": null,
+  "setup_ok": true,
+  "torch_version": "2.11.0+cu128",
+  "unique_batch_shapes": 26,
+  "unique_graphs": 2,
+  "wall_s": 4.68176346301334
+}

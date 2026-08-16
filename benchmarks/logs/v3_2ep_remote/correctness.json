@@ -1,0 +1,24 @@
+[
+  {
+    "candidate": "compiled_dynamic_true",
+    "grad_max_abs_diff": 2.9802322387695312e-08,
+    "loss_abs_diff": 0.0,
+    "pred_max_abs_diff": 0.0,
+    "state": {
+      "enabled": true,
+      "error": null,
+      "fallback_active": false
+    }
+  },
+  {
+    "candidate": "compiled_branchless_cfg_dynamic",
+    "grad_max_abs_diff": 2.9802322387695312e-08,
+    "loss_abs_diff": 0.0,
+    "pred_max_abs_diff": 0.0,
+    "state": {
+      "enabled": true,
+      "error": null,
+      "fallback_active": false
+    }
+  }
+]

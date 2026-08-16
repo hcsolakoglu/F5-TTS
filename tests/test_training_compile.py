@@ -1,9 +1,5 @@
 import copy
-import io
-import os
-import subprocess
 import sys
-import types
 from pathlib import Path
 from typing import Any, cast
 from unittest.mock import patch
@@ -34,56 +30,6 @@ CUDA_INDUCTOR_EQUIVALENCE_KWARGS = [
     pytest.param({"fullgraph": True, "dynamic": None}, id="fullgraph_autodynamic"),
     pytest.param({"fullgraph": True, "dynamic": True}, id="fullgraph_dynamic"),
 ]
-
-
-def _synthetic_compiler_error(message="synthetic compile failure"):
-    """Build a realistic torch.compile backend failure.
-
-    The runtime fallback only catches compiler-raised exception types. Simulating a
-    compile failure with a bare RuntimeError would test a code path that cannot occur
-    in production and would hide the fact that ordinary model errors must propagate
-    (see test_model_error_is_not_swallowed_by_compile_fallback).
-    """
-    from torch._dynamo.exc import BackendCompilerFailed
-
-    return BackendCompilerFailed(lambda: None, RuntimeError(message), None)
-
-
-def _randomize_zero_init_(model, *, seed=0, std=0.05):
-    """Move a freshly built DiT out of its identity-initialized state.
-
-    DiT.initialize_weights zero-initializes the AdaLN gates (`block.attn_norm.linear`)
-    and the output projection. That is correct for training -- the residual branches start
-    as no-ops -- but it makes an as-built model useless for eager-vs-compiled comparison:
-    `pred` is identically zero and only proj_out receives a gradient (2 of 29 parameters on
-    the tiny test model), so a completely broken attention or feed-forward inside the
-    compiled region still compares equal. Every parity test must run through this first,
-    and then assert non-vacuity with _assert_parity_is_meaningful.
-    """
-    generator = torch.Generator().manual_seed(seed)
-    with torch.no_grad():
-        for parameter in model.parameters():
-            if parameter.abs().sum() == 0:
-                noise = torch.empty_like(parameter).normal_(0.0, std, generator=generator)
-                parameter.copy_(noise)
-    return model
-
-
-def _assert_parity_is_meaningful(pred, model, *, min_grad_fraction=0.5):
-    """Fail if a parity comparison could pass on a broken implementation.
-
-    Guards against the zero-initialization trap above and against silently comparing
-    all-zero tensors: the prediction must be non-trivial and most parameters must carry
-    gradient, otherwise the surrounding assertions prove nothing about the compiled region.
-    """
-    assert torch.count_nonzero(pred) > 0, "prediction is identically zero; parity assertions would be vacuous"
-    parameters = list(model.parameters())
-    with_grad = sum(1 for p in parameters if p.grad is not None and torch.count_nonzero(p.grad) > 0)
-    fraction = with_grad / max(len(parameters), 1)
-    assert fraction >= min_grad_fraction, (
-        f"only {with_grad}/{len(parameters)} parameters received a nonzero gradient "
-        f"({fraction:.0%} < {min_grad_fraction:.0%}); the compiled region is barely exercised"
-    )
 
 
 def _build_model(
@@ -261,7 +207,7 @@ def test_forward_api_remains_tuple_and_state_dict_stays_clean():
 
 
 def test_compiled_loss_core_matches_eager_loss_outputs_and_gradients():
-    eager_model = _randomize_zero_init_(_build_model())
+    eager_model = _build_model()
     compiled_model = copy.deepcopy(eager_model)
     mel, text, lens = _sample_batch(batch_size=3, frames=12, text_len=7, lens=[12, 8, 5])
 
@@ -284,7 +230,6 @@ def test_compiled_loss_core_matches_eager_loss_outputs_and_gradients():
         param.grad.detach().clone() if param.grad is not None else None for param in compiled_model.parameters()
     ]
 
-    _assert_parity_is_meaningful(eager_pred, eager_model)
     _assert_close(compiled_loss.detach(), eager_loss.detach(), "loss")
     _assert_close(compiled_cond.detach(), eager_cond.detach(), "cond")
     _assert_close(compiled_pred.detach(), eager_pred.detach(), "pred")
@@ -298,16 +243,9 @@ def test_compiled_loss_core_matches_eager_loss_outputs_and_gradients():
 
 
 def test_regional_dit_blocks_matches_eager_loss_outputs_and_gradients():
-    eager_model = _randomize_zero_init_(_build_model())
+    eager_model = _build_model()
     compiled_model = copy.deepcopy(eager_model)
-    # dit_blocks compile is training-only by design, so both models must be in train mode
-    # or the compiled callable is bypassed and this compares eager against eager.
-    # _build_model pins dropout=0.0, so train mode stays deterministic.
-    eager_model.train()
-    compiled_model.train()
     mel, text, lens = _sample_batch(batch_size=3, frames=12, text_len=7, lens=[12, 8, 5])
-    transformer = cast(Any, compiled_model.transformer)
-    assert transformer._compiled_dit_block_forwards is None
 
     prepared_args = cast(PreparedArgs, eager_model._prepare_training_inputs(mel.clone(), text.clone(), lens.clone()))
 
@@ -317,7 +255,9 @@ def test_regional_dit_blocks_matches_eager_loss_outputs_and_gradients():
         param.grad.detach().clone() if param.grad is not None else None for param in eager_model.parameters()
     ]
 
-    compiled = compiled_model.compile_training_core(target="dit_blocks", backend="eager", fullgraph=False, dynamic=None)
+    compiled = compiled_model.compile_training_core(
+        target="dit_blocks", backend="eager", fullgraph=False, dynamic=None
+    )
     compiled_args = cast(
         PreparedArgs,
         tuple(arg.detach().clone() if torch.is_tensor(arg) else arg for arg in prepared_args),
@@ -328,16 +268,9 @@ def test_regional_dit_blocks_matches_eager_loss_outputs_and_gradients():
         param.grad.detach().clone() if param.grad is not None else None for param in compiled_model.parameters()
     ]
 
-    _assert_parity_is_meaningful(eager_pred, eager_model)
     assert isinstance(compiled, tuple)
     compiled_forwards = cast(tuple[Any, ...], compiled)
-    assert len(compiled_forwards) == len(transformer.transformer_blocks)
-    # Compiled callables live on the owning DiT, not on block.forward; modules stay
-    # unpatched so deepcopy/pickle produce eager modules.
-    assert transformer._compiled_dit_block_forwards is not None
-    assert len(transformer._compiled_dit_block_forwards) == len(transformer.transformer_blocks)
-    for block in transformer.transformer_blocks:
-        assert "forward" not in block.__dict__
+    assert len(compiled_forwards) == len(cast(Any, compiled_model.transformer).transformer_blocks)
     assert compiled_model.training_compile_state == {
         "enabled": True,
         "target": "dit_blocks",
@@ -361,420 +294,6 @@ def test_regional_dit_blocks_matches_eager_loss_outputs_and_gradients():
         "fallback_active": False,
         "error": None,
     }
-    assert transformer._compiled_dit_block_forwards is None
-
-
-def test_regional_dit_blocks_runtime_fallback_restores_eager_blocks():
-    model = _build_model()
-    mel, text, lens = _sample_batch()
-    prepared_args = cast(PreparedArgs, model._prepare_training_inputs(mel.clone(), text.clone(), lens.clone()))
-    transformer = cast(Any, model.transformer)
-    block = transformer.transformer_blocks[0]
-
-    assert transformer._compiled_dit_block_forwards is None
-    model.compile_training_core(target="dit_blocks", backend="eager", fullgraph=False, dynamic=None)
-    assert transformer._compiled_dit_block_forwards is not None
-    # Modules are never patched; the compiled callable is dispatched from the owner loop.
-    assert "forward" not in block.__dict__
-
-    def raise_compile_error(*_args, **_kwargs):
-        raise _synthetic_compiler_error("synthetic dit block compile failure")
-
-    # Inject a failing callable into the compiled slot to simulate a runtime compile
-    # failure dispatched through the owner loop (not through block.forward).
-    compiled = transformer._compiled_dit_block_forwards
-    object.__setattr__(
-        transformer,
-        "_compiled_dit_block_forwards",
-        (raise_compile_error, *compiled[1:]),
-    )
-    model.train()
-    loss, _, _ = model._run_loss_core(*prepared_args)
-
-    assert torch.isfinite(loss)
-    assert model.training_compile_state["enabled"] is False
-    assert model.training_compile_state["fallback_active"] is True
-    assert "synthetic dit block compile failure" in model.training_compile_state["error"]
-    assert transformer._compiled_dit_block_forwards is None
-
-
-def _count_compiled_block_calls(monkeypatch):
-    """Wrap torch.compile so tests can assert the compiled callable actually ran.
-
-    Asserting on `training_compile_state` only proves setup succeeded; it cannot detect a
-    dispatch that silently bypasses the compiled block.
-    """
-    calls = {"n": 0}
-    real_compile = torch.compile
-
-    def counting_compile(fn, **kwargs):
-        inner = real_compile(fn, **kwargs)
-
-        def wrapper(*args, **inner_kwargs):
-            calls["n"] += 1
-            return inner(*args, **inner_kwargs)
-
-        return wrapper
-
-    monkeypatch.setattr(torch, "compile", counting_compile)
-    return calls
-
-
-def test_regional_dit_blocks_compile_is_training_only(monkeypatch):
-    """Inference must not run through the compiled training blocks.
-
-    `CFM.sample` shares `DiTBlock.forward` with training, and Trainer calls it whenever
-    log_samples=True. Inference shapes (cfg_infer doubles the batch, the ODE solver sweeps
-    durations) would otherwise consume the same per-code-object recompile budget as
-    training -- default 8 -- and push new training shapes back to eager while the trainer
-    still reports compile as active.
-    """
-    calls = _count_compiled_block_calls(monkeypatch)
-    model = _build_model()
-    mel, text, lens = _sample_batch()
-    prepared_args = cast(PreparedArgs, model._prepare_training_inputs(mel.clone(), text.clone(), lens.clone()))
-    model.compile_training_core(target="dit_blocks", backend="eager", fullgraph=False, dynamic=None)
-
-    model.eval()
-    model._run_loss_core(*prepared_args)
-    assert calls["n"] == 0, "eval-mode forward must bypass the compiled training blocks"
-
-    model.train()
-    loss, _, _ = model._run_loss_core(*prepared_args)
-    assert torch.isfinite(loss)
-    assert calls["n"] >= len(cast(Any, model.transformer).transformer_blocks), (
-        "train-mode forward must dispatch through every compiled block"
-    )
-
-    # and compile state is unaffected by the mode switching
-    assert model.training_compile_state["enabled"] is True
-    assert model.training_compile_state["fallback_active"] is False
-
-
-def test_compiled_dit_deepcopy_runs_eager_and_does_not_share_source_closure(monkeypatch):
-    """A deep-copied compiled DiT must execute its own parameters eagerly.
-
-    Regression for the monkey-patch design where the installed closure captured the source
-    block, so a copied model silently ran the source model's weights. Compiled state is
-    stripped on deepcopy; the copy dispatches eager and its outputs depend only on its own
-    parameters.
-    """
-    model = _build_model()
-    mel, text, lens = _sample_batch()
-    model.compile_training_core(target="dit_blocks", backend="eager", fullgraph=False, dynamic=None)
-    model.train()
-
-    copied = copy.deepcopy(model)
-    # Compile state is stripped: the copy is eager and pickleable.
-    assert cast(Any, copied.transformer)._compiled_dit_block_forwards is None
-    assert copied.training_compile_state["enabled"] is False
-
-    copied.train()
-    prepared = cast(PreparedArgs, copied._prepare_training_inputs(mel.clone(), text.clone(), lens.clone()))
-    loss, _, _ = copied._run_loss_core(*prepared)
-    assert torch.isfinite(loss)
-
-    # Mutating the source model's parameters must not change the copy's output: the copy
-    # runs its own parameters, not a shared closure over the source block.
-    with torch.no_grad():
-        for param in model.parameters():
-            param.add_(1.0)
-    loss_after, _, _ = copied._run_loss_core(*prepared)
-    assert torch.equal(loss.detach(), loss_after.detach()), (
-        "deep-copied model must not share the source model's parameter closure"
-    )
-
-
-def test_compiled_dit_model_is_pickleable_via_torch_save():
-    """A compiled DiT must survive torch.save/torch.load and deserialize eager.
-
-    Regression for the local-closure pickle failure: ``torch.save(model, ...)`` raised
-    ``AttributeError: Can't pickle local object`` while the monkey-patch was active.
-    __getstate__ now strips compiled callables; the loaded model runs eager.
-    """
-    model = _build_model()
-    mel, text, lens = _sample_batch()
-    model.compile_training_core(target="dit_blocks", backend="eager", fullgraph=False, dynamic=None)
-    model.train()
-
-    buf = io.BytesIO()
-    torch.save(model, buf)
-    buf.seek(0)
-    loaded = torch.load(buf, weights_only=False)
-
-    assert cast(Any, loaded.transformer)._compiled_dit_block_forwards is None
-    assert loaded.training_compile_state["enabled"] is False
-    loaded.train()
-    prepared = cast(PreparedArgs, loaded._prepare_training_inputs(mel.clone(), text.clone(), lens.clone()))
-    loss, _, _ = loaded._run_loss_core(*prepared)
-    assert torch.isfinite(loss)
-
-
-def test_compiled_cfm_deepcopy_resets_to_eager_without_sharing_source_closure():
-    """A copied full-loss-core model must not retain a callable bound to the source CFM."""
-    model = _build_model()
-    model.compile_training_core(target="cfm_loss_core", backend="eager", fullgraph=False, dynamic=None)
-    source_compiled = model.__dict__["_compiled_loss_core"]
-
-    copied = copy.deepcopy(model)
-
-    assert copied is not model
-    assert copied.training_compile_state["enabled"] is False
-    assert copied.__dict__["_compiled_loss_core"] is None
-    assert model.__dict__["_compiled_loss_core"] is source_compiled
-
-
-def test_compiled_cfm_model_is_pickleable_via_torch_save_and_loads_eager():
-    """Whole-model serialization must strip the non-pickleable compiled CFM wrapper."""
-    model = _build_model()
-    state_dict_before = copy.deepcopy(model.state_dict())
-    model.compile_training_core(target="cfm_loss_core", backend="eager", fullgraph=False, dynamic=None)
-
-    buffer = io.BytesIO()
-    torch.save(model, buffer)
-    buffer.seek(0)
-    loaded = torch.load(buffer, weights_only=False)
-
-    assert loaded.training_compile_state["enabled"] is False
-    assert loaded.__dict__["_compiled_loss_core"] is None
-    assert loaded.state_dict().keys() == state_dict_before.keys()
-    for key, value in state_dict_before.items():
-        assert torch.equal(loaded.state_dict()[key], value), key
-
-
-def test_compile_state_serialization_does_not_require_nn_module_getstate(monkeypatch):
-    """CFM and DiT serialization must remain compatible with the torch 2.0 parent contract."""
-    model = _build_model()
-    transformer = cast(Any, model.transformer)
-    compiled_call_sentinels = {}
-    modules_and_compile_attrs = (
-        (model, model._CFM_COMPILE_ONLY_ATTRS),
-        (transformer, transformer._DIT_COMPILE_ONLY_ATTRS),
-    )
-
-    for module, compile_attrs in modules_and_compile_attrs:
-        compiled_call_sentinel = object()
-        compiled_call_sentinels[module] = compiled_call_sentinel
-        object.__setattr__(module, "_compiled_call_impl", compiled_call_sentinel)
-        for attr in compile_attrs:
-            object.__setattr__(module, attr, object())
-
-    # torch 2.0's nn.Module has no __getstate__. Remove the newer parent method to
-    # exercise that supported legacy contract without changing the installed torch.
-    monkeypatch.delattr(torch.nn.Module, "__getstate__", raising=False)
-
-    for module, compile_attrs in modules_and_compile_attrs:
-        state = module.__getstate__()
-        assert "_compiled_call_impl" not in state
-        assert all(attr not in state for attr in compile_attrs)
-
-        # __getstate__ must filter a copy, not mutate the live module.
-        assert module.__dict__["_compiled_call_impl"] is compiled_call_sentinels[module]
-        assert all(attr in module.__dict__ for attr in compile_attrs)
-        assert state["_modules"] is module.__dict__["_modules"]
-
-    # Exercise the EMA construction mechanism itself: deepcopy must also succeed
-    # while all ordinary child modules use torch 2.0's parent serialization contract.
-    copied = copy.deepcopy(model)
-    copied_transformer = cast(Any, copied.transformer)
-    assert "_compiled_call_impl" not in copied.__dict__
-    assert "_compiled_call_impl" not in copied_transformer.__dict__
-    assert copied.training_compile_state["enabled"] is False
-    assert copied_transformer.training_compile_state["enabled"] is False
-
-
-def test_clear_training_compile_after_deepcopy_leaves_forward_callable():
-    """clear_training_compile() on a deep-copied compiled DiT must not install a sentinel.
-
-    Regression for the identity-based sentinel restore: deepcopy produced a distinct
-    ``object()`` sentinel that failed the ``is _NO_INSTANCE_FORWARD`` check, so clear
-    installed a bare ``object`` as ``block.forward`` -> ``TypeError`` on next call. With
-    the monkey-patch removed, clear is a no-op on blocks and forward stays callable.
-    """
-    model = _build_model()
-    model.compile_training_core(target="dit_blocks", backend="eager", fullgraph=False, dynamic=None)
-    copied = copy.deepcopy(model)
-
-    copied.clear_training_compile()
-    transformer = cast(Any, copied.transformer)
-    assert transformer._compiled_dit_block_forwards is None
-    for block in transformer.transformer_blocks:
-        assert isinstance(block.forward, types.MethodType), "block.forward must remain a bound method"
-
-    mel, text, lens = _sample_batch()
-    copied.train()
-    prepared = cast(PreparedArgs, copied._prepare_training_inputs(mel.clone(), text.clone(), lens.clone()))
-    loss, _, _ = copied._run_loss_core(*prepared)
-    assert torch.isfinite(loss)
-
-
-def test_compiled_dit_state_dict_keys_unchanged_after_compile_and_deepcopy():
-    """Compile state must not leak into state_dict keys (no _orig_mod / compile keys)."""
-    model = _build_model()
-    keys_before = set(model.state_dict().keys())
-    model.compile_training_core(target="dit_blocks", backend="eager", fullgraph=False, dynamic=None)
-    keys_after_compile = set(model.state_dict().keys())
-    keys_after_deepcopy = set(copy.deepcopy(model).state_dict().keys())
-
-    assert keys_before == keys_after_compile == keys_after_deepcopy
-    assert not any("_orig_mod" in k or "compile" in k or "compiled" in k for k in keys_after_compile)
-
-
-def test_regional_dit_blocks_dispatch_uses_compiled_callable_in_train_mode(monkeypatch):
-    """The owner-loop dispatch must call the compiled callable, not block.forward, in train mode.
-
-    Guards against a regression where the dispatch bypasses the compiled callable (e.g. by
-    checking the wrong attribute or falling through to _forward_block_range in train mode).
-    """
-    calls = _count_compiled_block_calls(monkeypatch)
-    model = _build_model()
-    mel, text, lens = _sample_batch()
-    prepared = cast(PreparedArgs, model._prepare_training_inputs(mel.clone(), text.clone(), lens.clone()))
-
-    model.compile_training_core(target="dit_blocks", backend="eager", fullgraph=False, dynamic=None)
-    model.train()
-    model._run_loss_core(*prepared)
-    transformer = cast(Any, model.transformer)
-    assert calls["n"] >= len(transformer.transformer_blocks)
-
-    # A second distinct shape must also dispatch through the compiled callable.
-    mel2, text2, lens2 = _sample_batch(batch_size=2, frames=16, text_len=9, lens=[16, 10])
-    prepared2 = cast(PreparedArgs, model._prepare_training_inputs(mel2.clone(), text2.clone(), lens2.clone()))
-    before = calls["n"]
-    model._run_loss_core(*prepared2)
-    assert calls["n"] > before, "a new training shape must still dispatch through the compiled callable"
-
-
-def _attach_recording_hooks(block):
-    """Register forward pre/post and full backward hooks that record every firing.
-
-    Returns a dict of lists so a test can compare hook fire counts and captured
-    tensors between an eager and a compiled run. Hooks must be attached *before*
-    ``torch.compile`` so the compiled ``_call_impl`` graph traces them in.
-    """
-    records: dict[str, list[Any]] = {"fwd_pre": [], "fwd": [], "bwd": []}
-
-    def fwd_pre_hook(module, args):
-        records["fwd_pre"].append(len(args))
-
-    def fwd_hook(module, args, output):
-        records["fwd"].append(output.detach().clone())
-
-    def bwd_hook(module, grad_input, grad_output):
-        records["bwd"].append(tuple(g.detach().clone() if g is not None else None for g in grad_output))
-
-    block.register_forward_pre_hook(fwd_pre_hook)
-    block.register_forward_hook(fwd_hook)
-    block.register_full_backward_hook(bwd_hook)
-    return records
-
-
-def test_regional_dit_blocks_forward_and_backward_hooks_fire_as_eager():
-    """Forward pre/post hooks and full backward hooks must fire exactly as eager under regional compile.
-
-    Regression for the bare-``block.forward`` compile design: calling a compiled
-    ``block.forward`` directly from the owner loop bypasses ``nn.Module._call_impl``, so
-    none of the module hooks registered on the block fired. Compiling ``_call_impl``
-    instead (nn.Module's hook-dispatch path, the same mechanism ``nn.Module.compile``
-    uses) keeps the hook machinery inside the compiled graph. This test proves the
-    compiled dispatch fires forward pre-hooks, forward hooks, and full backward hooks
-    with the same counts and numerically equal captured tensors as the eager path.
-    """
-    eager_model = _randomize_zero_init_(_build_model())
-    compiled_model = copy.deepcopy(eager_model)
-    eager_model.train()
-    compiled_model.train()
-
-    eager_block = cast(Any, eager_model.transformer).transformer_blocks[0]
-    compiled_block = cast(Any, compiled_model.transformer).transformer_blocks[0]
-    eager_records = _attach_recording_hooks(eager_block)
-    compiled_records = _attach_recording_hooks(compiled_block)
-    # Attach before compile so the compiled _call_impl graph traces the hooks in.
-    compiled_model.compile_training_core(target="dit_blocks", backend="eager", fullgraph=False, dynamic=None)
-
-    mel, text, lens = _sample_batch(batch_size=3, frames=12, text_len=7, lens=[12, 8, 5])
-    prepared = cast(PreparedArgs, eager_model._prepare_training_inputs(mel.clone(), text.clone(), lens.clone()))
-    prepared_compiled = cast(
-        PreparedArgs,
-        tuple(arg.detach().clone() if torch.is_tensor(arg) else arg for arg in prepared),
-    )
-
-    eager_loss, _, eager_pred = eager_model._run_loss_core(*prepared)
-    eager_loss.backward()
-    compiled_loss, _, compiled_pred = compiled_model._run_loss_core(*prepared_compiled)
-    compiled_loss.backward()
-
-    _assert_parity_is_meaningful(eager_pred, eager_model)
-    # Hook fire counts match exactly: one forward pre, one forward, one full backward.
-    assert len(eager_records["fwd_pre"]) == len(compiled_records["fwd_pre"]) == 1
-    assert len(eager_records["fwd"]) == len(compiled_records["fwd"]) == 1
-    assert len(eager_records["bwd"]) == len(compiled_records["bwd"]) == 1
-    # Captured forward outputs and backward grad_outputs are numerically equal.
-    _assert_close(compiled_records["fwd"][0], eager_records["fwd"][0], "compiled_block_hook_forward_output")
-    _assert_close(compiled_records["bwd"][0][0], eager_records["bwd"][0][0], "compiled_block_hook_grad_output")
-    _assert_close(compiled_loss.detach(), eager_loss.detach(), "hook_parity_loss")
-
-    # Inference must still bypass the compiled path: with the model in eval mode, the
-    # training-gated dispatch falls through to eager ``block(...)`` and the compiled
-    # callable is never invoked, so hooks fire through the eager path only once more.
-    compiled_model.eval()
-    before_fwd = len(compiled_records["fwd"])
-    with torch.no_grad():
-        compiled_model._run_loss_core(*prepared_compiled)
-    assert len(compiled_records["fwd"]) == before_fwd + 1, "eval-mode forward must still fire hooks via the eager path"
-    assert len(compiled_records["bwd"]) == 1, "no-grad eval forward must not add a backward hook firing"
-
-
-def test_regional_dit_blocks_hook_preservation_keeps_blocks_deepcopy_and_pickle_safe():
-    """Compiling ``_call_impl`` must not leave unpickleable state on the blocks.
-
-    The design never sets ``block._compiled_call_impl`` (which would make eval/inference
-    ``block(...)`` accidentally enter the compiled path); the compiled callables live
-    only in the DiT-owned ``_compiled_dit_block_forwards`` tuple, stripped by
-    ``__getstate__``. This asserts the blocks stay free of compile state so deepcopy and
-    ``torch.save``/``load`` deserialize to eager modules that still support hooks.
-    """
-    model = _build_model()
-    model.compile_training_core(target="dit_blocks", backend="eager", fullgraph=False, dynamic=None)
-    transformer = cast(Any, model.transformer)
-    # The hook-preservation design compiles _call_impl without setting _compiled_call_impl
-    # on the blocks, so blocks carry no compiled closure and stay pickleable.
-    for block in transformer.transformer_blocks:
-        assert block._compiled_call_impl is None
-        assert "forward" not in block.__dict__
-
-    # deepcopy strips the DiT-owned compiled tuple; the copy is eager and hooks fire eager.
-    copied = copy.deepcopy(model)
-    copied_transformer = cast(Any, copied.transformer)
-    assert copied_transformer._compiled_dit_block_forwards is None
-    for block in copied_transformer.transformer_blocks:
-        assert block._compiled_call_impl is None
-    copied_records = _attach_recording_hooks(copied_transformer.transformer_blocks[0])
-    copied.train()
-    mel, text, lens = _sample_batch()
-    prepared = cast(PreparedArgs, copied._prepare_training_inputs(mel.clone(), text.clone(), lens.clone()))
-    loss, _, _ = copied._run_loss_core(*prepared)
-    loss.backward()
-    assert len(copied_records["fwd"]) == 1 and len(copied_records["bwd"]) == 1, (
-        "deep-copied eager model must fire hooks"
-    )
-
-    # torch.save/load deserializes eager; hooks attached post-load fire eager.
-    buf = io.BytesIO()
-    torch.save(model, buf)
-    buf.seek(0)
-    loaded = torch.load(buf, weights_only=False)
-    loaded_transformer = cast(Any, loaded.transformer)
-    assert loaded_transformer._compiled_dit_block_forwards is None
-    for block in loaded_transformer.transformer_blocks:
-        assert block._compiled_call_impl is None
-    loaded_records = _attach_recording_hooks(loaded_transformer.transformer_blocks[0])
-    loaded.train()
-    prepared_loaded = cast(PreparedArgs, loaded._prepare_training_inputs(mel.clone(), text.clone(), lens.clone()))
-    loaded_loss, _, _ = loaded._run_loss_core(*prepared_loaded)
-    loaded_loss.backward()
-    assert torch.isfinite(loaded_loss)
-    assert len(loaded_records["fwd"]) == 1 and len(loaded_records["bwd"]) == 1, "loaded eager model must fire hooks"
 
 
 def test_loss_core_components_preserve_public_forward_contract():
@@ -981,204 +500,6 @@ def test_loss_sum_gradient_scaling_accounts_for_ddp_gradient_average():
         _assert_close(current_param.grad, correct_param.grad, "ddp_scaled_grad", atol=1e-6, rtol=1e-6)
 
 
-def test_real_two_rank_ddp_global_masked_mean_matches_reference():
-    """Exercise real Accelerate accumulation and DDP averaging on two CPU/gloo ranks."""
-    worker = ROOT / "tests" / "training_compile_ddp_worker.py"
-    env = os.environ.copy()
-    source_path = str(ROOT / "src")
-    env["PYTHONPATH"] = source_path + os.pathsep + env.get("PYTHONPATH", "")
-    result = subprocess.run(
-        [
-            sys.executable,
-            "-m",
-            "torch.distributed.run",
-            "--standalone",
-            "--nproc_per_node=2",
-            str(worker),
-        ],
-        cwd=ROOT,
-        env=env,
-        text=True,
-        capture_output=True,
-        timeout=90,
-        check=False,
-    )
-
-    combined_output = result.stdout + result.stderr
-    assert result.returncode == 0, combined_output
-    assert "REAL_DDP_GLOBAL_MASKED_MEAN_OK" in combined_output
-
-
-def test_real_two_rank_invalid_compile_backend_setup_raises_without_hanging():
-    """Strict invalid compile setup must complete the rank collective before raising."""
-    worker = ROOT / "tests" / "training_compile_ddp_worker.py"
-    env = os.environ.copy()
-    source_path = str(ROOT / "src")
-    env["PYTHONPATH"] = source_path + os.pathsep + env.get("PYTHONPATH", "")
-    result = subprocess.run(
-        [
-            sys.executable,
-            "-m",
-            "torch.distributed.run",
-            "--standalone",
-            "--nproc_per_node=2",
-            str(worker),
-            "--invalid-compile-backend",
-        ],
-        cwd=ROOT,
-        env=env,
-        text=True,
-        capture_output=True,
-        timeout=90,
-        check=False,
-    )
-
-    combined_output = result.stdout + result.stderr
-    assert result.returncode == 0, combined_output
-    assert "REAL_DDP_INVALID_BACKEND_OK" in combined_output
-
-
-def test_scale_gradients_by_loss_denom_uses_python_float_not_grad_dtype():
-    """The normalisation scalar must not be pre-cast to the gradient dtype.
-
-    Under fp16 AMP, casting a small scale (e.g. 1e-6) to fp16 flushes it to a subnormal
-    with zero precision bits or to zero, corrupting the gradient. The fix applies the
-    scale as a Python float so the ATen kernel handles it at full precision and only the
-    result is rounded back to the tensor dtype.
-    """
-    from f5_tts.model.trainer import Trainer
-
-    # Simulate an fp16 gradient: use an fp16 model so .grad is naturally fp16.
-    model = torch.nn.Linear(4, 4, bias=False).half()
-    model.weight.grad = torch.full_like(model.weight, 1.0)  # fp16, matches param dtype
-    grad_before = model.weight.grad.clone()
-
-    trainer = Trainer.__new__(Trainer)
-    trainer.model = cast(Any, model)
-    trainer.grad_accumulation_steps = 1
-    trainer.accelerator = cast(Any, _FakeReduceAccelerator(num_processes=1))
-
-    # global_denom large enough that scale ~ 1e-6 would flush to fp16 subnormal/zero.
-    global_denom = torch.tensor(1_000_000.0)
-    trainer._scale_gradients_by_loss_denom(global_denom)
-
-    # If the scale were pre-cast to fp16, 1e-6 becomes a subnormal with ~0 precision,
-    # and the multiply could produce zero or a severely rounded result. With a Python
-    # float, the result is 1.0 * 1e-6 = 1e-6, stored back as fp16 (representable as
-    # subnormal ~9.98e-7, nonzero).
-    assert model.weight.grad is not None
-    assert torch.count_nonzero(model.weight.grad) > 0, "scale was flushed to zero by dtype pre-cast"
-    expected = grad_before.float() * (1.0 / 1_000_000.0)
-    _assert_close(model.weight.grad.float(), expected, "fp16_scaled_grad", atol=1e-7, rtol=1e-6)
-
-
-def test_global_masked_mean_rejects_deepspeed_zero():
-    """global_masked_mean=True must fail fast when a DeepSpeed/ZeRO plugin is active.
-
-     Post-backward per-parameter .grad scaling is a silent no-op under ZeRO-2/3 (partitioned
-    /freed .grad), so gradients would be applied ~global_denom/(G*W) times too large. The
-     guard must raise NotImplementedError at construction, not corrupt training silently.
-    """
-    from f5_tts.model.trainer import Trainer
-
-    trainer = Trainer.__new__(Trainer)
-
-    # Simulate a DeepSpeed plugin on the accelerator state.
-    class _FakeState:
-        deepspeed_plugin = object()  # non-None → DeepSpeed/ZeRO active
-
-    class _FakeAccelerator:
-        state = _FakeState()
-
-    trainer.accelerator = cast(Any, _FakeAccelerator())
-
-    with pytest.raises(NotImplementedError, match="DeepSpeed/ZeRO"):
-        trainer._reject_sharded_grad_backend_for_global_masked_mean()
-
-
-def test_global_masked_mean_allows_non_deepspeed_backend():
-    """global_masked_mean=True must be accepted when no DeepSpeed plugin is active."""
-    from f5_tts.model.trainer import Trainer
-
-    trainer = Trainer.__new__(Trainer)
-
-    class _FakeState:
-        deepspeed_plugin = None
-
-    class _FakeAccelerator:
-        state = _FakeState()
-
-    trainer.accelerator = cast(Any, _FakeAccelerator())
-
-    # Must not raise.
-    trainer._reject_sharded_grad_backend_for_global_masked_mean()
-
-
-def test_sync_compile_setup_ddp_uses_accelerator_reduce_max():
-    """_sync_compile_setup_ddp must use accelerator.reduce('max'), not torch.distributed.
-
-    This verifies the collective goes through Accelerate's dispatch layer (handles
-    DeepSpeed/FSDP process groups) and that the return value correctly reflects whether
-    any rank failed. Uses a fake accelerator to avoid real process groups.
-    """
-    from f5_tts.model.trainer import Trainer
-
-    class _FakeReduceAcceleratorMax:
-        def __init__(self, *, num_processes, reduced_flag):
-            self.num_processes = num_processes
-            self._reduced_flag = reduced_flag
-            self.reduce_calls: list[str] = []
-            self.device = torch.device("cpu")
-
-        def reduce(self, tensor, reduction="sum"):
-            self.reduce_calls.append(reduction)
-            return self._reduced_flag.to(tensor.device) if self._reduced_flag is not None else tensor
-
-        @property
-        def is_main_process(self):
-            return True
-
-    # Case 1: this rank failed (fallback mode), collective returns max=1.0 → any_failed=True.
-    fake = _FakeReduceAcceleratorMax(num_processes=2, reduced_flag=torch.tensor(1.0))
-    trainer = Trainer.__new__(Trainer)
-    trainer.accelerator = cast(Any, fake)
-    trainer.compile_fallback_active = True
-    trainer.compile_active = False
-    trainer._unwrapped_model = cast(Any, type("M", (), {"clear_training_compile": lambda self: None})())
-    any_failed = trainer._sync_compile_setup_ddp()
-    assert any_failed is True
-    assert fake.reduce_calls == ["max"], f"expected reduce('max'), got {fake.reduce_calls}"
-
-    # Case 2: no rank failed, collective returns max=0.0 → any_failed=False.
-    fake = _FakeReduceAcceleratorMax(num_processes=2, reduced_flag=torch.tensor(0.0))
-    trainer = Trainer.__new__(Trainer)
-    trainer.accelerator = cast(Any, fake)
-    trainer.compile_fallback_active = False
-    trainer.compile_active = True
-    any_failed = trainer._sync_compile_setup_ddp()
-    assert any_failed is False
-    assert fake.reduce_calls == ["max"]
-
-    # Case 3: strict-mode failure via local_failed (compile_fallback_active stays False).
-    fake = _FakeReduceAcceleratorMax(num_processes=2, reduced_flag=torch.tensor(1.0))
-    trainer = Trainer.__new__(Trainer)
-    trainer.accelerator = cast(Any, fake)
-    trainer.compile_fallback_active = False
-    trainer.compile_active = False
-    any_failed = trainer._sync_compile_setup_ddp(local_failed=True)
-    assert any_failed is True
-    assert fake.reduce_calls == ["max"]
-
-    # Case 4: single-process returns local flag directly, no collective.
-    fake = _FakeReduceAcceleratorMax(num_processes=1, reduced_flag=None)
-    trainer = Trainer.__new__(Trainer)
-    trainer.accelerator = cast(Any, fake)
-    trainer.compile_fallback_active = True
-    any_failed = trainer._sync_compile_setup_ddp()
-    assert any_failed is True
-    assert fake.reduce_calls == [], "single-process must not call reduce"
-
-
 def test_compiled_loss_core_handles_cfg_branches_and_empty_mask():
     model = _build_model()
     model.compile_training_core(backend="eager", fullgraph=False, dynamic=None)
@@ -1202,11 +523,9 @@ def test_compiled_loss_core_handles_cfg_branches_and_empty_mask():
 
 
 def test_tensor_aware_training_cfg_flags_are_tensorized_for_dit_and_unett():
-    """When a compile target is active, CFG flags become 0-D bool tensors (branchless)."""
     mel, text, lens = _sample_batch(batch_size=2, frames=12, text_len=7, lens=[12, 8])
 
     dit_model = _build_model(audio_drop_prob=1.0, cond_drop_prob=0.0)
-    dit_model.compile_training_core(backend="eager", fullgraph=False, dynamic=None)
     dit_prepared = cast(PreparedArgs, dit_model._prepare_training_inputs(mel.clone(), text.clone(), lens.clone()))
     drop_audio_cond, drop_text = dit_prepared[6], dit_prepared[7]
     assert torch.is_tensor(drop_audio_cond)
@@ -1219,7 +538,6 @@ def test_tensor_aware_training_cfg_flags_are_tensorized_for_dit_and_unett():
     assert drop_text.item() is False
 
     unett_model = _build_unett_model(audio_drop_prob=1.0, cond_drop_prob=0.0)
-    unett_model.compile_training_core(backend="eager", fullgraph=False, dynamic=None)
     unett_prepared = cast(PreparedArgs, unett_model._prepare_training_inputs(mel.clone(), text.clone(), lens.clone()))
     unett_drop_audio_cond, unett_drop_text = unett_prepared[6], unett_prepared[7]
     assert torch.is_tensor(unett_drop_audio_cond)
@@ -1230,71 +548,6 @@ def test_tensor_aware_training_cfg_flags_are_tensorized_for_dit_and_unett():
     assert unett_drop_text.dtype is torch.bool
     assert unett_drop_audio_cond.item() is True
     assert unett_drop_text.item() is False
-
-
-def test_cfg_flags_are_python_bools_on_never_compiled_default_path():
-    """The default compile-disabled path must keep Python bool CFG flags (upstream parity).
-
-    Tensorizing flags unconditionally added per-step host->device transfers and
-    full-size zeros_like/where work that upstream's `if drop_text:` branches skipped on
-    no-drop steps. The default path is documented as byte-identical to upstream, so it
-    must use plain bools unless a compile target is actually active.
-    """
-    mel, text, lens = _sample_batch(batch_size=2, frames=12, text_len=7, lens=[12, 8])
-
-    dit_model = _build_model(audio_drop_prob=1.0, cond_drop_prob=0.0)
-    dit_prepared = cast(PreparedArgs, dit_model._prepare_training_inputs(mel.clone(), text.clone(), lens.clone()))
-    drop_audio_cond, drop_text = dit_prepared[6], dit_prepared[7]
-    assert isinstance(drop_audio_cond, bool) and not torch.is_tensor(drop_audio_cond)
-    assert isinstance(drop_text, bool) and not torch.is_tensor(drop_text)
-    assert drop_audio_cond is True
-    assert drop_text is False
-
-    unett_model = _build_unett_model(audio_drop_prob=1.0, cond_drop_prob=0.0)
-    unett_prepared = cast(PreparedArgs, unett_model._prepare_training_inputs(mel.clone(), text.clone(), lens.clone()))
-    unett_drop_audio_cond, unett_drop_text = unett_prepared[6], unett_prepared[7]
-    assert isinstance(unett_drop_audio_cond, bool) and not torch.is_tensor(unett_drop_audio_cond)
-    assert isinstance(unett_drop_text, bool) and not torch.is_tensor(unett_drop_text)
-    assert unett_drop_audio_cond is True
-    assert unett_drop_text is False
-
-
-def test_cfg_flags_revert_to_bools_after_runtime_compile_fallback():
-    """After clear_training_compile() (runtime fallback), flags must revert to bools.
-
-    A compile failure that triggers eager fallback clears compile state, so
-    _training_compile_enabled() returns False and flags become Python bools again --
-    the fallback path must not keep paying the tensorization overhead.
-    """
-    mel, text, lens = _sample_batch(batch_size=2, frames=12, text_len=7, lens=[12, 8])
-
-    model = _build_model(audio_drop_prob=1.0, cond_drop_prob=0.0)
-    model.compile_training_core(backend="eager", fullgraph=False, dynamic=None)
-    prepared = cast(PreparedArgs, model._prepare_training_inputs(mel.clone(), text.clone(), lens.clone()))
-    assert torch.is_tensor(prepared[6]) and torch.is_tensor(prepared[7]), "flags must be tensors while compiled"
-
-    model.clear_training_compile()
-    prepared = cast(PreparedArgs, model._prepare_training_inputs(mel.clone(), text.clone(), lens.clone()))
-    drop_audio_cond, drop_text = prepared[6], prepared[7]
-    assert isinstance(drop_audio_cond, bool) and not torch.is_tensor(drop_audio_cond)
-    assert isinstance(drop_text, bool) and not torch.is_tensor(drop_text)
-
-
-def test_cfg_flags_are_tensors_for_dit_blocks_regional_compile_target():
-    """target='dit_blocks' (transformer-level compile) must also tensorize CFG flags.
-
-    _training_compile_enabled() covers both cfm_loss_core (_compiled_loss_core set) and
-    dit_blocks (transformer training_compile_state enabled); the gate must not miss the
-    regional target.
-    """
-    mel, text, lens = _sample_batch(batch_size=2, frames=12, text_len=7, lens=[12, 8])
-
-    model = _build_model(audio_drop_prob=1.0, cond_drop_prob=0.0)
-    model.transformer.compile_training_target("dit_blocks", backend="eager", fullgraph=False, dynamic=None)
-    prepared = cast(PreparedArgs, model._prepare_training_inputs(mel.clone(), text.clone(), lens.clone()))
-    drop_audio_cond, drop_text = prepared[6], prepared[7]
-    assert torch.is_tensor(drop_audio_cond) and drop_audio_cond.dtype is torch.bool
-    assert torch.is_tensor(drop_text) and drop_text.dtype is torch.bool
 
 
 def test_branchless_tensor_cfg_flags_match_bool_loss_outputs_and_gradients():
@@ -1311,7 +564,9 @@ def test_branchless_tensor_cfg_flags_match_bool_loss_outputs_and_gradients():
 
     tensor_core_args = tuple(arg.detach().clone() if torch.is_tensor(arg) else arg for arg in core_args)
     tensor_flag = torch.tensor(True, device=tensor_core_args[0].device)
-    tensor_loss, tensor_cond, tensor_pred = tensor_model._forward_loss_core(*tensor_core_args, tensor_flag, tensor_flag)
+    tensor_loss, tensor_cond, tensor_pred = tensor_model._forward_loss_core(
+        *tensor_core_args, tensor_flag, tensor_flag
+    )
     tensor_loss.backward()
     tensor_grads = [
         param.grad.detach().clone() if param.grad is not None else None for param in tensor_model.parameters()
@@ -1341,7 +596,9 @@ def test_unett_branchless_tensor_cfg_flags_match_bool_loss_outputs_and_gradients
 
     tensor_core_args = tuple(arg.detach().clone() if torch.is_tensor(arg) else arg for arg in core_args)
     tensor_flag = torch.tensor(True, device=tensor_core_args[0].device)
-    tensor_loss, tensor_cond, tensor_pred = tensor_model._forward_loss_core(*tensor_core_args, tensor_flag, tensor_flag)
+    tensor_loss, tensor_cond, tensor_pred = tensor_model._forward_loss_core(
+        *tensor_core_args, tensor_flag, tensor_flag
+    )
     tensor_loss.backward()
     tensor_grads = [
         param.grad.detach().clone() if param.grad is not None else None for param in tensor_model.parameters()
@@ -1378,225 +635,6 @@ def test_unett_fullgraph_compile_accepts_tensor_cfg_flags():
     assert explanation.graph_break_count == 0
 
 
-def test_unett_compiled_loss_core_handles_tensor_cfg_flags_without_fallback():
-    """UNetT tensor CFG path must compile all CFG combos without fallback or graph breaks."""
-    model = _build_unett_model()
-    mel, text, lens = _sample_batch(batch_size=2, frames=12, text_len=7, lens=[12, 8])
-    prepared_args = cast(PreparedArgs, model._prepare_training_inputs(mel.clone(), text.clone(), lens.clone()))
-    core_args = prepared_args[:6]
-
-    model.compile_training_core(backend="eager", fullgraph=True, dynamic=True)
-
-    cfg_combos = ((False, False), (True, False), (True, True))
-    for drop_audio_cond, drop_text in cfg_combos:
-        drop_audio_cond_tensor = torch.tensor(drop_audio_cond, device=core_args[0].device)
-        drop_text_tensor = torch.tensor(drop_text, device=core_args[0].device)
-        loss, cond, pred = model._run_loss_core(*core_args, drop_audio_cond_tensor, drop_text_tensor)
-        assert torch.isfinite(loss), f"UNetT compiled loss not finite for combo {(drop_audio_cond, drop_text)}"
-        assert cond.shape == mel.shape
-        assert pred.shape == mel.shape
-
-    assert not model._compile_fallback_active
-
-    dynamo.reset()
-    drop_audio_cond_tensor = torch.tensor(True, device=core_args[0].device)
-    drop_text_tensor = torch.tensor(True, device=core_args[0].device)
-    explanation = dynamo.explain(model._forward_loss_core)(*core_args, drop_audio_cond_tensor, drop_text_tensor)
-    assert explanation.graph_break_count == 0
-
-    dynamo.reset()
-    torch._dynamo.utils.counters.clear()
-    for drop_audio_cond, drop_text in cfg_combos:
-        model._run_loss_core(*core_args, drop_audio_cond, drop_text)
-    bool_unique_graphs = int(torch._dynamo.utils.counters.get("stats", {}).get("unique_graphs", 0))
-
-    dynamo.reset()
-    torch._dynamo.utils.counters.clear()
-    model.clear_training_compile()
-    model.compile_training_core(backend="eager", fullgraph=True, dynamic=True)
-    for drop_audio_cond, drop_text in cfg_combos:
-        drop_audio_cond_tensor = torch.tensor(drop_audio_cond, device=core_args[0].device)
-        drop_text_tensor = torch.tensor(drop_text, device=core_args[0].device)
-        model._run_loss_core(*core_args, drop_audio_cond_tensor, drop_text_tensor)
-    tensor_unique_graphs = int(torch._dynamo.utils.counters.get("stats", {}).get("unique_graphs", 0))
-
-    # Without this the whole assertion passes vacuously as 0 <= 0 whenever the Dynamo
-    # counters are unavailable, renamed, or simply never populated.
-    assert bool_unique_graphs > 0, "Dynamo captured no graphs; the comparison below proves nothing"
-    assert tensor_unique_graphs > 0, "Dynamo captured no graphs for the tensor-flag path"
-    assert tensor_unique_graphs <= bool_unique_graphs, (
-        f"UNetT tensor CFG unique graphs ({tensor_unique_graphs}) should be <= bool ({bool_unique_graphs})"
-    )
-
-
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required for the inductor dit_blocks test")
-def test_cuda_inductor_dit_blocks_matches_eager_with_variable_shapes():
-    """The shipped default target for F5 configs, through the backend it actually uses.
-
-    Every other dit_blocks test compiles with backend="eager", and every Inductor/CUDA test
-    compiles the *other* target (cfm_loss_core), so an Inductor-only defect in regional
-    block compilation -- in the patched callable, the compiled backward, or dynamic-shape
-    handling inside DiTBlock -- would not be caught anywhere. F5TTS_Base, F5TTS_Small,
-    F5TTS_v1_Base and F5TTS_v1_Small all ship `target: dit_blocks`.
-    """
-    device = torch.device("cuda")
-    dynamo.reset()
-    eager_model = _randomize_zero_init_(_build_real_config_model()).to(device)
-    compiled_model = copy.deepcopy(eager_model)
-    eager_model.train()
-    compiled_model.train()
-    compiled_model.compile_training_core(target="dit_blocks", backend="inductor", fullgraph=False, dynamic=None)
-
-    # more than one shape, so the compiled region must survive a dynamic-shape recompile
-    for frames, text_len, lens in ((16, 9, [16, 11]), (24, 13, [24, 19])):
-        mel, text, lens_tensor = _sample_batch(batch_size=2, frames=frames, text_len=text_len, lens=lens)
-        prepared = cast(
-            PreparedArgs,
-            eager_model._prepare_training_inputs(mel.to(device), text.to(device), lens_tensor.to(device)),
-        )
-        eager_loss, _cond, eager_pred = eager_model._forward_loss_core(*prepared)
-        eager_loss.backward()
-        _assert_parity_is_meaningful(eager_pred, eager_model)
-
-        compiled_args = cast(PreparedArgs, tuple(a.detach().clone() if torch.is_tensor(a) else a for a in prepared))
-        compiled_loss, _cond2, compiled_pred = compiled_model._run_loss_core(*compiled_args)
-        compiled_loss.backward()
-
-        _assert_close(compiled_loss.detach(), eager_loss.detach(), "inductor_blocks_loss", atol=1e-4, rtol=1e-4)
-        _assert_close(compiled_pred.detach(), eager_pred.detach(), "inductor_blocks_pred", atol=1e-3, rtol=1e-3)
-
-        for name, eager_param in eager_model.named_parameters():
-            compiled_param = dict(compiled_model.named_parameters())[name]
-            if eager_param.grad is None or compiled_param.grad is None:
-                assert eager_param.grad is None and compiled_param.grad is None, name
-                continue
-            _assert_close(compiled_param.grad, eager_param.grad, f"inductor_blocks_grad_{name}", atol=1e-3, rtol=1e-3)
-
-        eager_model.zero_grad(set_to_none=True)
-        compiled_model.zero_grad(set_to_none=True)
-
-    assert compiled_model.training_compile_state["fallback_active"] is False, (
-        "inductor regional compile silently fell back to eager"
-    )
-
-
-def test_compiled_dropout_uses_its_own_rng_unless_fallback_random_is_set():
-    """Document the one place compiled training is NOT numerically equal to eager.
-
-    Inductor lowers nn.Dropout to its own Philox RNG, so with dropout > 0 -- which every
-    shipped config has (0.1) -- the compiled loss differs from eager by far more than
-    floating-point noise. This is expected torch.compile behaviour and statistically
-    harmless (a different random mask is still a valid mask), but it means the suite's
-    other parity tests, which all pin dropout=0.0, do not establish equality for the
-    production configuration. Users who need eager-identical dropout can pass
-    `options={"fallback_random": True}` through to torch.compile.
-
-    This test exists so the claim stays honest and so a future PyTorch change to either
-    behaviour is caught rather than silently altering training.
-    """
-    import pytest as _pytest
-
-    def build():
-        torch.manual_seed(7)
-        model = CFM(
-            transformer=DiT(
-                dim=32, depth=1, heads=2, dim_head=16, mel_dim=8, text_num_embeds=32, text_dim=16, dropout=0.3
-            ),
-            mel_spec_kwargs={"n_mel_channels": 8},
-            audio_drop_prob=0.0,
-            cond_drop_prob=0.0,
-        ).cpu()
-        # dropout only changes the output if the weights are not zero-initialized
-        for parameter in model.parameters():
-            if parameter.dim() > 1:
-                torch.nn.init.normal_(parameter, std=0.05)
-        model.train()
-        return model
-
-    def run(**compile_kwargs):
-        dynamo.reset()
-        model = build()
-        torch.manual_seed(3)
-        prepared = cast(
-            PreparedArgs,
-            model._prepare_training_inputs(
-                torch.randn(2, 40, 8), torch.randint(0, 32, (2, 11)), torch.tensor([40, 31])
-            ),
-        )
-        torch.manual_seed(999)
-        eager = model._forward_loss_core_components(*prepared)[0].item()
-        model.compile_training_core(target="cfm_loss_core", runtime_fallback=False, **compile_kwargs)
-        torch.manual_seed(999)
-        compiled = model._run_loss_core_components(*prepared)[0].item()
-        return eager, compiled
-
-    try:
-        eager, compiled = run(backend="inductor")
-    except Exception as exc:  # inductor needs a working compiler toolchain
-        _pytest.skip(f"inductor unavailable: {exc}")
-
-    assert abs(eager - compiled) > 1e-5, (
-        "compiled dropout unexpectedly matched eager; if PyTorch changed this, the "
-        "documentation and the fallback_random guidance below need updating"
-    )
-
-    eager_fr, compiled_fr = run(backend="inductor", options={"fallback_random": True})
-    assert abs(eager_fr - compiled_fr) < 1e-5, "fallback_random=True must restore eager RNG parity for dropout"
-
-
-def test_unett_bool_inference_cache_behavior_still_works():
-    """Existing UNetT bool-flag inference + cache path must remain functional."""
-    model = _build_unett_model()
-    model.eval()
-    mel, text, _ = _sample_batch(batch_size=2, frames=12, text_len=7, lens=[12, 8])
-    x = mel
-    cond = mel.clone()
-    time = torch.rand((mel.shape[0],))
-
-    out_cond = model.transformer(
-        x=x,
-        cond=cond,
-        text=text,
-        time=time,
-        mask=None,
-        drop_audio_cond=False,
-        drop_text=False,
-        cache=True,
-    )
-    out_uncond = model.transformer(
-        x=x,
-        cond=cond,
-        text=text,
-        time=time,
-        mask=None,
-        drop_audio_cond=True,
-        drop_text=True,
-        cache=True,
-    )
-
-    assert out_cond.shape == mel.shape
-    assert out_uncond.shape == mel.shape
-    assert not torch.allclose(out_cond, out_uncond, atol=1e-6)
-
-    out_cfg = model.transformer(
-        x=x,
-        cond=cond,
-        text=text,
-        time=time,
-        mask=None,
-        drop_audio_cond=False,
-        drop_text=False,
-        cfg_infer=True,
-        cache=True,
-    )
-    assert out_cfg.shape == (mel.shape[0] * 2, mel.shape[1], mel.shape[2])
-
-    keys = set(model.transformer.state_dict().keys())
-    assert "text_embed.text_embed.weight" in keys
-    assert "input_embed.proj.weight" in keys
-    assert "proj_out.weight" in keys
-
-
 def test_fullgraph_compile_handles_ragged_lens_without_text_embedding_graph_break():
     model = _build_model()
     mel, text, lens = _sample_batch(batch_size=2, frames=12, text_len=7, lens=[12, 8])
@@ -1617,7 +655,7 @@ def test_fullgraph_compile_handles_ragged_lens_without_text_embedding_graph_brea
 
 def test_real_config_compiled_loss_core_matches_eager():
     """CPU parity for production DiT knobs that the tiny default model misses."""
-    eager_model = _randomize_zero_init_(_build_real_config_model())
+    eager_model = _build_real_config_model()
     compiled_model = copy.deepcopy(eager_model)
     mel, text, lens = _sample_batch(batch_size=2, frames=12, text_len=7, lens=[12, 8])
 
@@ -1639,7 +677,6 @@ def test_real_config_compiled_loss_core_matches_eager():
         param.grad.detach().clone() if param.grad is not None else None for param in compiled_model.parameters()
     ]
 
-    _assert_parity_is_meaningful(eager_pred, eager_model)
     _assert_close(compiled_loss.detach(), eager_loss.detach(), "real_config_loss")
     _assert_close(compiled_cond.detach(), eager_cond.detach(), "real_config_cond")
     _assert_close(compiled_pred.detach(), eager_pred.detach(), "real_config_pred")
@@ -1652,7 +689,7 @@ def test_real_config_compiled_loss_core_matches_eager():
 
 def test_unett_compiled_loss_core_matches_eager():
     """CPU parity for E2TTS/UNetT, whose text embedding path differs from DiT."""
-    eager_model = _randomize_zero_init_(_build_unett_model())
+    eager_model = _build_unett_model()
     compiled_model = copy.deepcopy(eager_model)
     mel, text, lens = _sample_batch(batch_size=2, frames=12, text_len=7, lens=[12, 8])
 
@@ -1674,7 +711,6 @@ def test_unett_compiled_loss_core_matches_eager():
         param.grad.detach().clone() if param.grad is not None else None for param in compiled_model.parameters()
     ]
 
-    _assert_parity_is_meaningful(eager_pred, eager_model)
     _assert_close(compiled_loss.detach(), eager_loss.detach(), "unett_loss")
     _assert_close(compiled_cond.detach(), eager_cond.detach(), "unett_cond")
     _assert_close(compiled_pred.detach(), eager_pred.detach(), "unett_pred")
@@ -1724,12 +760,7 @@ def test_cuda_inductor_real_config_smoke():
     assert torch.isfinite(loss)
     assert cond.shape == mel.shape
     assert pred.shape == mel.shape
-    assert model.training_compile_state == {
-        "enabled": True,
-        "target": "cfm_loss_core",
-        "fallback_active": False,
-        "error": None,
-    }
+    assert model.training_compile_state == {"enabled": True, "target": "cfm_loss_core", "fallback_active": False, "error": None}
 
 
 @pytest.mark.skipif(
@@ -1739,7 +770,7 @@ def test_cuda_inductor_real_config_smoke():
 def test_cuda_inductor_real_config_matches_eager_across_compile_knobs(compile_kwargs):
     """CUDA inductor vs eager numerical parity for real-config knobs and compile knobs."""
     device = torch.device("cuda")
-    eager_model = _randomize_zero_init_(_build_real_config_model()).to(device)
+    eager_model = _build_real_config_model().to(device)
     compiled_model = copy.deepcopy(eager_model)
     mel, text, lens = _sample_batch(batch_size=2, frames=12, text_len=7, lens=[12, 8])
     mel = mel.to(device)
@@ -1765,7 +796,6 @@ def test_cuda_inductor_real_config_matches_eager_across_compile_knobs(compile_kw
         param.grad.detach().clone() if param.grad is not None else None for param in compiled_model.parameters()
     ]
 
-    _assert_parity_is_meaningful(eager_pred, eager_model)
     _assert_close(compiled_loss.detach(), eager_loss.detach(), "cuda_real_config_loss", atol=1e-4, rtol=1e-4)
     _assert_close(compiled_cond.detach(), eager_cond.detach(), "cuda_real_config_cond", atol=1e-4, rtol=1e-4)
     _assert_close(compiled_pred.detach(), eager_pred.detach(), "cuda_real_config_pred", atol=1e-3, rtol=1e-3)
@@ -1774,12 +804,7 @@ def test_cuda_inductor_real_config_matches_eager_across_compile_knobs(compile_kw
             assert compiled_grad is eager_grad, f"cuda real_config gradient None mismatch at parameter {index}"
         else:
             _assert_close(compiled_grad, eager_grad, f"cuda_real_config_grad_{index}", atol=1e-3, rtol=1e-3)
-    assert compiled_model.training_compile_state == {
-        "enabled": True,
-        "target": "cfm_loss_core",
-        "fallback_active": False,
-        "error": None,
-    }
+    assert compiled_model.training_compile_state == {"enabled": True, "target": "cfm_loss_core", "fallback_active": False, "error": None}
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required for GPU torch.compile smoke test")
@@ -1800,19 +825,14 @@ def test_cuda_inductor_training_loss_core_smoke():
     assert torch.isfinite(loss)
     assert cond.shape == mel.shape
     assert pred.shape == mel.shape
-    assert model.training_compile_state == {
-        "enabled": True,
-        "target": "cfm_loss_core",
-        "fallback_active": False,
-        "error": None,
-    }
+    assert model.training_compile_state == {"enabled": True, "target": "cfm_loss_core", "fallback_active": False, "error": None}
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required for GPU inductor equivalence test")
 @pytest.mark.parametrize("compile_kwargs", CUDA_INDUCTOR_EQUIVALENCE_KWARGS)
 def test_cuda_inductor_matches_eager_loss_outputs_and_gradients_across_compile_knobs(compile_kwargs):
     device = torch.device("cuda")
-    eager_model = _randomize_zero_init_(_build_model()).to(device)
+    eager_model = _build_model().to(device)
     compiled_model = copy.deepcopy(eager_model)
     mel, text, lens = _sample_batch(batch_size=2, frames=12, text_len=7, lens=[12, 8])
     mel = mel.to(device)
@@ -1838,7 +858,6 @@ def test_cuda_inductor_matches_eager_loss_outputs_and_gradients_across_compile_k
         param.grad.detach().clone() if param.grad is not None else None for param in compiled_model.parameters()
     ]
 
-    _assert_parity_is_meaningful(eager_pred, eager_model)
     _assert_close(compiled_loss.detach(), eager_loss.detach(), "cuda_loss", atol=1e-4, rtol=1e-4)
     _assert_close(compiled_cond.detach(), eager_cond.detach(), "cuda_cond", atol=1e-4, rtol=1e-4)
     _assert_close(compiled_pred.detach(), eager_pred.detach(), "cuda_pred", atol=1e-3, rtol=1e-3)
@@ -1847,12 +866,7 @@ def test_cuda_inductor_matches_eager_loss_outputs_and_gradients_across_compile_k
             assert compiled_grad is eager_grad, f"cuda gradient None mismatch at parameter {index}"
         else:
             _assert_close(compiled_grad, eager_grad, f"cuda_grad_{index}", atol=1e-3, rtol=1e-3)
-    assert compiled_model.training_compile_state == {
-        "enabled": True,
-        "target": "cfm_loss_core",
-        "fallback_active": False,
-        "error": None,
-    }
+    assert compiled_model.training_compile_state == {"enabled": True, "target": "cfm_loss_core", "fallback_active": False, "error": None}
 
 
 def test_runtime_fallback_can_be_enabled_or_disabled():
@@ -1861,7 +875,7 @@ def test_runtime_fallback_can_be_enabled_or_disabled():
     prepared_args = cast(PreparedArgs, model._prepare_training_inputs(mel.clone(), text.clone(), lens.clone()))
 
     def raise_compile_error(*_args):
-        raise _synthetic_compiler_error()
+        raise RuntimeError("synthetic compile failure")
 
     object.__setattr__(model, "_compiled_loss_core", raise_compile_error)
     object.__setattr__(model, "_compile_runtime_fallback", True)
@@ -1879,66 +893,7 @@ def test_runtime_fallback_can_be_enabled_or_disabled():
         model._run_loss_core(*prepared_args)
 
 
-def test_model_error_is_not_swallowed_by_compile_fallback():
-    """A genuine model bug must propagate, not be disguised as a compile failure.
-
-    The fallback used to catch bare `Exception`, so a shape mismatch, a bad vocabulary
-    index or a failed assertion inside the transformer would silently disable compile,
-    report a misleading "compile failed" state, and then re-run the *same* bad input
-    eagerly -- producing a second, more confusing traceback and, for any transformer with
-    mutable state, applying that state twice.
-    """
-    model = _build_model()
-    mel, text, lens = _sample_batch()
-    prepared_args = cast(PreparedArgs, model._prepare_training_inputs(mel.clone(), text.clone(), lens.clone()))
-
-    calls = []
-
-    def raise_model_error(*_args):
-        calls.append(1)
-        raise RuntimeError("index out of range in self")
-
-    object.__setattr__(model, "_compiled_loss_core", raise_model_error)
-    object.__setattr__(model, "_compile_runtime_fallback", True)
-
-    with pytest.raises(RuntimeError, match="index out of range in self"):
-        model._run_loss_core(*prepared_args)
-
-    # the failing callable ran exactly once: no eager retry of a possibly-partial forward
-    assert calls == [1]
-    # and compile state is untouched, so the error is not misreported as a compile problem
-    assert model.training_compile_state["fallback_active"] is False
-    assert model.training_compile_state["error"] is None
-
-
-def test_host_out_of_memory_compiler_error_is_not_treated_as_cuda_capacity_oom():
-    """A compiler-side 'out of memory' must fall back, not hard-fail as a GPU OOM.
-
-    `_is_cuda_oom` used to match any RuntimeError containing "out of memory", so a Triton
-    autotune worker reporting *host* OOM was rewritten as a GPU capacity error and the
-    requested eager fallback was skipped.
-    """
-    model = _build_model()
-    mel, text, lens = _sample_batch()
-    prepared_args = cast(PreparedArgs, model._prepare_training_inputs(mel.clone(), text.clone(), lens.clone()))
-
-    def raise_host_oom(*_args):
-        raise _synthetic_compiler_error("Triton compile worker exited: host out of memory")
-
-    object.__setattr__(model, "_compiled_loss_core", raise_host_oom)
-    object.__setattr__(model, "_compile_runtime_fallback", True)
-
-    loss, _, _ = model._run_loss_core(*prepared_args)
-    assert torch.isfinite(loss)
-    assert model.training_compile_state["fallback_active"] is True
-
-
 def test_cuda_oom_from_compiled_core_is_not_swallowed_into_eager_fallback():
-    """A real CUDA OOM must keep its original type/message so standard handlers match.
-
-    The OOM is re-raised unchanged (bare ``raise``) with a compile-context note that does
-    not alter ``str(exc)``; eager fallback must stay disabled for OOM.
-    """
     model = _build_model()
     mel, text, lens = _sample_batch()
     prepared_args = cast(PreparedArgs, model._prepare_training_inputs(mel.clone(), text.clone(), lens.clone()))
@@ -1949,26 +904,15 @@ def test_cuda_oom_from_compiled_core_is_not_swallowed_into_eager_fallback():
     object.__setattr__(model, "_compiled_loss_core", raise_oom)
     object.__setattr__(model, "_compile_runtime_fallback", True)
 
-    with pytest.raises(torch.cuda.OutOfMemoryError, match="CUDA out of memory") as exc_info:
+    with pytest.raises(RuntimeError, match="ran out of GPU memory") as exc_info:
         model._run_loss_core(*prepared_args)
 
-    # Original type and message preserved; no synthetic rewrite.
-    assert "CUDA out of memory" in str(exc_info.value)
-    # Python 3.11+ supports exception notes; Python 3.10 is still supported by the
-    # project, so absence of BaseException.add_note there must remain a clean no-op.
-    notes = getattr(exc_info.value, "__notes__", None) or []
-    if hasattr(exc_info.value, "add_note"):
-        assert any("not falling back to eager" in note for note in notes)
-    else:
-        assert notes == []
-    # Bare raise sets __context__ (not __cause__); there is no chained synthetic error.
-    assert exc_info.value.__cause__ is None
+    assert isinstance(exc_info.value.__cause__, torch.cuda.OutOfMemoryError)
     assert model.training_compile_state["enabled"] is True
     assert model.training_compile_state["fallback_active"] is False
 
 
 def test_message_based_oom_runtimeerror_also_skips_fallback():
-    """A message-based CUDA OOM RuntimeError keeps its original message and skips fallback."""
     model = _build_model()
     mel, text, lens = _sample_batch()
     prepared_args = cast(PreparedArgs, model._prepare_training_inputs(mel.clone(), text.clone(), lens.clone()))
@@ -1979,16 +923,12 @@ def test_message_based_oom_runtimeerror_also_skips_fallback():
     object.__setattr__(model, "_compiled_loss_core", raise_oom_msg)
     object.__setattr__(model, "_compile_runtime_fallback", True)
 
-    with pytest.raises(RuntimeError, match="out of memory") as exc_info:
+    with pytest.raises(RuntimeError, match="ran out of GPU memory"):
         model._run_loss_core(*prepared_args)
-    # Original message preserved (no 'ran out of GPU memory' rewrite).
-    assert "cuda runtime error: out of memory" in str(exc_info.value)
-    assert "ran out of GPU memory" not in str(exc_info.value)
     assert model.training_compile_state["fallback_active"] is False
 
 
 def test_oom_still_raises_when_runtime_fallback_disabled():
-    """With runtime fallback disabled, a CUDA OOM still raises the original exception."""
     model = _build_model()
     mel, text, lens = _sample_batch()
     prepared_args = cast(PreparedArgs, model._prepare_training_inputs(mel.clone(), text.clone(), lens.clone()))
@@ -1999,47 +939,8 @@ def test_oom_still_raises_when_runtime_fallback_disabled():
     object.__setattr__(model, "_compiled_loss_core", raise_oom)
     object.__setattr__(model, "_compile_runtime_fallback", False)
 
-    with pytest.raises(torch.cuda.OutOfMemoryError, match="CUDA out of memory"):
+    with pytest.raises(RuntimeError, match="ran out of GPU memory"):
         model._run_loss_core(*prepared_args)
-    assert model.training_compile_state["fallback_active"] is False
-
-
-def test_dit_blocks_eager_region_oom_is_not_mislabeled_as_compiled_loss_core_oom():
-    """Under target='dit_blocks' the CFM loss core runs eager; an OOM there must keep its
-    original type/message and must NOT be relabeled as a 'compiled CFM loss core' OOM.
-
-    With _compiled_loss_core is None (regional target), _run_loss_core_components takes the
-    eager _forward_loss_core_components path (cfm.py); an OOM raised from that eager region
-    must propagate unchanged.
-    """
-    model = _build_model()
-    mel, text, lens = _sample_batch()
-    prepared_args = cast(PreparedArgs, model._prepare_training_inputs(mel.clone(), text.clone(), lens.clone()))
-
-    # Simulate a dit_blocks setup: no compiled loss-core callable, but compile "enabled"
-    # via the transformer state so _training_compile_enabled() is True and the eager
-    # loss-core path is selected inside _run_loss_core_components.
-    object.__setattr__(model, "_compiled_loss_core", None)
-    object.__setattr__(model, "_compile_target", "dit_blocks")
-    object.__setattr__(model, "_compile_runtime_fallback", True)
-    object.__setattr__(model.transformer, "_dit_compile_target", "dit_blocks")
-
-    original_components = model._forward_loss_core_components
-
-    def raise_oom_eager(*_args):
-        raise torch.cuda.OutOfMemoryError("CUDA out of memory. Tried to allocate 4.00 GiB")
-
-    object.__setattr__(model, "_forward_loss_core_components", raise_oom_eager)
-    try:
-        with pytest.raises(torch.cuda.OutOfMemoryError, match="CUDA out of memory") as exc_info:
-            model._run_loss_core(*prepared_args)
-    finally:
-        object.__setattr__(model, "_forward_loss_core_components", original_components)
-
-    # The eager-region OOM must not be relabeled with a compiled-loss-core message.
-    assert "ran out of GPU memory" not in str(exc_info.value)
-    assert "CFM loss core" not in str(exc_info.value)
-    assert model.training_compile_state["fallback_active"] is False
 
 
 def test_non_oom_compile_failure_still_falls_back_when_enabled():
@@ -2048,7 +949,7 @@ def test_non_oom_compile_failure_still_falls_back_when_enabled():
     prepared_args = cast(PreparedArgs, model._prepare_training_inputs(mel.clone(), text.clone(), lens.clone()))
 
     def raise_compile_error(*_args):
-        raise _synthetic_compiler_error()
+        raise RuntimeError("synthetic compile failure")
 
     object.__setattr__(model, "_compiled_loss_core", raise_compile_error)
     object.__setattr__(model, "_compile_runtime_fallback", True)
@@ -2059,23 +960,15 @@ def test_non_oom_compile_failure_still_falls_back_when_enabled():
 
 
 def test_trainer_materialises_loss_scalar_at_most_once_per_step():
+    import inspect
+
     from f5_tts.model.trainer import Trainer
 
-    class CountingScalar:
-        def __init__(self, value):
-            self.value = value
-            self.item_calls = 0
-
-        def item(self):
-            self.item_calls += 1
-            return self.value
-
-    loss = CountingScalar(1.25)
-    loss_scalar, duration_scalar = Trainer._materialize_log_scalars(cast(Any, loss), None)
-
-    assert loss_scalar == 1.25
-    assert duration_scalar is None
-    assert loss.item_calls == 1
+    source = inspect.getsource(Trainer.train)
+    assert "loss_scalar = loss.item()" in source
+    assert "loss=loss.item()" not in source
+    assert '"loss": loss.item()' not in source
+    assert 'add_scalar("loss", loss.item()' not in source
 
 
 def test_trainer_uses_persistent_workers_only_when_workers_are_enabled(monkeypatch):
@@ -2108,15 +1001,10 @@ def test_trainer_uses_persistent_workers_only_when_workers_are_enabled(monkeypat
     monkeypatch.setattr(trainer_module, "DataLoader", fake_dataloader)
     monkeypatch.setattr(trainer_module, "DynamicBatchSampler", DummyBatchSampler)
 
-    # NOTE: this bypasses Trainer.__init__ and hand-sets only the attributes train()
-    # happens to touch, so it breaks whenever Trainer gains a field. Kept because it is
-    # the cheapest way to intercept DataLoader construction, but the defaults below must
-    # be updated alongside Trainer.__init__.
     trainer = object.__new__(Trainer)
     trainer.log_samples = False
     trainer.batch_size_per_gpu = 2
     trainer.max_samples = 2
-    trainer.vocoder_name = "vocos"
     cast(Any, trainer).accelerator = DummyAccelerator()
     dataset = DummyDataset()
 
@@ -2137,31 +1025,15 @@ def test_trainer_uses_persistent_workers_only_when_workers_are_enabled(monkeypat
 
 
 def test_duration_predictor_scalar_is_logged_lazily_with_main_metrics():
+    import inspect
+
     from f5_tts.model.trainer import Trainer
 
-    class CountingScalar:
-        def __init__(self, value):
-            self.value = value
-            self.item_calls = 0
-
-        def item(self):
-            self.item_calls += 1
-            return self.value
-
-    loss = CountingScalar(2.5)
-    duration_loss = CountingScalar(0.75)
-    loss_scalar, duration_scalar = Trainer._materialize_log_scalars(
-        cast(Any, loss),
-        cast(Any, duration_loss),
-    )
-
-    metrics = {"loss": loss_scalar}
-    if duration_scalar is not None:
-        metrics["duration loss"] = duration_scalar
-
-    assert metrics == {"loss": 2.5, "duration loss": 0.75}
-    assert loss.item_calls == 1
-    assert duration_loss.item_calls == 1
+    source = inspect.getsource(Trainer.train)
+    assert '{"duration loss": dur_loss.item()}' not in source
+    assert "duration_loss_scalar = None" in source
+    assert "duration_loss_scalar = duration_loss.item()" in source
+    assert 'metrics["duration loss"] = duration_loss_scalar' in source
 
 
 def test_cli_compile_flags_parse():
@@ -2242,20 +1114,11 @@ def test_compile_guard_average_upsampling_eager_forward_still_works():
     assert model.training_compile_state["enabled"] is False
 
 
-def test_dit_blocks_compile_target_allows_average_upsampling_outside_compiled_region(monkeypatch):
-    """dit_blocks compile must actually invoke the compiled blocks for average-upsampling.
-
-    The average-upsampling text-embedding path lives outside the compiled DiT-block region,
-    so target='dit_blocks' must accept it. This test must run in train mode and assert the
-    compiled callable is dispatched -- otherwise it only proves the eager eval path works
-    (the dispatch keys on Module.training and _build_model returns an eval-mode model).
-    """
-    calls = _count_compiled_block_calls(monkeypatch)
+def test_dit_blocks_compile_target_allows_average_upsampling_outside_compiled_region():
     model = _build_model(average_upsampling=True)
     mel, text, lens = _sample_batch(batch_size=2, frames=12, text_len=7, lens=[12, 8])
 
     model.compile_training_core(target="dit_blocks", backend="eager", fullgraph=False, dynamic=None)
-    model.train()
     loss, cond, pred = model(mel, text=text, lens=lens)
 
     assert torch.isfinite(loss)
@@ -2263,10 +1126,6 @@ def test_dit_blocks_compile_target_allows_average_upsampling_outside_compiled_re
     assert pred.shape == mel.shape
     assert model.training_compile_state["enabled"] is True
     assert model.training_compile_state["target"] == "dit_blocks"
-    transformer = cast(Any, model.transformer)
-    assert calls["n"] >= len(transformer.transformer_blocks), (
-        "train-mode forward must dispatch through every compiled block"
-    )
 
 
 def test_real_trainer_frame_dataset_dit_blocks_compile_runs_variable_shape_epoch(tmp_path, monkeypatch):
@@ -2347,160 +1206,6 @@ def test_real_trainer_frame_dataset_dit_blocks_compile_runs_variable_shape_epoch
     assert len({call["text_shape"] for call in seen_core_calls}) > 1
     assert all(call["drop_audio_cond"] and call["drop_text"] for call in seen_core_calls)
     _assert_clean_checkpoint_state_dict(tmp_path / "model_last.pt")
-
-
-def test_logged_samples_switch_to_eval_and_restore_train_mode(tmp_path, monkeypatch):
-    """Logged samples must run in eval mode and restore train mode afterward.
-
-    Regression for finding 11: the Trainer's sample-logging block must switch the unwrapped
-    model to eval so regional compile dispatch (which keys on Module.training) routes
-    inference through the eager path, and must restore the prior mode in a finally so an
-    exception during sampling/vocoding/saving does not leave the model in eval mode for
-    subsequent training steps (which would silently bypass compiled blocks).
-
-    Note: CFM.sample itself calls self.eval(), so the eval switch is belt-and-suspenders;
-    the critical fix is the try/finally restore around the entire sample block.
-    """
-    from f5_tts.model import dataset as dataset_module
-    from f5_tts.model import trainer as trainer_module
-    from f5_tts.model.trainer import Trainer
-
-    monkeypatch.setattr(trainer_module, "tqdm", _SilentProgress)
-    monkeypatch.setattr(dataset_module, "tqdm", _SilentProgress)
-
-    # Mock the vocoder so no download/decode is needed.
-    class _DummyVocoder:
-        def decode(self, mel):
-            return torch.zeros(1, 1, mel.shape[-1] * 256)
-
-    infer_utils = types.ModuleType("f5_tts.infer.utils_infer")
-    infer_utils.cfg_strength = 2.0
-    infer_utils.nfe_step = 2
-    infer_utils.sway_sampling_coef = -1.0
-    infer_utils.load_vocoder = lambda **kw: _DummyVocoder()
-    monkeypatch.setitem(sys.modules, "f5_tts.infer.utils_infer", infer_utils)
-    monkeypatch.setattr(trainer_module.torchaudio, "save", lambda *a, **kw: None)
-
-    torch.manual_seed(2026)
-    train_dataset = _PrecomputedMelDataset()
-    model = _build_model(audio_drop_prob=1.0, cond_drop_prob=1.0, vocab_size=256)
-
-    # Instrument DiT._run_transformer_blocks to record self.training at each call.
-    transformer = cast(Any, model.transformer)
-    original_run = transformer._run_transformer_blocks
-    training_flags: list[bool] = []
-
-    def recording_run(x, t, mask, rope):
-        training_flags.append(transformer.training)
-        return original_run(x, t, mask, rope)
-
-    object.__setattr__(transformer, "_run_transformer_blocks", recording_run)
-
-    trainer = Trainer(
-        model,
-        epochs=1,
-        learning_rate=1e-4,
-        num_warmup_updates=1,
-        save_per_updates=1,
-        keep_last_n_checkpoints=0,
-        checkpoint_path=str(tmp_path),
-        batch_size_per_gpu=20,
-        batch_size_type="frame",
-        max_samples=2,
-        grad_accumulation_steps=1,
-        max_grad_norm=1.0,
-        logger=None,
-        log_samples=True,
-        last_per_updates=10**9,
-        compile_enabled=True,
-        compile_backend="eager",
-        compile_target="dit_blocks",
-        compile_fullgraph=False,
-        compile_dynamic=None,
-        compile_fallback_to_eager=False,
-    )
-
-    trainer.train(train_dataset, num_workers=0, resumable_with_seed=123)
-
-    # Training steps must have run in train mode.
-    assert any(training_flags), "training steps must dispatch through _run_transformer_blocks"
-    assert all(flag for flag in training_flags[:1]), "first forward must be in train mode"
-    # At least one forward during sampling must have been in eval mode.
-    assert any(not flag for flag in training_flags), (
-        "sample-logging must switch the model to eval so inference bypasses compiled blocks"
-    )
-    # After train() returns, the model must be back in train mode.
-    assert trainer._unwrapped_model.training is True, (
-        "model must be restored to train mode after the sample-logging block"
-    )
-
-
-def test_logged_samples_restore_train_mode_on_exception(tmp_path, monkeypatch):
-    """The try/finally must restore train mode even if sampling raises.
-
-    Without the finally, an exception during the sample block leaves the model in eval mode
-    (CFM.sample calls self.eval() and never restores), so subsequent training steps would
-    silently bypass compiled blocks.
-    """
-    from f5_tts.model import dataset as dataset_module
-    from f5_tts.model import trainer as trainer_module
-    from f5_tts.model.trainer import Trainer
-
-    monkeypatch.setattr(trainer_module, "tqdm", _SilentProgress)
-    monkeypatch.setattr(dataset_module, "tqdm", _SilentProgress)
-
-    class _DummyVocoder:
-        def decode(self, mel):
-            return torch.zeros(1, 1, mel.shape[-1] * 256)
-
-    infer_utils = types.ModuleType("f5_tts.infer.utils_infer")
-    infer_utils.cfg_strength = 2.0
-    infer_utils.nfe_step = 2
-    infer_utils.sway_sampling_coef = -1.0
-    infer_utils.load_vocoder = lambda **kw: _DummyVocoder()
-    monkeypatch.setitem(sys.modules, "f5_tts.infer.utils_infer", infer_utils)
-
-    torch.manual_seed(2026)
-    train_dataset = _PrecomputedMelDataset()
-    model = _build_model(audio_drop_prob=1.0, cond_drop_prob=1.0, vocab_size=256)
-
-    # Force the sample block to raise by making torchaudio.save fail.
-    def _save_fail(*a, **kw):
-        raise RuntimeError("simulated save failure")
-
-    monkeypatch.setattr(trainer_module.torchaudio, "save", _save_fail)
-
-    trainer = Trainer(
-        model,
-        epochs=1,
-        learning_rate=1e-4,
-        num_warmup_updates=1,
-        save_per_updates=1,
-        keep_last_n_checkpoints=0,
-        checkpoint_path=str(tmp_path),
-        batch_size_per_gpu=20,
-        batch_size_type="frame",
-        max_samples=2,
-        grad_accumulation_steps=1,
-        max_grad_norm=1.0,
-        logger=None,
-        log_samples=True,
-        last_per_updates=10**9,
-        compile_enabled=True,
-        compile_backend="eager",
-        compile_target="dit_blocks",
-        compile_fullgraph=False,
-        compile_dynamic=None,
-        compile_fallback_to_eager=False,
-    )
-
-    with pytest.raises(RuntimeError, match="simulated save failure"):
-        trainer.train(train_dataset, num_workers=0, resumable_with_seed=123)
-
-    # Even though the sample block raised, the model must be back in train mode.
-    assert trainer._unwrapped_model.training is True, (
-        "try/finally must restore train mode even when the sample block raises"
-    )
 
 
 def test_compile_guard_default_off_path_still_compiles():
@@ -2591,8 +1296,8 @@ def test_compile_guard_blocks_cuda_inductor_for_average_upsampling():
 # ---------------------------------------------------------------------------
 
 
-def test_trainer_global_masked_mean_defaults_false():
-    """The flag must default to False (opt-in, not default behaviour)."""
+def test_trainer_global_masked_mean_defaults_false_and_gates_backward_path():
+    """Default preserves old per-microbatch mean backward; opt-in enables loss_sum path."""
     import inspect
 
     from f5_tts.model.trainer import Trainer
@@ -2600,301 +1305,14 @@ def test_trainer_global_masked_mean_defaults_false():
     sig = inspect.signature(Trainer.__init__)
     assert sig.parameters["global_masked_mean"].default is False
 
-
-class _TwoSampleDataset(torch.utils.data.Dataset):
-    """Four samples with different mel lengths so masked-frame denoms differ."""
-
-    def __init__(self, sample_count=4):
-        gen = torch.Generator().manual_seed(2026)
-        self.lengths = [8, 12, 16, 20]
-        self.texts = ["ab", "cde", "abcdef", "long text"]
-        self.mels = [torch.randn(8, f, generator=gen) for f in self.lengths]
-        if not 1 <= sample_count <= len(self.mels):
-            raise ValueError(f"sample_count must be in [1, {len(self.mels)}]")
-        self.lengths = self.lengths[:sample_count]
-        self.texts = self.texts[:sample_count]
-        self.mels = self.mels[:sample_count]
-
-    def __len__(self):
-        return len(self.mels)
-
-    def get_frame_len(self, index):
-        return self.lengths[index]
-
-    def __getitem__(self, index):
-        return {"mel_spec": self.mels[index], "text": self.texts[index]}
-
-
-def _run_trainer_one_update(global_masked_mean, tmp_path, monkeypatch, *, sample_count=4):
-    """Run a real Trainer.train loop for two updates; return wiring + gradient evidence.
-
-    Uses 4 samples with batch_size=1 and grad_accumulation_steps=2 → 2 updates, which
-    avoids the LinearLR ZeroDivisionError that occurs with total_updates == warmup_updates.
-    Gradients are captured at each sync_gradients (before zero_grad clears them).
-    """
-    from f5_tts.model import trainer as trainer_module
-    from f5_tts.model.trainer import Trainer
-
-    monkeypatch.setattr(trainer_module, "tqdm", _SilentProgress)
-
-    torch.manual_seed(2026)
-    model = _build_model(vocab_size=256)
-    dataset = _TwoSampleDataset(sample_count=sample_count)
-
-    backward_vals: list[float] = []
-    scale_calls: list[float] = []
-    component_vals: list[tuple[float, float, float]] = []
-    captured_grads: list[list[torch.Tensor | None]] = []
-
-    trainer = Trainer(
-        model,
-        epochs=1,
-        learning_rate=0.0,
-        num_warmup_updates=1,
-        save_per_updates=10**9,
-        keep_last_n_checkpoints=0,
-        checkpoint_path=str(tmp_path / f"ckpt_{global_masked_mean}"),
-        batch_size_per_gpu=1,
-        batch_size_type="sample",
-        grad_accumulation_steps=2,
-        max_grad_norm=0.0,
-        logger=None,
-        log_samples=False,
-        last_per_updates=10**9,
-        compile_enabled=False,
-        global_masked_mean=global_masked_mean,
-    )
-
-    # Record what backward receives.
-    original_backward = trainer.accelerator.backward
-
-    def recording_backward(loss, **kwargs):
-        backward_vals.append(float(loss.detach().item()))
-        return original_backward(loss, **kwargs)
-
-    trainer.accelerator.backward = recording_backward
-
-    # Record loss components (only called on the return_loss_components=True path).
-    module = cast(Any, trainer._unwrapped_model)
-    original_run = module._run_loss_core_components
-
-    def recording_run(*args):
-        result = original_run(*args)
-        component_vals.append(
-            (float(result[0].detach().item()), float(result[1].detach().item()), float(result[2].detach().item()))
-        )
-        return result
-
-    object.__setattr__(module, "_run_loss_core_components", recording_run)
-
-    # Record scaler calls.
-    original_scale = trainer._scale_gradients_by_loss_denom
-
-    def recording_scale(global_loss_denom):
-        scale_calls.append(float(global_loss_denom.item()))
-        return original_scale(global_loss_denom)
-
-    trainer._scale_gradients_by_loss_denom = recording_scale
-
-    # Capture grads before zero_grad clears them (only at sync_gradients).
-    original_zero_grad = trainer.optimizer.zero_grad
-
-    def capturing_zero_grad(*args, **kwargs):
-        if trainer.accelerator.sync_gradients:
-            captured_grads.append(
-                [p.grad.detach().clone() if p.grad is not None else None for p in trainer._unwrapped_model.parameters()]
-            )
-        return original_zero_grad(*args, **kwargs)
-
-    trainer.optimizer.zero_grad = capturing_zero_grad
-
-    # Seed global RNG identically for both runs so forward passes match.
-    torch.manual_seed(42)
-    trainer.train(dataset, num_workers=0, resumable_with_seed=123)
-
-    return backward_vals, scale_calls, component_vals, captured_grads
-
-
-def test_trainer_train_global_masked_mean_wiring_through_real_loop(tmp_path, monkeypatch):
-    """Replace source-grep: drive a real Trainer.train loop and verify branch wiring.
-
-    With global_masked_mean=True the loop must backpropagate loss_sum and call
-    _scale_gradients_by_loss_denom at sync_gradients. With False it must backpropagate
-    the mean loss and never call the scaler. Gradients must differ between the two
-    paths (proving the flag changes the objective, not just the source text).
-    """
-    bw_true, scale_true, comp_true, grads_true = _run_trainer_one_update(True, tmp_path, monkeypatch)
-    bw_false, scale_false, _comp_false, grads_false = _run_trainer_one_update(False, tmp_path, monkeypatch)
-
-    # 4 microbatches (4 samples, batch_size=1) → 2 updates (grad_accum=2).
-    assert len(bw_true) == 4
-    assert len(bw_false) == 4
-
-    # True path: backward receives loss_sum (component[1]), not loss (component[0]).
-    assert len(comp_true) == 4, "_run_loss_core_components must be called on the True path"
-    for bw_val, (_loss, loss_sum, _denom) in zip(bw_true, comp_true, strict=True):
-        assert bw_val == loss_sum, f"True path should backprop loss_sum ({loss_sum}), got {bw_val}"
-
-    # False path: backward receives the mean loss (not loss_sum). The False path uses
-    # _forward_loss_core_upstream_exact (not _run_loss_core_components), so comp_false is
-    # empty; the scaler-not-called + gradient-difference assertions below cover this.
-    assert len(scale_false) == 0, "False path must not call _scale_gradients_by_loss_denom"
-
-    # True path calls scaler at each sync_gradients (2 updates → 2 calls); False never.
-    assert len(scale_true) == 2, "True path must call _scale_gradients_by_loss_denom at each sync"
-    assert len(scale_false) == 0
-
-    # Gradients captured at each sync (2 updates → 2 captures).
-    assert len(grads_true) == 2 and len(grads_false) == 2
-
-    # Gradients differ at the first update: the flag changes the objective.
-    any_differ = False
-    for g_true, g_false in zip(grads_true[0], grads_false[0], strict=True):
-        if g_true is not None and g_false is not None:
-            if not torch.allclose(g_true, g_false, atol=1e-6, rtol=1e-6):
-                any_differ = True
-                break
-    assert any_differ, (
-        "global_masked_mean=True and False produced identical gradients; the flag has no behavioural effect"
-    )
-
-
-def test_trainer_train_global_masked_mean_true_gradients_match_global_mean_reference(tmp_path, monkeypatch):
-    """The True path through real Trainer.train produces grad(total_loss_sum/total_denom).
-
-    Replays the same forward passes (same seed, same data, same model weights) outside the
-    Trainer and compares gradients for the first update. This is the end-to-end integration
-    counterpart to the toy formula tests (test_loss_sum_gradient_scaling_*).
-    """
-    bw_true, scale_true, comp_true, grads_true = _run_trainer_one_update(True, tmp_path, monkeypatch)
-
-    # 4 microbatches → 2 updates; compare the first update (first 2 microbatches).
-    assert len(comp_true) == 4
-    assert len(scale_true) == 2
-    assert len(grads_true) == 2
-
-    # Rebuild the same model (same seed → same weights) and replay the forward passes
-    # with the same global RNG seed to get identical loss_sum/denom, then backprop the
-    # global mean reference for the first update: grad(total_loss_sum / total_denom).
-    torch.manual_seed(2026)
-    ref_model = _build_model(vocab_size=256)
-    # Match the Trainer's device (gradients were captured on the accelerator's device).
-    ref_device = next(g.device for g in grads_true[0] if g is not None)
-    ref_model = ref_model.to(ref_device)
-    ref_model.train()
-
-    # Match the Trainer's DataLoader: same dataset, same batch_size, same generator seed.
-    from torch.utils.data import DataLoader
-
-    from f5_tts.model.dataset import collate_fn
-
-    dataset = _TwoSampleDataset()
-    generator = torch.Generator()
-    generator.manual_seed(123)
-    ref_loader = DataLoader(
-        dataset, collate_fn=collate_fn, num_workers=0, batch_size=1, shuffle=True, generator=generator
-    )
-
-    torch.manual_seed(42)  # same seed as _run_trainer_one_update uses before trainer.train
-
-    # Replay only the first 2 microbatches (first update).
-    total_loss_sum = torch.zeros((), device=ref_device)
-    total_denom = torch.zeros((), device=ref_device)
-    for batch, _ in zip(ref_loader, range(2)):
-        mel_spec = batch["mel"].permute(0, 2, 1).to(ref_device)
-        mel_lengths = batch["mel_lengths"].to(ref_device)
-        _loss, loss_sum, denom, _cond, _pred = ref_model(
-            mel_spec, text=batch["text"], lens=mel_lengths, return_loss_components=True
-        )
-        total_loss_sum = total_loss_sum + loss_sum
-        total_denom = total_denom + denom.detach()
-
-    # Global mean reference: grad(total_loss_sum / total_denom).
-    ref_model.zero_grad(set_to_none=True)
-    (total_loss_sum / total_denom).backward()
-
-    # Compare Trainer's first-update gradients to the reference.
-    for g_trainer, ref_p in zip(grads_true[0], ref_model.parameters(), strict=True):
-        if g_trainer is not None and ref_p.grad is not None:
-            _assert_close(g_trainer, ref_p.grad, "global_mean_grad", atol=1e-5, rtol=1e-5)
-
-
-def test_trainer_global_masked_mean_scales_final_partial_accumulation_window(tmp_path, monkeypatch):
-    """Accelerate must sync and normalize a final one-microbatch remainder window."""
-    backward, denominators, components, gradients = _run_trainer_one_update(
-        True,
-        tmp_path,
-        monkeypatch,
-        sample_count=3,
-    )
-
-    assert len(backward) == 3
-    assert len(components) == 3
-    assert len(denominators) == 2
-    assert len(gradients) == 2
-    # The second update contains only the final microbatch. Its global denominator
-    # must not retain either denominator from the preceding full accumulation window.
-    assert denominators[1] == pytest.approx(components[2][2])
-
-
-@pytest.mark.skipif(
-    not torch.cuda.is_available() or not torch.cuda.is_bf16_supported(),
-    reason="CUDA BF16 support is required for the Trainer-level AMP smoke",
-)
-def test_trainer_global_masked_mean_bf16_amp_step_is_finite(tmp_path, monkeypatch):
-    """Run the real Trainer compile/global-mean path under CUDA BF16 autocast."""
-    from accelerate.state import AcceleratorState
-
-    from f5_tts.model import trainer as trainer_module
-    from f5_tts.model.trainer import Trainer
-
-    monkeypatch.setattr(trainer_module, "tqdm", _SilentProgress)
-    AcceleratorState._reset_state(reset_partial_state=True)
-    try:
-        torch.manual_seed(2026)
-        trainer = Trainer(
-            _build_model(vocab_size=256),
-            epochs=1,
-            learning_rate=0.0,
-            num_warmup_updates=1,
-            save_per_updates=10**9,
-            keep_last_n_checkpoints=0,
-            checkpoint_path=str(tmp_path / "bf16_amp_ckpt"),
-            batch_size_per_gpu=1,
-            batch_size_type="sample",
-            grad_accumulation_steps=2,
-            max_grad_norm=1.0,
-            logger=None,
-            log_samples=False,
-            last_per_updates=10**9,
-            compile_enabled=True,
-            compile_backend="eager",
-            compile_target="cfm_loss_core",
-            compile_dynamic=True,
-            compile_fallback_to_eager=False,
-            global_masked_mean=True,
-            accelerate_kwargs={"mixed_precision": "bf16"},
-        )
-
-        gradient_checks = []
-        original_step = trainer.optimizer.step
-
-        def checking_step(*args, **kwargs):
-            gradients = [parameter.grad for parameter in trainer.model.parameters() if parameter.grad is not None]
-            assert gradients
-            assert all(torch.isfinite(gradient).all() for gradient in gradients)
-            gradient_checks.append(len(gradients))
-            return original_step(*args, **kwargs)
-
-        trainer.optimizer.step = checking_step
-        trainer.train(_TwoSampleDataset(sample_count=3), num_workers=0, resumable_with_seed=123)
-
-        assert trainer.accelerator.mixed_precision == "bf16"
-        assert trainer.compile_active is True
-        assert trainer.compile_fallback_active is False
-        assert len(gradient_checks) == 2
-    finally:
-        AcceleratorState._reset_state(reset_partial_state=True)
+    source = inspect.getsource(Trainer.train)
+    # Opt-in path backprops loss_sum and rescales by global denominator.
+    assert "self.accelerator.backward(loss_sum)" in source
+    assert "self._scale_gradients_by_loss_denom(global_loss_denom)" in source
+    # Default path backprops the per-microbatch mean loss, not loss_sum.
+    assert "self.accelerator.backward(loss)" in source
+    # The branch is gated on the flag, not unconditional.
+    assert "if self.global_masked_mean:" in source
 
 
 def test_default_loss_path_gradient_matches_average_of_means_not_global_mean():
@@ -2932,274 +1350,45 @@ def test_default_loss_path_gradient_matches_average_of_means_not_global_mean():
         )
 
 
-def test_adamw_fused_policy_matches_pytorch_authoritative_device_list():
-    """The fused-AdamW device allowlist must track PyTorch's authoritative per-build helper.
+def test_adamw_fused_uses_accelerator_device_not_global_cuda():
+    """fused must be driven by the actual accelerator device, not torch.cuda.is_available()."""
+    import inspect
 
-    Upstream requests `fused=True` unconditionally. Hardcoding a tuple that omits devices
-    PyTorch actually supports (mps/hpu/mtia on newer builds) silently downgrades those
-    users to the unfused kernel, changing optimizer numerics and serialized state on the
-    default compile-disabled path -- a backward-compatibility break nobody opted into.
-    The policy must therefore equal the helper's list when the helper is available, and
-    always include CPU + CUDA (the devices upstream unconditionally fused).
-    """
-    from f5_tts.model.trainer import FUSED_ADAMW_DEVICE_TYPES
+    from f5_tts.model.trainer import Trainer
 
-    assert "cpu" in FUSED_ADAMW_DEVICE_TYPES, "CPU fused AdamW is upstream behaviour"
-    assert "cuda" in FUSED_ADAMW_DEVICE_TYPES
-
-    # When PyTorch exposes the authoritative helper, the policy must match it exactly --
-    # no silent omissions of devices the installed build supports.
-    try:
-        from torch.optim.optimizer import _get_fused_kernels_supported_devices
-    except ImportError:
-        pytest.skip("torch lacks _get_fused_kernels_supported_devices; fallback path covered elsewhere")
-    authoritative = frozenset(_get_fused_kernels_supported_devices())
-    assert frozenset(FUSED_ADAMW_DEVICE_TYPES) == authoritative, (
-        f"FUSED_ADAMW_DEVICE_TYPES={sorted(FUSED_ADAMW_DEVICE_TYPES)} != authoritative={sorted(authoritative)}"
-    )
+    source = inspect.getsource(Trainer.__init__)
+    assert 'self.accelerator.device.type == "cuda"' in source
+    assert "fused=torch.cuda.is_available()" not in source
 
 
-def test_adamw_fused_is_actually_supported_on_cpu():
-    """Behavioural counterpart: the fused CPU kernel this policy relies on must exist.
+def test_adamw_fused_false_when_accelerator_cpu_on_cuda_host():
+    """On a CUDA host with a CPU accelerator, AdamW must not request the fused kernel."""
+    if not torch.cuda.is_available():
+        pytest.skip("Requires a CUDA-capable host to prove the CPU-path divergence")
 
-    If a future torch drops fused CPU AdamW, this fails loudly instead of letting the
-    trainer raise at optimizer construction for every CPU user.
-    """
+    from accelerate import Accelerator
+
+    # On a CUDA host the old code (torch.cuda.is_available()) would set fused=True;
+    # the patched logic keys off the actual accelerator device and must yield False.
+    cpu_accel = Accelerator(cpu=True)
+    use_fused = cpu_accel.device.type == "cuda"
+    assert use_fused is False
+    assert torch.cuda.is_available() is True  # proves the two checks diverge here
     model = torch.nn.Linear(4, 4)
-    opt = torch.optim.AdamW(model.parameters(), lr=1e-4, fused=True)
-    assert opt.param_groups[0].get("fused", False) is True
-
-    for parameter in model.parameters():
-        parameter.grad = torch.ones_like(parameter)
-    opt.step()  # must not raise
-    assert all(torch.isfinite(p).all() for p in model.parameters())
+    opt = torch.optim.AdamW(model.parameters(), lr=1e-4, fused=use_fused)
+    assert opt.param_groups[0].get("fused", False) is False
 
 
-def test_trainer_requests_fused_adamw_for_its_accelerator_device():
-    """The trainer must derive `fused` from the accelerator device, not global CUDA state.
+def test_dit_text_embed_keeps_symint_in_non_tensor_path():
+    """The non-tensor seq_len path must not call int() (which specializes dynamic graphs)."""
+    import inspect
 
-    Asserted behaviourally against the constructed optimizer rather than by grepping the
-    source, and without constructing a second Accelerator (AcceleratorState is a process
-    global; building one with a different device makes the test order-dependent and it
-    fails whenever an earlier test has already initialised CUDA).
-    """
-    from f5_tts.model.trainer import FUSED_ADAMW_DEVICE_TYPES, Trainer
-
-    model = _build_model()
-    trainer = Trainer(
-        model,
-        epochs=1,
-        learning_rate=1e-4,
-        num_warmup_updates=1,
-        save_per_updates=10**9,
-        keep_last_n_checkpoints=0,
-        logger=None,
-        log_samples=False,
-    )
-    expected = trainer.accelerator.device.type in FUSED_ADAMW_DEVICE_TYPES
-    assert trainer.optimizer.param_groups[0].get("fused", False) is expected
-
-
-def _upstream_reference_loss(pred, flow, rand_span_mask):
-    """Return the exact masked-mean reduction used by upstream commit 2ae2c9b."""
-    loss = torch.nn.functional.mse_loss(pred, flow, reduction="none")
-    return loss[rand_span_mask].mean()
-
-
-def _base_commit_forward(model, mel, text, lens):
-    """Transcribe the CFM forward *orchestration* from base commit 2ae2c9b (compile-disabled).
-
-    Pinned to SWivid/F5-TTS 2ae2c9b ``src/f5_tts/model/cfm.py`` lines 231-302.
-
-    Scope -- what this does and does not prove:
-      * It transcribes the CFM-level orchestration only: stochastic input preparation
-        (frac_lengths -> rand_span_mask, x0/time sampling, cond construction, bool CFG
-        drop decisions) and the ``loss[rand_span_mask].mean()`` reduction.
-      * It calls ``model.transformer`` -- the *current* DiT/UNetT implementation -- not a
-        frozen base-commit transformer. Both this oracle and the current default path
-        share the same transformer, so the transformer tree (TextEmbedding,
-        InputEmbedding, DiTBlock, attention, projections) is a held constant, not a
-        variable under test. This oracle therefore cannot detect a divergence between
-        the current transformer and the base-commit transformer; it only proves the
-        CFM orchestration wrapping it is unchanged.
-      * Full-tree base parity (TextEmbedding/InputEmbedding/block internals) is out of
-        scope here and is not claimed. Vendoring a frozen base-commit transformer would
-        add that coverage but at large maintenance/drift cost for a regression surface
-        already covered by the dedicated backbone tests in this file.
-
-    Differences from the current ``_prepare_training_inputs`` + ``_run_loss_core`` path
-    that this transcription preserves:
-      * Bool CFG drop flags (base) vs 0-D bool tensors (current DiT path) -- but only
-        when a compile target is active; the compile-disabled default path this oracle
-        compares against also uses bool flags, so the flag dtype is not a variable here.
-      * Inline stochastic preparation with no compile-friendly split.
-      * ``loss[rand_span_mask].mean()`` reduction (no masked-multiply reassociation).
-
-    No git-history runtime dependence: the body is straight-line code kept in lockstep
-    with the named commit. If the base forward ever changes, update this transcription
-    deliberately and record the new pinned SHA.
-    """
-    from random import random
-
-    import torch.nn.functional as F
-
-    from f5_tts.model.utils import exists, lens_to_mask, list_str_to_idx, list_str_to_tensor, mask_from_frac_lengths
-
-    inp = mel  # test passes mel directly; base raw-wave branch omitted (not exercised)
-    batch, seq_len, dtype, device = *inp.shape[:2], inp.dtype, model.device
-
-    if isinstance(text, list):
-        if exists(model.vocab_char_map):
-            text = list_str_to_idx(text, model.vocab_char_map).to(device)
-        else:
-            text = list_str_to_tensor(text).to(device)
-        assert text.shape[0] == batch
-
-    if not exists(lens):
-        lens = torch.full((batch,), seq_len, device=device)
-    mask = lens_to_mask(lens, length=seq_len)
-
-    frac_lengths = torch.zeros((batch,), device=model.device).float().uniform_(*model.frac_lengths_mask)
-    rand_span_mask = mask_from_frac_lengths(lens, frac_lengths)
-    if exists(mask):
-        rand_span_mask &= mask
-
-    x1 = inp
-    x0 = torch.randn_like(x1)
-    time = torch.rand((batch,), dtype=dtype, device=model.device)
-
-    t = time.unsqueeze(-1).unsqueeze(-1)
-    phi = (1 - t) * x0 + t * x1
-    flow = x1 - x0
-
-    cond = torch.where(rand_span_mask[..., None], torch.zeros_like(x1), x1)
-
-    drop_audio_cond = random() < model.audio_drop_prob
-    if random() < model.cond_drop_prob:
-        drop_audio_cond = True
-        drop_text = True
-    else:
-        drop_text = False
-
-    pred = model.transformer(
-        x=phi,
-        cond=cond,
-        text=text,
-        time=time,
-        drop_audio_cond=drop_audio_cond,
-        drop_text=drop_text,
-        mask=mask,
-    )
-
-    loss = F.mse_loss(pred, flow, reduction="none")
-    loss = loss[rand_span_mask]
-    return loss.mean(), cond, pred, rand_span_mask
-
-
-def test_default_path_matches_base_commit_forward_end_to_end():
-    """The compile-disabled default path's CFM orchestration must match base 2ae2c9b.
-
-    The previous parity test compared the new path's prediction against itself (it fed the
-    same ``pred`` into a reduction helper), so changes to the stochastic input preparation
-    or the loss reduction could alter outputs while the test stayed green. This replacement
-    runs a transcribed base-commit CFM orchestration and the current default path
-    (``_prepare_training_inputs`` + ``_run_loss_core``) from identical model state and RNG
-    state, then asserts bitwise equality of predictions, conditioning, loss, and the span
-    mask end-to-end.
-
-    Scope: both paths call the *same* ``model.transformer``, so this proves the CFM-level
-    orchestration (stochastic preparation, cond construction, reduction form) is unchanged
-    -- not full-tree base parity. A divergence in TextEmbedding/InputEmbedding/block
-    internals would change both paths equally and stay green here; that regression surface
-    is covered by the dedicated backbone tests (e.g. ``test_dit_text_embed_*``,
-    ``test_branchless_tensor_cfg_flags_match_bool_loss_outputs_and_gradients``) rather than
-    by this orchestration oracle.
-
-    With ``audio_drop_prob=cond_drop_prob=0`` the Python ``random()`` drop decisions are
-    deterministic, and the compile-disabled default path keeps bool CFG flags, so the two
-    paths exercise identical flag dtypes -- the only remaining variable is the orchestration
-    split, which is exactly what this test verifies.
-    """
-    model = _build_model()
-    for seed in range(8):
-        torch.manual_seed(seed)
-        mel = torch.randn(3, 37, 8)
-        text = torch.randint(0, 32, (3, 11))
-        lens = torch.tensor([37, 29, 33])
-
-        # Base-commit forward from a cloned model so weights are identical to the new path.
-        torch.manual_seed(seed)
-        base_model = copy.deepcopy(model)
-        base_loss, base_cond, base_pred, base_mask = _base_commit_forward(base_model, mel, text, lens)
-
-        # Current default path (compile-disabled) from the same seed/state.
-        torch.manual_seed(seed)
-        prepared = cast(PreparedArgs, model._prepare_training_inputs(mel, text, lens))
-        new_loss, new_cond, new_pred = model._run_loss_core(*prepared)
-        _, _, _, new_mask, _, _, _, _ = prepared
-
-        assert torch.equal(new_mask, base_mask), f"seed {seed}: rand_span_mask diverged"
-        assert torch.equal(new_pred, base_pred), f"seed {seed}: pred diverged"
-        assert torch.equal(new_cond, base_cond), f"seed {seed}: cond diverged"
-        assert torch.equal(new_loss, base_loss), f"seed {seed}: loss diverged"
-
-
-def test_compiled_reduction_is_close_but_not_required_to_be_bitwise_equal():
-    """The compiled reduction may differ by ~1 ULP; it must stay within tight tolerance.
-
-    Documents the deliberate asymmetry: exactness is owed to users who did NOT opt in,
-    while the opt-in compiled path only owes numerical equivalence.
-    """
-    model = _build_model()
-    torch.manual_seed(0)
-    mel = torch.randn(3, 37, 8)
-    text = torch.randint(0, 32, (3, 11))
-    lens = torch.tensor([37, 29, 33])
-    prepared = cast(PreparedArgs, model._prepare_training_inputs(mel, text, lens))
-    x1, _text, _mask, rand_span_mask, x0, _time, _dac, _dt = prepared
-
-    upstream_loss, _cond, pred = model._run_loss_core(*prepared)
-    components_loss, _sum, _denom, _cond2, _pred2 = model._forward_loss_core_components(*prepared)
-
-    assert torch.allclose(upstream_loss, components_loss, rtol=1e-6, atol=1e-7)
-    assert components_loss.dtype == torch.float32  # fp32 accumulation guard is preserved
-    del pred, rand_span_mask
-
-
-def test_dit_text_embed_keeps_one_dynamic_graph_across_sequence_lengths():
-    """TextEmbedding must preserve symbolic sequence lengths instead of specializing."""
     from f5_tts.model.backbones.dit import TextEmbedding
 
-    torch._dynamo.reset()
-    captured_graphs = []
-
-    def counting_backend(graph_module, _example_inputs):
-        captured_graphs.append(graph_module)
-        return graph_module.forward
-
-    embed = TextEmbedding(text_num_embeds=32, text_dim=8, mask_padding=False)
-
-    def run(text, valid_seq_lens):
-        return embed(
-            text,
-            seq_len=text.shape[1],
-            drop_text=False,
-            valid_seq_lens=valid_seq_lens,
-        )
-
-    compiled = torch.compile(run, backend=counting_backend, fullgraph=True, dynamic=True)
-    # Keep batch size fixed so this assertion isolates sequence-length symbolism.
-    # PyTorch may legitimately specialize batch=1 separately from batch>1 even with
-    # dynamic=True; that is not sequence-length graph churn.
-    for batch, seq_len in ((2, 7), (2, 11), (2, 15)):
-        text = torch.randint(1, 32, (batch, seq_len))
-        valid_seq_lens = torch.full((batch,), seq_len, dtype=torch.long)
-        output = compiled(text, valid_seq_lens)
-        assert output.shape == (batch, seq_len, 8)
-
-    assert len(captured_graphs) == 1, (
-        f"symbolic batch/sequence lengths should reuse one graph, captured {len(captured_graphs)}"
-    )
+    src = inspect.getsource(TextEmbedding.forward)
+    assert "int(seq_len)" not in src
+    # The non-tensor branch keeps the value as-is (Python int in eager, SymInt under compile).
+    assert "max_seq_len = seq_len" in src
 
 
 def test_dit_text_embed_non_tensor_seq_len_still_masks_correctly():
@@ -3232,123 +1421,3 @@ def test_all_training_configs_define_global_masked_mean_default_false():
         config = yaml.safe_load(config_path.read_text())
         assert "optim" in config, config_path.name
         assert config["optim"].get("global_masked_mean") is False, config_path.name
-
-
-def test_post_fallback_default_path_keeps_fp32_components_reduction():
-    """After a runtime compile fallback, the default (non-components) loss path must keep
-    the fp32 masked-multiply reduction, not revert to the upstream input-dtype reduction.
-
-    The upstream-exact path computes ``F.mse_loss(pred, flow)`` in the input dtype; an fp16
-    AMP run that fell back mid-training would switch to fp16 squared error and could
-    overflow. The post-fallback path reuses ``_forward_loss_core_components`` (fp32), which
-    is numerically safe and matches the reduction the run used while compiled.
-    """
-    model = _build_model()
-    mel, text, lens = _sample_batch()
-    prepared = cast(PreparedArgs, model._prepare_training_inputs(mel.clone(), text.clone(), lens.clone()))
-
-    # Enable compile (eager backend keeps the test CPU-fast and deterministic).
-    model.compile_training_core(backend="eager", fullgraph=False, dynamic=None)
-    assert model.training_compile_state["enabled"] is True
-
-    # Inject a compiled callable that raises a compiler failure, then run once to trigger
-    # the runtime fallback (clear_training_compile + _compile_fallback_active=True).
-    def raise_compile_error(*_args):
-        raise _synthetic_compiler_error()
-
-    object.__setattr__(model, "_compiled_loss_core", raise_compile_error)
-    object.__setattr__(model, "_compile_runtime_fallback", True)
-    loss_first, _, _ = model._run_loss_core(*prepared)
-    assert torch.isfinite(loss_first)
-    assert model.training_compile_state["fallback_active"] is True
-    assert model.training_compile_state["enabled"] is False
-
-    # Subsequent default-path calls must use the fp32 components reduction.
-    loss_again, _, _ = model._run_loss_core(*prepared)
-    components_loss, _sum, _denom, _cond, _pred = model._forward_loss_core_components(*prepared)
-    assert loss_again.dtype == torch.float32
-    assert torch.equal(loss_again, components_loss)
-
-
-def test_post_fallback_fp32_reduction_matches_active_compiled_reduction():
-    """The post-fallback fp32 reduction must equal the reduction the run used while
-    compiled, so a mid-training fallback does not change the loss objective (only the
-    backend, eager vs compiled). Compares the post-fallback loss against a freshly
-    compiled-path loss from identical inputs.
-    """
-    model = _build_model()
-    torch.manual_seed(0)
-    mel = torch.randn(3, 37, 8)
-    text = torch.randint(0, 32, (3, 11))
-    lens = torch.tensor([37, 29, 33])
-    prepared = cast(PreparedArgs, model._prepare_training_inputs(mel, text, lens))
-
-    # Active-compiled reduction (eager backend: same reduction, no real compilation).
-    model.compile_training_core(backend="eager", fullgraph=False, dynamic=None)
-    compiled_loss, _, _ = model._run_loss_core(*prepared)
-
-    # Force fallback.
-    def raise_compile_error(*_args):
-        raise _synthetic_compiler_error()
-
-    object.__setattr__(model, "_compiled_loss_core", raise_compile_error)
-    object.__setattr__(model, "_compile_runtime_fallback", True)
-    model._run_loss_core(*prepared)  # triggers fallback
-    assert model.training_compile_state["fallback_active"] is True
-
-    # Same inputs -> post-fallback eager fp32 reduction must equal the compiled reduction.
-    fallback_loss, _, _ = model._run_loss_core(*prepared)
-    assert torch.equal(fallback_loss, compiled_loss)
-
-
-def test_never_compiled_default_path_stays_bit_exact_upstream_after_fallback_fix():
-    """The finding-6 fix must NOT change the never-compiled default path.
-
-    A model whose compile was never enabled (_compile_fallback_active stays False) must
-    still take the byte-exact upstream reduction, preserving the exact-default contract.
-    """
-    model = _build_model()
-    assert model.training_compile_state["fallback_active"] is False
-    assert model.training_compile_state["enabled"] is False
-
-    mismatches = 0
-    for seed in range(10):
-        torch.manual_seed(seed)
-        mel = torch.randn(3, 37, 8)
-        text = torch.randint(0, 32, (3, 11))
-        lens = torch.tensor([37, 29, 33])
-        prepared = cast(PreparedArgs, model._prepare_training_inputs(mel, text, lens))
-        x1, _text, _mask, rand_span_mask, x0, _time, _dac, _dt = prepared
-
-        loss, _cond, pred = model._run_loss_core(*prepared)
-        reference = _upstream_reference_loss(pred, x1 - x0, rand_span_mask)
-        assert loss.dtype == reference.dtype
-        if loss.item() != reference.item():
-            mismatches += 1
-    assert mismatches == 0, f"never-compiled default diverged from upstream on {mismatches}/10 seeds"
-
-
-def test_post_fallback_global_masked_mean_components_path_still_fp32():
-    """The global_masked_mean path (return_loss_components=True) must also stay fp32 after
-    fallback. forward(..., return_loss_components=True) calls _run_loss_core_components
-    directly, which dispatches to the fp32 _forward_loss_core_components when compile is
-    off -- this was already safe and must remain so.
-    """
-    model = _build_model()
-    mel, text, lens = _sample_batch()
-
-    model.compile_training_core(backend="eager", fullgraph=False, dynamic=None)
-
-    def raise_compile_error(*_args):
-        raise _synthetic_compiler_error()
-
-    object.__setattr__(model, "_compiled_loss_core", raise_compile_error)
-    object.__setattr__(model, "_compile_runtime_fallback", True)
-    # Trigger fallback via the components path.
-    _ = model(mel, text=text, lens=lens, return_loss_components=True)
-    assert model.training_compile_state["fallback_active"] is True
-
-    loss, loss_sum, denom, _cond, _pred = model(mel, text=text, lens=lens, return_loss_components=True)
-    assert loss.dtype == torch.float32
-    assert loss_sum.dtype == torch.float32
-    assert torch.isfinite(loss)

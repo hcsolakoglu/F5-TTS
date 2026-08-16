@@ -1,0 +1,141 @@
+{
+  "batch_size_per_gpu_frames": 12000,
+  "batches_per_epoch": 65,
+  "candidate": "eager",
+  "candidate_config": {
+    "compile": false,
+    "mark_step": false
+  },
+  "compile_active_end": false,
+  "compile_fallback_active_end": false,
+  "cuda_available": true,
+  "dataset_metadata": {
+    "config": "clean",
+    "dataset": "openslr/librispeech_asr",
+    "dtype": "float32",
+    "fetch_rows": 5000,
+    "max_duration_s": 11.995,
+    "max_frames": 1125,
+    "median_duration_s": 7.5600000000000005,
+    "median_frames": 709.0,
+    "min_duration_s": 1.87,
+    "min_frames": 176,
+    "n_mel_channels": 100,
+    "preprocess_wall_s": 138.66545511100003,
+    "sample_rate": 24000,
+    "samples": 1000,
+    "split": "train.100",
+    "streaming": true,
+    "total_hours": 2.0577500868055556,
+    "unique_frame_lengths": 594,
+    "unique_speakers": 76
+  },
+  "dynamo_counters": {},
+  "epochs": 2,
+  "error": null,
+  "first_12_batch_shapes": [
+    [
+      24,
+      213,
+      44
+    ],
+    [
+      24,
+      230,
+      51
+    ],
+    [
+      24,
+      260,
+      48
+    ],
+    [
+      24,
+      280,
+      50
+    ],
+    [
+      24,
+      310,
+      66
+    ],
+    [
+      24,
+      331,
+      63
+    ],
+    [
+      24,
+      355,
+      83
+    ],
+    [
+      24,
+      373,
+      66
+    ],
+    [
+      24,
+      391,
+      75
+    ],
+    [
+      24,
+      413,
+      81
+    ],
+    [
+      24,
+      447,
+      93
+    ],
+    [
+      24,
+      468,
+      90
+    ]
+  ],
+  "first_recorded_update_s": 1.9135705130001952,
+  "gpu_name": "NVIDIA L4",
+  "last_recorded_update_s": 1.4764829959999588,
+  "loss_finite": true,
+  "loss_first": 9.866446495056152,
+  "loss_last": 2.5199508666992188,
+  "max_memory_allocated_mb": 14788.271484375,
+  "max_memory_reserved_mb": 17710.0,
+  "max_samples_per_batch": 24,
+  "mean_update_s": 1.3824803624384598,
+  "median_recorded_update_s": 1.491251967000153,
+  "model_cfg": {
+    "attn_backend": "torch",
+    "attn_mask_enabled": false,
+    "checkpoint_activations": false,
+    "conv_layers": 4,
+    "depth": 18,
+    "dim": 768,
+    "ff_mult": 2,
+    "heads": 12,
+    "pe_attn_head": null,
+    "qk_norm": null,
+    "text_dim": 512,
+    "text_mask_padding": true
+  },
+  "model_training_compile_state": {
+    "enabled": false,
+    "error": null,
+    "fallback_active": false
+  },
+  "p90_recorded_update_s": 1.5850270072000057,
+  "params": 158056804,
+  "precision": {
+    "amp_or_quantization": "none",
+    "float32_matmul_precision": "highest",
+    "tf32_cudnn": false,
+    "tf32_matmul": false
+  },
+  "torch_version": "2.11.0+cu128",
+  "unique_batch_shapes": 65,
+  "updates_expected": 130,
+  "updates_recorded": 130,
+  "wall_s": 179.72244711699977
+}

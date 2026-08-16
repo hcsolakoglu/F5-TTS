@@ -1,0 +1,37 @@
+{
+  "all_counters": {},
+  "candidate": "eager",
+  "candidate_config": {
+    "compile": false
+  },
+  "compile_state": {
+    "enabled": false,
+    "error": null,
+    "fallback_active": false,
+    "target": null
+  },
+  "correctness": true,
+  "error": null,
+  "fallback": false,
+  "finite_loss": true,
+  "first_update_s": 0.03792091197101399,
+  "gate_loss_compiled": 1.212404489517212,
+  "gate_loss_eager": 1.212404489517212,
+  "gpu_name": "NVIDIA GeForce RTX 3070",
+  "grad_close": true,
+  "graph_break_counters": {},
+  "keys_clean": true,
+  "loss_close": true,
+  "max_memory_allocated_mb": 58.7080078125,
+  "max_memory_reserved_mb": 80.0,
+  "mean_update_s": 0.021829613993759267,
+  "median_update_s": 0.018911669991211966,
+  "n_updates": 12,
+  "p90_update_s": 0.03492387778242119,
+  "recompiles": null,
+  "setup_ok": true,
+  "torch_version": "2.11.0+cu128",
+  "unique_batch_shapes": 26,
+  "unique_graphs": null,
+  "wall_s": 0.26341296802274883
+}

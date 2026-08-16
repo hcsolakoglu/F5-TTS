@@ -52,9 +52,7 @@ class TextEmbedding(nn.Module):
             self.extra_modeling = False
 
     def forward(self, text: int["b nt"], seq_len, drop_text=False):
-        text_tensor = (
-            cast(torch.Tensor, text) + 1
-        )  # use 0 as filler token. preprocess of batch pad -1, see list_str_to_idx()
+        text_tensor = cast(torch.Tensor, text) + 1  # use 0 as filler token. preprocess of batch pad -1, see list_str_to_idx()
         text_tensor = text_tensor[:, :seq_len]  # curtail if character tokens are more than the mel spec tokens
         batch, text_len = text_tensor.shape[0], text_tensor.shape[1]
         text_tensor = F.pad(text_tensor, (0, seq_len - text_len), value=0)
@@ -78,7 +76,9 @@ class TextEmbedding(nn.Module):
 
             # convnextv2 blocks
             if self.mask_padding:
-                text_tensor = text_tensor.masked_fill(text_mask.unsqueeze(-1).expand(-1, -1, text_tensor.size(-1)), 0.0)
+                text_tensor = text_tensor.masked_fill(
+                    text_mask.unsqueeze(-1).expand(-1, -1, text_tensor.size(-1)), 0.0
+                )
                 for block in self.text_blocks:
                     text_tensor = block(text_tensor)
                     text_tensor = text_tensor.masked_fill(

@@ -474,19 +474,7 @@ def infer_batch_process(
     if len(ref_text[-1].encode("utf-8")) == 1:
         ref_text = ref_text + " "
 
-    # Allocate fix_duration across chunks to avoid each chunk using the full-sentence duration (N× blow-up)
-    if fix_duration is not None and len(gen_text_batches) > 1:
-        ref_audio_len_frames = audio.shape[-1] // hop_length
-        ref_sec = ref_audio_len_frames * hop_length / target_sample_rate
-        target_total = fix_duration - ref_sec
-        weights = [len(c.encode("utf-8")) for c in gen_text_batches]
-        total_w = sum(weights)
-        allocatable = target_total + cross_fade_duration * (len(gen_text_batches) - 1)
-        fix_durations = [ref_sec + allocatable * w / total_w for w in weights]
-    else:
-        fix_durations = [fix_duration] * len(gen_text_batches)
-
-    def _infer_basic(gen_text, fix_dur):
+    def _infer_basic(gen_text):
         local_speed = speed
         if len(gen_text.encode("utf-8")) < 10:
             local_speed = 0.3
@@ -496,8 +484,8 @@ def infer_batch_process(
         final_text_list = convert_char_to_pinyin(text_list)
 
         ref_audio_len = audio.shape[-1] // hop_length
-        if fix_dur is not None:
-            duration = int(fix_dur * target_sample_rate / hop_length)
+        if fix_duration is not None:
+            duration = int(fix_duration * target_sample_rate / hop_length)
         else:
             # Calculate duration
             ref_text_len = len(ref_text.encode("utf-8"))
@@ -531,27 +519,26 @@ def infer_batch_process(
 
         return generated_wave, generated
 
-    def infer_single_process(gen_text, fix_dur):
-        generated_wave, generated = _infer_basic(gen_text, fix_dur)
+    def infer_single_process(gen_text):
+        generated_wave, generated = _infer_basic(gen_text)
         generated_cpu = generated[0].cpu().numpy()
         del generated
         return generated_wave, generated_cpu
 
-    def infer_single_process_streaming(gen_text, fix_dur):
+    def infer_single_process_streaming(gen_text):
         # for src/f5_tts/socket_server.py
-        generated_wave, generated = _infer_basic(gen_text, fix_dur)
+        generated_wave, generated = _infer_basic(gen_text)
         del generated
         for j in range(0, len(generated_wave), chunk_size):
             yield generated_wave[j : j + chunk_size], target_sample_rate
 
     if streaming:
-        batches_iter = progress.tqdm(gen_text_batches) if progress is not None else gen_text_batches
-        for gen_text, fix_dur in zip(batches_iter, fix_durations):
-            for chunk in infer_single_process_streaming(gen_text, fix_dur):
+        for gen_text in progress.tqdm(gen_text_batches) if progress is not None else gen_text_batches:
+            for chunk in infer_single_process_streaming(gen_text):
                 yield chunk
     else:
         with ThreadPoolExecutor() as executor:
-            futures = [executor.submit(infer_single_process, gt, fd) for gt, fd in zip(gen_text_batches, fix_durations)]
+            futures = [executor.submit(infer_single_process, gen_text) for gen_text in gen_text_batches]
             for future in progress.tqdm(futures) if progress is not None else futures:
                 result = future.result()
                 if result:

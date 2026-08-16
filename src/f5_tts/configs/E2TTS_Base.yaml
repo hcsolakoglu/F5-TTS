@@ -56,12 +56,7 @@ compile:
   enabled: False  # optional torch.compile path; disabled by default
   target: cfm_loss_core  # cfm_loss_core | dit_blocks
   backend: inductor  # requires triton on CUDA
-  # Keep the default mode for variable-length training. reduce-overhead and max-autotune
-  # were slower/unstable in measured variable-shape runs and are not recommended here.
-  mode: null
+  mode: null  # e.g. default, reduce-overhead, max-autotune (reduce-overhead/max-autotune need fixed shapes)
   fullgraph: False
-  dynamic: null  # modern Torch auto-detects shapes; legacy static-default Torch resolves null to True
+  dynamic: null  # variable lengths may recompile; compare null/True/False or fixed shapes
   fallback_to_eager: True  # fall back to eager if compile setup fails (runtime fallback disabled in DDP)
-  # Reproducibility note: with dropout > 0 (the default), Inductor uses its own RNG, so
-  # compiled dropout masks differ from eager. This is expected and statistically harmless.
-  # For eager-identical dropout, pass options={"fallback_random": True} to torch.compile.

@@ -8,4 +8,3 @@ dummy-variable-rgx = "^_.*$"
 [lint.isort]
 force-single-line = false
 lines-after-imports = 2
-known-third-party = ["wandb"]

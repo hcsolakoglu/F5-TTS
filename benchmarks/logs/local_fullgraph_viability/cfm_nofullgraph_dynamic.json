@@ -1,0 +1,64 @@
+{
+  "all_counters": {
+    "aot_autograd": {
+      "autograd_cache_hit": 2,
+      "autograd_cache_miss": 2,
+      "ok": 2,
+      "total": 4
+    },
+    "frames": {
+      "ok": 2,
+      "total": 2
+    },
+    "inductor": {
+      "async_compile_cache_hit": 257,
+      "async_compile_cache_miss": 387,
+      "extern_calls": 446,
+      "fxgraph_cache_hit": 4,
+      "pattern_matcher_count": 20,
+      "pattern_matcher_nodes": 20,
+      "triton_bundler_load_static_autotuner": 128
+    },
+    "stats": {
+      "calls_captured": 2940,
+      "unique_graphs": 2
+    }
+  },
+  "candidate": "cfm_nofullgraph_dynamic",
+  "candidate_config": {
+    "compile": true,
+    "dynamic": true,
+    "fullgraph": false,
+    "target": "cfm_loss_core"
+  },
+  "compile_state": {
+    "enabled": true,
+    "error": null,
+    "fallback_active": false,
+    "target": "cfm_loss_core"
+  },
+  "correctness": true,
+  "error": null,
+  "fallback": false,
+  "finite_loss": true,
+  "first_update_s": 0.027064445021096617,
+  "gate_loss_compiled": 1.212404489517212,
+  "gate_loss_eager": 1.212404489517212,
+  "gpu_name": "NVIDIA GeForce RTX 3070",
+  "grad_close": true,
+  "graph_break_counters": {},
+  "keys_clean": true,
+  "loss_close": true,
+  "max_memory_allocated_mb": 57.517578125,
+  "max_memory_reserved_mb": 80.0,
+  "mean_update_s": 0.719741350330878,
+  "median_update_s": 0.00822929447167553,
+  "n_updates": 12,
+  "p90_update_s": 5.9698356906068515,
+  "recompiles": null,
+  "setup_ok": true,
+  "torch_version": "2.11.0+cu128",
+  "unique_batch_shapes": 26,
+  "unique_graphs": 2,
+  "wall_s": 8.638229243981186
+}

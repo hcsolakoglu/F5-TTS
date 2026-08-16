@@ -1,0 +1,143 @@
+[
+  {
+    "candidate": "eager",
+    "launches_total": 44458,
+    "launches_per_update": 8891.6,
+    "top_kernels": [
+      {
+        "key": "aten::cudnn_convolution",
+        "calls": 10,
+        "us_total": 5269
+      },
+      {
+        "key": "_5x_cudnn_ampere_scudnn_128x32_relu_smal",
+        "calls": 160,
+        "us_total": 5022
+      },
+      {
+        "key": "aten::mm",
+        "calls": 505,
+        "us_total": 3048
+      },
+      {
+        "key": "aten::sum",
+        "calls": 550,
+        "us_total": 2563
+      },
+      {
+        "key": "void at::native::reduce_kernel<128, 4, a",
+        "calls": 485,
+        "us_total": 2355
+      },
+      {
+        "key": "aten::mul",
+        "calls": 1025,
+        "us_total": 1797
+      },
+      {
+        "key": "aten::addmm",
+        "calls": 255,
+        "us_total": 1583
+      },
+      {
+        "key": "ampere_sgemm_32x32_sliced1x4_tn",
+        "calls": 232,
+        "us_total": 1333
+      }
+    ]
+  },
+  {
+    "candidate": "fullgraph",
+    "launches_total": 13573,
+    "launches_per_update": 2714.6,
+    "top_kernels": [
+      {
+        "key": "aten::cudnn_convolution",
+        "calls": 10,
+        "us_total": 5267
+      },
+      {
+        "key": "_5x_cudnn_ampere_scudnn_128x32_relu_smal",
+        "calls": 160,
+        "us_total": 5019
+      },
+      {
+        "key": "aten::mm",
+        "calls": 555,
+        "us_total": 3410
+      },
+      {
+        "key": "ampere_sgemm_32x32_sliced1x4_tn",
+        "calls": 232,
+        "us_total": 1351
+      },
+      {
+        "key": "aten::addmm",
+        "calls": 205,
+        "us_total": 1223
+      },
+      {
+        "key": "aten::convolution_backward",
+        "calls": 20,
+        "us_total": 1184
+      },
+      {
+        "key": "aten::_efficient_attention_backward",
+        "calls": 30,
+        "us_total": 1161
+      },
+      {
+        "key": "fmha_cutlassB_f32_aligned_64x64_k64_sm80",
+        "calls": 30,
+        "us_total": 1161
+      }
+    ]
+  },
+  {
+    "candidate": "reduce_overhead",
+    "launches_total": 16347,
+    "launches_per_update": 3269.4,
+    "top_kernels": [
+      {
+        "key": "## Call CompiledFxGraph fj5525t34ncz4eq6",
+        "calls": 4,
+        "us_total": 6618
+      },
+      {
+        "key": "## Call CompiledFxGraph fggqwyagw26llxqv",
+        "calls": 4,
+        "us_total": 5467
+      },
+      {
+        "key": "_5x_cudnn_ampere_scudnn_128x32_relu_smal",
+        "calls": 160,
+        "us_total": 5094
+      },
+      {
+        "key": "## Call CompiledFxGraph fv4stzopsj3z2rrx",
+        "calls": 1,
+        "us_total": 1667
+      },
+      {
+        "key": "ampere_sgemm_32x32_sliced1x4_tn",
+        "calls": 232,
+        "us_total": 1300
+      },
+      {
+        "key": "## Call CompiledFxGraph fa7ns3jinwdafsd2",
+        "calls": 1,
+        "us_total": 1195
+      },
+      {
+        "key": "fmha_cutlassB_f32_aligned_64x64_k64_sm80",
+        "calls": 30,
+        "us_total": 1160
+      },
+      {
+        "key": "Optimizer.step#AdamW.step",
+        "calls": 5,
+        "us_total": 1159
+      }
+    ]
+  }
+]

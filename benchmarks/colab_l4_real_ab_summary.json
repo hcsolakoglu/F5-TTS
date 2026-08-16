@@ -1,0 +1,86 @@
+{
+  "scope": {
+    "generated": "2026-06-28",
+    "commit": "e04c641e6cc38f280d1987e58e853313c3cc44db",
+    "branch": "torch-compile-upstream-integration",
+    "requested_gpu": "L4",
+    "assigned_gpu": "NVIDIA L4",
+    "torch": "2.11.0+cu128",
+    "dataset": "openslr/librispeech_asr/clean train.100 streaming",
+    "samples": 1000,
+    "epochs": 2,
+    "updates": 130,
+    "unique_batch_shapes": 65,
+    "precision": {
+      "amp_or_quantization": "none",
+      "float32_matmul_precision": "highest",
+      "tf32_cudnn": false,
+      "tf32_matmul": false
+    },
+    "raw_log": "benchmarks/logs/colab_l4_real_ab_v14_full.local.log"
+  },
+  "correctness": [
+    {
+      "candidate": "compiled_default",
+      "loss_abs_diff": 0.0,
+      "pred_max_abs_diff": 0.0,
+      "grad_max_abs_diff": 2.9802322387695312e-08,
+      "state": {
+        "enabled": true,
+        "error": null,
+        "fallback_active": false
+      }
+    }
+  ],
+  "results": [
+    {
+      "candidate": "eager",
+      "wall_s": 182.38143831899993,
+      "mean_update_s": 1.4029341409153842,
+      "median_update_s": 1.5147902379999323,
+      "p90_update_s": 1.6072967970998888,
+      "first_update_s": 1.94429695000008,
+      "last_update_s": 1.5076698279999619,
+      "wall_speedup_vs_eager": 1.0,
+      "median_speedup_vs_eager": 1.0,
+      "max_alloc_mb": 14788.271484375,
+      "max_reserved_mb": 17710.0,
+      "loss_first": 9.866446495056152,
+      "loss_last": 2.538334846496582,
+      "loss_finite": true,
+      "compile_active": false,
+      "fallback": false,
+      "unique_graphs": null
+    },
+    {
+      "candidate": "compiled_default",
+      "wall_s": 1088.757311521,
+      "mean_update_s": 8.375056242469231,
+      "median_update_s": 1.2015385280001283,
+      "p90_update_s": 1.2860631970998384,
+      "first_update_s": 92.71730656500017,
+      "last_update_s": 1.1685906019997674,
+      "wall_speedup_vs_eager": 0.16751339934903586,
+      "median_speedup_vs_eager": 1.2607088351308953,
+      "max_alloc_mb": 13041.88427734375,
+      "max_reserved_mb": 16600.0,
+      "loss_first": 9.866447448730469,
+      "loss_last": 2.1063590049743652,
+      "loss_finite": true,
+      "compile_active": true,
+      "fallback": false,
+      "unique_graphs": 8
+    }
+  ],
+  "derived": {
+    "median_step_saved_s_compiled_vs_eager": 0.313251709999804,
+    "median_step_saved_ms_compiled_vs_eager": 313.251709999804,
+    "wall_extra_s_compiled_vs_eager": 906.3758732020001,
+    "observed_break_even_updates": 2893.4426988525206,
+    "audio_hours_processed": 4.115500173611111,
+    "eager_audio_realtime_factor": 81.23023572685063,
+    "compiled_audio_realtime_factor": 13.606965755426914,
+    "alloc_mb_delta_compiled_minus_eager": -1746.38720703125,
+    "reserved_mb_delta_compiled_minus_eager": -1110.0
+  }
+}
