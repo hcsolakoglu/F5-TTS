@@ -348,7 +348,7 @@ class CFM(nn.Module):
         acceptable for users who never asked for it.
 
         After a *runtime compile fallback* (``_compile_fallback_active``), the module is
-        back to eager, but we deliberately keep the fp32 masked-multiply reduction
+        back to eager, but we deliberately keep the fp32 torch.where-selecting reduction
         (``_forward_loss_core_components``) instead of the upstream-exact path. The
         upstream path computes ``F.mse_loss(pred, flow)`` in the input dtype, so an fp16
         AMP run that fell back mid-training would switch from the compiled fp32
@@ -379,7 +379,7 @@ class CFM(nn.Module):
         """Reproduce upstream's loss reduction exactly (never compiled).
 
         ``loss[rand_span_mask]`` produces a data-dependent shape, which graph-breaks under
-        torch.compile -- that is precisely why the compiled path uses the masked-multiply
+        torch.compile -- that is precisely why the compiled path uses the masked-select
         form instead. Keeping this expression for the default path is what makes
         compile-disabled training bit-for-bit identical to upstream, including dtype: the
         compiled path accumulates in fp32 (needed so a raw ``loss_sum`` cannot overflow

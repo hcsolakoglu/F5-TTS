@@ -1,5 +1,7 @@
 import copy
 import io
+import os
+import subprocess
 import sys
 import types
 from pathlib import Path
@@ -223,6 +225,32 @@ class _SilentProgress:
 
     def set_postfix(self, *args, **kwargs):
         pass
+
+
+class _PrecomputedMelDataset(torch.utils.data.Dataset):
+    """Tiny real Trainer dataset: variable mel/text lengths, no external downloads."""
+
+    def __init__(self):
+        generator = torch.Generator().manual_seed(2026)
+        self.lengths = [8, 12, 16, 20]
+        self.texts = ["a", "abcdef", "hi", "long text"]
+        self.mels = [torch.randn(8, frames, generator=generator) for frames in self.lengths]
+
+    def __len__(self):
+        return len(self.mels)
+
+    def get_frame_len(self, index):
+        return self.lengths[index]
+
+    def __getitem__(self, index):
+        return {"mel_spec": self.mels[index], "text": self.texts[index]}
+
+
+def _assert_clean_checkpoint_state_dict(checkpoint_path: Path):
+    checkpoint = torch.load(checkpoint_path, map_location="cpu", weights_only=True)
+    state_dict = checkpoint["model_state_dict"]
+    assert state_dict
+    assert not any("_orig_mod" in key or "compile" in key or "compiled" in key for key in state_dict)
 
 
 def _assert_clean_checkpoint_state_dict(checkpoint_path: Path):
@@ -2074,120 +2102,6 @@ def test_compile_guard_blocks_cuda_inductor_for_average_upsampling():
 # ---------------------------------------------------------------------------
 
 
-class _TwoSampleDataset(torch.utils.data.Dataset):
-    """Four samples with different mel lengths so masked-frame denoms differ."""
-
-    def __init__(self, sample_count=4):
-        gen = torch.Generator().manual_seed(2026)
-        self.lengths = [8, 12, 16, 20]
-        self.texts = ["ab", "cde", "abcdef", "long text"]
-        self.mels = [torch.randn(8, f, generator=gen) for f in self.lengths]
-        if not 1 <= sample_count <= len(self.mels):
-            raise ValueError(f"sample_count must be in [1, {len(self.mels)}]")
-        self.lengths = self.lengths[:sample_count]
-        self.texts = self.texts[:sample_count]
-        self.mels = self.mels[:sample_count]
-
-    def __len__(self):
-        return len(self.mels)
-
-    def get_frame_len(self, index):
-        return self.lengths[index]
-
-    def __getitem__(self, index):
-        return {"mel_spec": self.mels[index], "text": self.texts[index]}
-
-
-def _run_trainer_one_update(global_masked_mean, tmp_path, monkeypatch, *, sample_count=4):
-    """Run a real Trainer.train loop for two updates; return wiring + gradient evidence.
-
-    Uses 4 samples with batch_size=1 and grad_accumulation_steps=2 → 2 updates, which
-    avoids the LinearLR ZeroDivisionError that occurs with total_updates == warmup_updates.
-    Gradients are captured at each sync_gradients (before zero_grad clears them).
-    """
-    from f5_tts.model import trainer as trainer_module
-    from f5_tts.model.trainer import Trainer
-
-    monkeypatch.setattr(trainer_module, "tqdm", _SilentProgress)
-
-    torch.manual_seed(2026)
-    model = _build_model(vocab_size=256)
-    dataset = _TwoSampleDataset(sample_count=sample_count)
-
-    backward_vals: list[float] = []
-    scale_calls: list[float] = []
-    component_vals: list[tuple[float, float, float]] = []
-    captured_grads: list[list[torch.Tensor | None]] = []
-
-    trainer = Trainer(
-        model,
-        epochs=1,
-        learning_rate=0.0,
-        num_warmup_updates=1,
-        save_per_updates=10**9,
-        keep_last_n_checkpoints=0,
-        checkpoint_path=str(tmp_path / f"ckpt_{global_masked_mean}"),
-        batch_size_per_gpu=1,
-        batch_size_type="sample",
-        grad_accumulation_steps=2,
-        max_grad_norm=0.0,
-        logger=None,
-        log_samples=False,
-        last_per_updates=10**9,
-        compile_enabled=False,
-        global_masked_mean=global_masked_mean,
-    )
-
-    # Record what backward receives.
-    original_backward = trainer.accelerator.backward
-
-    def recording_backward(loss, **kwargs):
-        backward_vals.append(float(loss.detach().item()))
-        return original_backward(loss, **kwargs)
-
-    trainer.accelerator.backward = recording_backward
-
-    # Record loss components (only called on the return_loss_components=True path).
-    module = cast(Any, trainer._unwrapped_model)
-    original_run = module._run_loss_core_components
-
-    def recording_run(*args):
-        result = original_run(*args)
-        component_vals.append(
-            (float(result[0].detach().item()), float(result[1].detach().item()), float(result[2].detach().item()))
-        )
-        return result
-
-    object.__setattr__(module, "_run_loss_core_components", recording_run)
-
-    # Record scaler calls.
-    original_scale = trainer._scale_gradients_by_loss_denom
-
-    def recording_scale(global_loss_denom):
-        scale_calls.append(float(global_loss_denom.item()))
-        return original_scale(global_loss_denom)
-
-    trainer._scale_gradients_by_loss_denom = recording_scale
-
-    # Capture grads before zero_grad clears them (only at sync_gradients).
-    original_zero_grad = trainer.optimizer.zero_grad
-
-    def capturing_zero_grad(*args, **kwargs):
-        if trainer.accelerator.sync_gradients:
-            captured_grads.append(
-                [p.grad.detach().clone() if p.grad is not None else None for p in trainer._unwrapped_model.parameters()]
-            )
-        return original_zero_grad(*args, **kwargs)
-
-    trainer.optimizer.zero_grad = capturing_zero_grad
-
-    # Seed global RNG identically for both runs so forward passes match.
-    torch.manual_seed(42)
-    trainer.train(dataset, num_workers=0, resumable_with_seed=123)
-
-    return backward_vals, scale_calls, component_vals, captured_grads
-
-
 def test_default_loss_path_gradient_matches_average_of_means_not_global_mean():
     """With global_masked_mean=False, gradients equal backprop of per-microbatch means
     (historical average-of-means), which differs from the global masked-mean when
@@ -2548,3 +2462,128 @@ def test_never_compiled_default_path_stays_bit_exact_upstream_after_fallback_fix
         if loss.item() != reference.item():
             mismatches += 1
     assert mismatches == 0, f"never-compiled default diverged from upstream on {mismatches}/10 seeds"
+
+
+def test_real_two_rank_invalid_compile_backend_setup_raises_without_hanging():
+    """Strict invalid compile setup must complete the rank collective before raising."""
+    worker = ROOT / "tests" / "training_compile_ddp_worker.py"
+    env = os.environ.copy()
+    source_path = str(ROOT / "src")
+    env["PYTHONPATH"] = source_path + os.pathsep + env.get("PYTHONPATH", "")
+    # Accelerator(cpu=True) still resolves CUDA state under torchrun on a CUDA-visible
+    # host, which makes the teardown barrier fail with an invalid device ordinal.
+    # Force a pure-CPU context for the probe subprocess.
+    env["CUDA_VISIBLE_DEVICES"] = ""
+    result = subprocess.run(
+        [
+            sys.executable,
+            "-m",
+            "torch.distributed.run",
+            "--standalone",
+            "--nproc_per_node=2",
+            str(worker),
+            "--invalid-compile-backend",
+        ],
+        cwd=ROOT,
+        env=env,
+        text=True,
+        capture_output=True,
+        timeout=90,
+        check=False,
+    )
+
+    combined_output = result.stdout + result.stderr
+    assert result.returncode == 0, combined_output
+    assert "REAL_DDP_INVALID_BACKEND_OK" in combined_output
+
+
+def test_real_trainer_frame_dataset_dit_blocks_compile_runs_variable_shape_epoch(tmp_path, monkeypatch):
+    """Regression for compile bugs missed by direct CFM calls.
+
+    This uses the actual Trainer.train DataLoader path with DynamicBatchSampler and
+    collate_fn, variable mel/text lengths, string tokenization, optimizer/scheduler,
+    EMA checkpoint save, and target=dit_blocks compile setup after Accelerate.prepare.
+    """
+    from f5_tts.model import dataset as dataset_module
+    from f5_tts.model import trainer as trainer_module
+    from f5_tts.model.trainer import Trainer
+
+    monkeypatch.setattr(trainer_module, "tqdm", _SilentProgress)
+    monkeypatch.setattr(dataset_module, "tqdm", _SilentProgress)
+    # Upstream v1.1.22 builds training DataLoaders with persistent_workers=True, which
+    # PyTorch rejects for num_workers=0. The standalone zero-workers PR fixes the
+    # trainer itself; until it merges (stack order), force the flag off here so this
+    # PR keeps its real-Trainer-loop coverage.
+    real_dataloader = trainer_module.DataLoader
+
+    def _dataloader_without_persistent_zero_workers(*args, **kwargs):
+        if kwargs.get("num_workers", 0) == 0:
+            kwargs["persistent_workers"] = False
+        return real_dataloader(*args, **kwargs)
+
+    monkeypatch.setattr(trainer_module, "DataLoader", _dataloader_without_persistent_zero_workers)
+    torch.manual_seed(2026)
+
+    train_dataset = _PrecomputedMelDataset()
+    model = _build_model(
+        audio_drop_prob=1.0,
+        cond_drop_prob=1.0,
+        vocab_size=256,
+    )
+    trainer = Trainer(
+        model,
+        epochs=1,
+        learning_rate=1e-4,
+        num_warmup_updates=1,
+        save_per_updates=10**9,
+        keep_last_n_checkpoints=0,
+        checkpoint_path=str(tmp_path),
+        batch_size_per_gpu=20,
+        batch_size_type="frame",
+        max_samples=2,
+        grad_accumulation_steps=1,
+        max_grad_norm=1.0,
+        logger=None,
+        log_samples=False,
+        last_per_updates=10**9,
+        compile_enabled=True,
+        compile_backend="eager",
+        compile_target="dit_blocks",
+        compile_fullgraph=False,
+        compile_dynamic=None,
+        compile_fallback_to_eager=False,
+    )
+
+    module = cast(Any, trainer._unwrapped_model)
+    original_run_components = module._run_loss_core_components
+    seen_core_calls = []
+
+    def recording_run_components(*loss_args):
+        x1, text, _mask, _rand_span_mask, _x0, _time, drop_audio_cond, drop_text = loss_args
+        seen_core_calls.append(
+            {
+                "mel_shape": tuple(x1.shape),
+                "text_shape": tuple(text.shape),
+                "drop_audio_cond": bool(drop_audio_cond),
+                "drop_text": bool(drop_text),
+            }
+        )
+        return original_run_components(*loss_args)
+
+    object.__setattr__(module, "_run_loss_core_components", recording_run_components)
+
+    trainer.train(train_dataset, num_workers=0, resumable_with_seed=123)
+
+    assert trainer.compile_active is True
+    assert trainer.compile_fallback_active is False
+    assert module.training_compile_state == {
+        "enabled": True,
+        "target": "dit_blocks",
+        "fallback_active": False,
+        "error": None,
+    }
+    assert len(seen_core_calls) == 3
+    assert len({call["mel_shape"] for call in seen_core_calls}) > 1
+    assert len({call["text_shape"] for call in seen_core_calls}) > 1
+    assert all(call["drop_audio_cond"] and call["drop_text"] for call in seen_core_calls)
+    _assert_clean_checkpoint_state_dict(tmp_path / "model_last.pt")
