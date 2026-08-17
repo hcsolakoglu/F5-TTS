@@ -239,6 +239,15 @@ def test_window_iterator_accepts_preprocessed_pinyin_token_lists():
     assert yielded[4] is True
 
 
+def test_window_iterator_rejects_nested_tokens_without_vocabulary_map():
+    trainer = _iterator_trainer([torch.ones((1, 3), dtype=torch.bool)], gradient_accumulation_steps=1)
+    batch = _batch(mel_channels=2, seq_len=3)
+    batch["text"] = [[" ", "ni3", "hao3"]]
+
+    with pytest.raises(ValueError, match="nested text token lists require a vocabulary map"):
+        list(trainer._iter_global_masked_mean_batches([batch]))
+
+
 def test_window_iterator_rejects_non_string_preprocessed_text_tokens():
     trainer = _iterator_trainer([torch.ones((1, 3), dtype=torch.bool)], gradient_accumulation_steps=1)
     batch = _batch(mel_channels=2, seq_len=3)

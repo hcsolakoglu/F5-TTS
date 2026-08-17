@@ -282,6 +282,14 @@ class Trainer:
                 for item in text
             ):
                 return "text list entries must be strings or lists of strings"
+            # list_str_to_idx supports nested token lists (pinyin style), but only
+            # when the model has a vocabulary map. Without one CFM falls back to
+            # ByT5 byte encoding (list_str_to_tensor), which requires plain strings
+            # and would otherwise raise a cryptic TypeError deep inside forward.
+            if any(isinstance(item, list) for item in text) and not (
+                getattr(self._unwrapped_model, "vocab_char_map", None) is not None
+            ):
+                return "nested text token lists require a vocabulary map"
         else:
             return "text must be a tensor or list"
         return None
