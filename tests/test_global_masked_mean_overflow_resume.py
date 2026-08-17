@@ -57,7 +57,7 @@ class _OverflowModel(nn.Module):
         loss_sum = self.weight.square() * denominator
         loss = loss_sum / denominator
         if return_loss_components:
-            return loss_sum, denominator, mel, mel
+            return loss, loss_sum, denominator, mel, mel
         return loss, mel, mel
 
 

@@ -1,10 +1,11 @@
 from __future__ import annotations
 
 import gc
+import inspect
 import math
 import os
 from contextlib import contextmanager, nullcontext
-from typing import cast
+from typing import Any, cast
 
 import torch
 import torchaudio
@@ -20,6 +21,35 @@ from tqdm import tqdm
 from f5_tts.model import CFM
 from f5_tts.model.dataset import DynamicBatchSampler, collate_fn
 from f5_tts.model.utils import default, exists
+
+
+def _resolve_compile_dynamic(
+    requested: bool | None,
+    compile_fn: Any,
+) -> bool | None:
+    """Resolve ``dynamic=None`` across torch.compile API generations.
+
+    PyTorch 2.0 exposed ``dynamic=False`` as the callable default, while newer
+    releases use ``None`` for automatic dynamic-shape detection. Preserve an
+    explicit user choice on every release. For the auto setting, opt into
+    ``dynamic=True`` only when the callable's published signature proves that
+    omission would select the legacy static default.
+
+    Signature inspection follows ``functools.wraps`` metadata. If a custom or
+    monkeypatched callable has no trustworthy signature, leave the argument
+    unset rather than guessing at an API it may not support.
+    """
+    if requested is not None:
+        return requested
+
+    try:
+        dynamic_parameter = inspect.signature(compile_fn, follow_wrapped=True).parameters.get("dynamic")
+    except Exception:
+        return None
+
+    if dynamic_parameter is not None and dynamic_parameter.default is False:
+        return True
+    return None
 
 
 # trainer
@@ -56,6 +86,13 @@ class Trainer:
         local_vocoder_path: str = "",  # local vocoder path
         model_cfg_dict: dict = dict(),  # training config
         global_masked_mean: bool = False,
+        compile_enabled: bool = False,
+        compile_backend: str | None = "inductor",
+        compile_target: str = "cfm_loss_core",
+        compile_mode: str | None = None,
+        compile_fullgraph: bool = False,
+        compile_dynamic: bool | None = None,
+        compile_fallback_to_eager: bool = True,
     ):
         ddp_kwargs = DistributedDataParallelKwargs(find_unused_parameters=True)
 
@@ -155,6 +192,18 @@ class Trainer:
 
         self.duration_predictor = duration_predictor
 
+        # torch.compile configuration (optional, default-off)
+        self.compile_enabled = compile_enabled
+        self.compile_backend = compile_backend
+        self.compile_target = compile_target
+        self.compile_mode = compile_mode
+        self.compile_fullgraph = compile_fullgraph
+        self.compile_dynamic = compile_dynamic
+        self.compile_fallback_to_eager = compile_fallback_to_eager
+        self.compile_active = False
+        self.compile_fallback_active = False
+        self._unwrapped_model = None  # cached after accelerator.prepare
+
         if bnb_optimizer:
             import bitsandbytes as bnb
 
@@ -163,6 +212,7 @@ class Trainer:
             self.optimizer = AdamW(model.parameters(), lr=learning_rate, fused=True)
         self.model, self.optimizer = self.accelerator.prepare(self.model, self.optimizer)
         self._unwrapped_model = self.accelerator.unwrap_model(self.model)
+        self._configure_compile()
 
     @property
     def is_main(self):
@@ -316,6 +366,148 @@ class Trainer:
                 "global_masked_mean requires equal dataloader lengths on every rank; "
                 f"received {gathered_lengths.cpu().tolist()}."
             )
+
+
+    # ---- torch.compile support (optional, default-off) ----
+
+    def _configure_compile(self):
+        """Set up torch.compile on the CFM loss core if enabled.
+
+        Compilation is lazy (triggered by the first real training batch); there is no
+        synthetic preflight, which avoids shape/vocab mismatches with arbitrary models.
+        In DDP (num_processes > 1) runtime fallback is disabled: a per-rank eager fallback
+        would desynchronise the gradient all-reduce. Setup-time fallback is still allowed
+        and synchronised across ranks via ``_sync_compile_setup_ddp``.
+
+        Strict mode (``compile_fallback_to_eager=False``): a rank-local setup exception is
+        deferred until *every* rank has participated in the status collective
+        (``_sync_compile_setup_ddp``), then all ranks raise coherently -- the failing rank
+        re-raises its original exception, peers raise a collective-failure error. This
+        prevents a rank-divergent setup failure from stranding healthy ranks in an
+        unmatched collective. Single-process preserves the original immediate re-raise.
+        """
+        if not self.compile_enabled:
+            return
+
+        if not hasattr(torch, "compile"):
+            # torch.compile unavailable: participate in the collective before raising.
+            self.compile_active = False
+            if self.compile_fallback_to_eager:
+                self.compile_fallback_active = True
+                if self.is_main:
+                    print("torch.compile is unavailable; falling back to eager training.")
+            self._sync_compile_setup_ddp(local_failed=True)
+            if not self.compile_fallback_to_eager:
+                raise RuntimeError("torch.compile is unavailable in this PyTorch build")
+            return
+
+        effective_compile_dynamic = _resolve_compile_dynamic(self.compile_dynamic, torch.compile)
+        compile_kwargs = {
+            "backend": self.compile_backend,
+            "mode": self.compile_mode,
+            "fullgraph": self.compile_fullgraph,
+            "dynamic": effective_compile_dynamic,
+        }
+        compile_kwargs = {k: v for k, v in compile_kwargs.items() if v is not None}
+
+        # Under DDP, disable runtime fallback so a compile failure raises on all ranks
+        # (collective-safe) instead of one rank silently going eager.
+        runtime_fallback = self.compile_fallback_to_eager and self.accelerator.num_processes <= 1
+
+        setup_exc: Exception | None = None
+        try:
+            compile_fn = getattr(self._unwrapped_model, "compile_training_core", None)
+            if compile_fn is None:
+                raise TypeError("The training model does not expose compile_training_core()")
+            compile_target = getattr(self, "compile_target", "cfm_loss_core")
+            compile_fn(target=compile_target, runtime_fallback=runtime_fallback, **compile_kwargs)
+            self.compile_active = True
+        except Exception as exc:
+            # Defer the strict-mode re-raise until after the collective so every rank
+            # participates before any rank raises. Store the exception; in fallback mode
+            # also mark/clear for eager continuation. In strict mode compile_fallback_active
+            # stays False (we are not falling back — we are about to raise).
+            setup_exc = exc
+            self.compile_active = False
+            if self.compile_fallback_to_eager:
+                self.compile_fallback_active = True
+                if self.is_main:
+                    print(f"torch.compile setup failed; falling back to eager training. Error: {exc}")
+                clear_fn = getattr(self._unwrapped_model, "clear_training_compile", None)
+                if clear_fn is not None:
+                    clear_fn()
+
+        # Every rank participates in the status exchange before any rank raises.
+        any_failed = self._sync_compile_setup_ddp(local_failed=setup_exc is not None)
+
+        # Strict mode: raise coherently on ALL ranks after the collective.
+        if any_failed and not self.compile_fallback_to_eager:
+            if setup_exc is not None:
+                raise setup_exc
+            raise RuntimeError("torch.compile setup failed on at least one rank; aborting (strict mode).")
+
+        if self.compile_active and self.is_main:
+            compile_target = getattr(self, "compile_target", "cfm_loss_core")
+            print(
+                f"torch.compile enabled (target={compile_target}, backend={self.compile_backend}, "
+                f"mode={self.compile_mode}, fullgraph={self.compile_fullgraph}, "
+                f"dynamic={effective_compile_dynamic})"
+            )
+            if self.accelerator.num_processes > 1 and self.compile_fallback_to_eager:
+                print("DDP detected: runtime compile fallback disabled (errors will raise on all ranks).")
+
+    def _sync_compile_setup_ddp(self, local_failed: bool = False) -> bool:
+        """Exchange setup-time compile status across DDP ranks via a single reduce.
+
+        Every rank participates before any rank raises, so a rank-divergent setup failure
+        cannot strand peers in an unmatched collective. ``local_failed`` carries strict-
+        mode failures (where ``compile_fallback_active`` is not set because we are about to
+        raise, not fall back). Returns ``True`` if any rank reported a setup failure. In
+        fallback mode, all ranks switch to eager so the gradient all-reduce stays
+        consistent. In strict mode the caller raises after this returns (see
+        ``_configure_compile``).
+
+        Uses ``accelerator.reduce(..., reduction='max')`` on a 0/1 flag rather than a raw
+        ``torch.distributed.all_reduce`` so the collective goes through Accelerate's
+        dispatch layer (handles DeepSpeed/FSDP process groups correctly). Single-process
+        returns the local flag directly with no collective.
+
+        This covers setup only. A compile failure that first surfaces at *runtime* on a
+        single rank is deliberately fatal for that rank (runtime fallback is disabled under
+        DDP, see ``_configure_compile``): the alternative, one rank silently going eager,
+        would desynchronise gradients and corrupt training silently. A dying rank aborts
+        the job through the launcher, which is the intended fail-fast behaviour -- it is
+        not a graceful, collective-safe recovery, and no per-step collective is added to
+        make it one because that cost would be paid by every healthy step.
+        """
+        failed = local_failed or self.compile_fallback_active
+        if self.accelerator.num_processes <= 1:
+            return failed
+        flag = torch.tensor(1.0 if failed else 0.0, device=self.accelerator.device)
+        flag = cast(torch.Tensor, self.accelerator.reduce(flag, reduction="max"))
+        any_failed = float(flag) > 0.0
+        if any_failed and self.compile_active:
+            if self.is_main:
+                print("torch.compile setup failed on at least one rank; switching all ranks to eager.")
+            clear_fn = getattr(self._unwrapped_model, "clear_training_compile", None)
+            if clear_fn is not None:
+                clear_fn()
+            self.compile_active = False
+        if any_failed:
+            self.compile_fallback_active = True
+        return any_failed
+
+    def _check_compile_runtime_fallback(self):
+        """Detect a runtime compile failure surfaced by the CFM module and update trainer state."""
+        if not self.compile_active:
+            return
+        state = getattr(self._unwrapped_model, "training_compile_state", None)
+        if state is not None and state["fallback_active"]:
+            if self.is_main:
+                print(f"torch.compile runtime failed; continuing eagerly. Error: {state['error']}")
+            self.compile_active = False
+            self.compile_fallback_active = True
+
 
     def save_checkpoint(self, update, last=False, *, consumed_batches: int | None = None):
         self.accelerator.wait_for_everyone()
@@ -560,7 +752,7 @@ class Trainer:
                         self.accelerator.log({"duration loss": dur_loss.item()}, step=global_update)
 
                     if self.global_masked_mean:
-                        loss_sum, _, cond, pred = self.model(
+                        _, loss_sum, _, cond, pred = self.model(
                             mel_spec,
                             text=text_inputs,
                             lens=mel_lengths,
@@ -574,6 +766,7 @@ class Trainer:
                         loss, cond, pred = self.model(
                             mel_spec, text=text_inputs, lens=mel_lengths, noise_scheduler=self.noise_scheduler
                         )
+                    self._check_compile_runtime_fallback()
                     self.accelerator.backward(loss)
 
                     if self.max_grad_norm > 0 and self.accelerator.sync_gradients:
@@ -631,32 +824,45 @@ class Trainer:
                         infer_text = [
                             text_inputs[0] + ([" "] if isinstance(text_inputs[0], list) else " ") + text_inputs[0]
                         ]
-                        with torch.inference_mode(), self.accelerator.autocast():
-                            generated, _ = self.accelerator.unwrap_model(self.model).sample(
-                                cond=mel_spec[0][:ref_audio_len].unsqueeze(0),
-                                text=infer_text,
-                                duration=ref_audio_len * 2,
-                                steps=nfe_step,
-                                cfg_strength=cfg_strength,
-                                sway_sampling_coef=sway_sampling_coef,
-                            )
-                            generated = generated.to(torch.float32)
-                            gen_mel_spec = generated[:, ref_audio_len:, :].permute(0, 2, 1).to(self.accelerator.device)
-                            ref_mel_spec = batch["mel"][0, :, :ref_audio_len].unsqueeze(0)
-                            if self.vocoder_name == "vocos":
-                                gen_audio = vocoder.decode(gen_mel_spec).cpu()
-                                ref_audio = vocoder.decode(ref_mel_spec).cpu()
-                            elif self.vocoder_name == "bigvgan":
-                                gen_audio = vocoder(gen_mel_spec).squeeze(0).cpu()
-                                ref_audio = vocoder(ref_mel_spec).squeeze(0).cpu()
+                        # Switch the unwrapped model to eval so regional compile dispatch
+                        # (which keys on Module.training) routes inference through the eager
+                        # path. Logged samples use cfg_infer-doubled batches and swept
+                        # durations; routing them through the training compile cache would
+                        # exhaust its per-code-object recompile budget and silently push new
+                        # training shapes back to eager while compile is still reported active.
+                        sample_model = self.accelerator.unwrap_model(self.model)
+                        was_training = sample_model.training
+                        sample_model.eval()
+                        try:
+                            with torch.inference_mode(), self.accelerator.autocast():
+                                generated, _ = sample_model.sample(
+                                    cond=mel_spec[0][:ref_audio_len].unsqueeze(0),
+                                    text=infer_text,
+                                    duration=ref_audio_len * 2,
+                                    steps=nfe_step,
+                                    cfg_strength=cfg_strength,
+                                    sway_sampling_coef=sway_sampling_coef,
+                                )
+                                generated = generated.to(torch.float32)
+                                gen_mel_spec = (
+                                    generated[:, ref_audio_len:, :].permute(0, 2, 1).to(self.accelerator.device)
+                                )
+                                ref_mel_spec = batch["mel"][0, :, :ref_audio_len].unsqueeze(0)
+                                if self.vocoder_name == "vocos":
+                                    gen_audio = vocoder.decode(gen_mel_spec).cpu()
+                                    ref_audio = vocoder.decode(ref_mel_spec).cpu()
+                                elif self.vocoder_name == "bigvgan":
+                                    gen_audio = vocoder(gen_mel_spec).squeeze(0).cpu()
+                                    ref_audio = vocoder(ref_mel_spec).squeeze(0).cpu()
 
-                        torchaudio.save(
-                            f"{log_samples_path}/update_{global_update}_gen.wav", gen_audio, target_sample_rate
-                        )
-                        torchaudio.save(
-                            f"{log_samples_path}/update_{global_update}_ref.wav", ref_audio, target_sample_rate
-                        )
-                        self.model.train()
+                            torchaudio.save(
+                                f"{log_samples_path}/update_{global_update}_gen.wav", gen_audio, target_sample_rate
+                            )
+                            torchaudio.save(
+                                f"{log_samples_path}/update_{global_update}_ref.wav", ref_audio, target_sample_rate
+                            )
+                        finally:
+                            sample_model.train(was_training)
 
         self.save_checkpoint(
             global_update,

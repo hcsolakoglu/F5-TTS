@@ -56,7 +56,8 @@ class _TrainingModel(nn.Module):
         self.forward_calls += 1
         loss_count = rand_span_mask.sum(dtype=torch.int64) * mel.shape[-1]
         loss_sum = self.weight.square() * loss_count
-        return loss_sum, loss_count, mel, mel
+        loss = loss_sum / loss_count
+        return loss, loss_sum, loss_count, mel, mel
 
 
 class _ControlledSGD(torch.optim.SGD):
@@ -155,6 +156,8 @@ def _trainer(
     trainer.ema_model = _CountingEMA()
     trainer.global_masked_mean = True
     trainer.grad_accumulation_steps = grad_accumulation_steps
+    trainer.compile_active = False
+    trainer._loaded_consumed_batches = 0
     trainer.max_grad_norm = max_grad_norm
     trainer.log_samples = False
     trainer.batch_size_type = "sample"

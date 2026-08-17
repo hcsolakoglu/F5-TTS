@@ -64,6 +64,7 @@ def mask_from_start_end_indices(
     end: torch.Tensor,
     length: int | None = None,
 ) -> torch.Tensor:
+    # Optional explicit length avoids a seq_len.max().item() CPU-GPU sync (graph break under torch.compile).
     max_seq_len = seq_len.max().item() if length is None else length
     seq = torch.arange(max_seq_len, device=start.device).long()
     start_mask = seq[None, :] >= start[:, None]

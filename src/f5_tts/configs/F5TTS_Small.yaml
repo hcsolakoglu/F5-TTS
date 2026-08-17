@@ -56,3 +56,12 @@ ckpts:
   keep_last_n_checkpoints: -1  # -1 to keep all, 0 to not save intermediate, > 0 to keep last N checkpoints
   last_per_updates: 5000  # save last checkpoint per updates
   save_dir: ckpts/${model.name}_${model.mel_spec.mel_spec_type}_${model.tokenizer}_${datasets.name}
+
+compile:
+  enabled: False  # optional torch.compile path; disabled by default
+  target: dit_blocks  # dit_blocks | cfm_loss_core
+  backend: inductor  # requires triton on CUDA
+  mode: null
+  fullgraph: False
+  dynamic: null  # modern Torch auto-detects shapes; legacy static-default Torch resolves null to True
+  fallback_to_eager: True  # fall back to eager if compile setup fails (runtime fallback disabled in DDP)

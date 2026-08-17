@@ -95,7 +95,7 @@ def test_forward_reuses_presampled_mask_without_resampling(monkeypatch):
         raise AssertionError("forward resampled a precomputed training mask")
 
     monkeypatch.setattr(model, "_sample_training_mask", fail_if_resampled)
-    loss_sum, denominator, _, _ = model(
+    loss, loss_sum, denominator, _, _ = model(
         inp,
         text,
         lens=lens,
@@ -105,7 +105,7 @@ def test_forward_reuses_presampled_mask_without_resampling(monkeypatch):
 
     # Four valid time positions, two mel channels each.
     assert denominator == 8
-    assert loss_sum.dtype == torch.float32
+    torch.testing.assert_close(loss, loss_sum / denominator)
 
 
 def test_forward_rejects_presampled_mask_with_wrong_shape():

@@ -129,7 +129,7 @@ def test_sample_training_mask_rejects_invalid_lengths(lens, seq_len, message):
         _cfm().sample_training_mask(lens, seq_len)
 
 
-def test_presampled_mask_returns_fp32_sum_and_int64_count(monkeypatch):
+def test_presampled_mask_returns_fp32_sum_and_denominator(monkeypatch):
     model = _cfm()
     inp = torch.tensor(
         [
@@ -152,7 +152,7 @@ def test_presampled_mask_returns_fp32_sum_and_int64_count(monkeypatch):
         lambda shape, *, dtype, device: torch.full(shape, 0.5, dtype=dtype, device=device),
     )
 
-    loss_sum, loss_count, cond, pred = model(
+    _, loss_sum, loss_count, cond, pred = model(
         inp,
         text=text,
         lens=lens,
@@ -161,12 +161,14 @@ def test_presampled_mask_returns_fp32_sum_and_int64_count(monkeypatch):
     )
 
     expected_elementwise = F.mse_loss(pred.float(), inp.float(), reduction="none")
-    expected_sum = (expected_elementwise * span[..., None]).sum()
+    expected_sum = torch.where(span[..., None], expected_elementwise, torch.zeros_like(expected_elementwise)).sum()
     expected_count = span.sum(dtype=torch.int64) * inp.shape[-1]
     torch.testing.assert_close(loss_sum, expected_sum)
     assert loss_sum.dtype == torch.float32
-    assert torch.equal(loss_count, expected_count)
-    assert loss_count.dtype == torch.int64
+    # The merged core returns a float denominator for the per-batch mean; exact
+    # int64 global counting lives in the trainer's own accumulation window math.
+    assert torch.equal(loss_count, expected_count.to(loss_count.dtype))
+    assert loss_count.dtype.is_floating_point
     assert torch.equal(cond == 0, span[..., None].expand_as(cond))
 
     loss_sum.backward()
@@ -206,7 +208,7 @@ def test_unselected_nonfinite_values_do_not_poison_loss_sum(monkeypatch):
         lambda shape, *, dtype, device: torch.full(shape, 0.5, dtype=dtype, device=device),
     )
 
-    loss_sum, loss_count, _, _ = model(
+    _, loss_sum, loss_count, _, _ = model(
         inp,
         text=text,
         lens=lens,
@@ -259,7 +261,7 @@ def test_cuda_low_precision_components_and_gradients_are_finite(dtype, monkeypat
         lambda shape, *, dtype, device: torch.full(shape, 0.5, dtype=dtype, device=device),
     )
 
-    loss_sum, loss_count, _, _ = model(
+    _, loss_sum, loss_count, _, _ = model(
         inp,
         text=text,
         lens=lens,
