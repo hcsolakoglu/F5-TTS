@@ -4,13 +4,14 @@ import gc
 import inspect
 import math
 import os
+from contextlib import contextmanager, nullcontext
 from typing import Any, cast
 
 import torch
 import torchaudio
 import wandb
 from accelerate import Accelerator
-from accelerate.utils import DistributedDataParallelKwargs
+from accelerate.utils import DistributedDataParallelKwargs, DistributedType, send_to_device
 from ema_pytorch import EMA
 from torch.optim import AdamW
 from torch.optim.lr_scheduler import LinearLR, SequentialLR
@@ -91,6 +92,7 @@ class Trainer:
         compile_fullgraph: bool = False,
         compile_dynamic: bool | None = None,
         compile_fallback_to_eager: bool = True,
+        global_masked_mean: bool = False,
     ):
         ddp_kwargs = DistributedDataParallelKwargs(find_unused_parameters=True)
 
@@ -104,6 +106,10 @@ class Trainer:
             gradient_accumulation_steps=grad_accumulation_steps,
             **accelerate_kwargs,
         )
+        self.global_masked_mean = global_masked_mean
+        self.grad_accumulation_steps = grad_accumulation_steps
+        self.max_grad_norm = max_grad_norm
+        self._validate_global_masked_mean_config()
 
         self.logger = logger
         if self.logger == "wandb":
@@ -161,8 +167,6 @@ class Trainer:
         self.batch_size_per_gpu = batch_size_per_gpu
         self.batch_size_type = batch_size_type
         self.max_samples = max_samples
-        self.grad_accumulation_steps = grad_accumulation_steps
-        self.max_grad_norm = max_grad_norm
 
         # mel vocoder config
         self.vocoder_name = mel_spec_type
@@ -193,6 +197,7 @@ class Trainer:
             self.optimizer = AdamW(model.parameters(), lr=learning_rate, fused=True)
         self.model, self.optimizer = self.accelerator.prepare(self.model, self.optimizer)
         self._unwrapped_model = self.accelerator.unwrap_model(self.model)
+        self._validate_global_masked_mean_backend()
         self._configure_compile()
 
     @property
@@ -200,6 +205,84 @@ class Trainer:
         return self.accelerator.is_main_process
 
     # ---- torch.compile support (optional, default-off) ----
+
+    def _validate_global_masked_mean_config(self):
+        """Reject incompatible distributed configurations before model setup."""
+        if not self.global_masked_mean:
+            return
+        if self.accelerator.distributed_type in (DistributedType.FSDP, DistributedType.MEGATRON_LM):
+            raise NotImplementedError(
+                f"global_masked_mean=True does not support {self.accelerator.distributed_type.value}; "
+                "the current F5-TTS EMA and checkpoint path is not compatible with sharded model parameters."
+            )
+        if self.accelerator.distributed_type != DistributedType.DEEPSPEED:
+            return
+
+        deepspeed_plugin = self.accelerator.state.deepspeed_plugin
+        zero_stage = int(getattr(deepspeed_plugin, "zero_stage", 0))
+        if zero_stage != 0:
+            raise NotImplementedError(
+                "global_masked_mean currently supports DeepSpeed ZeRO stage 0 only. "
+                "F5-TTS checkpointing saves optimizer state on rank 0 and its EMA requires full parameters, "
+                "so enabling sharded ZeRO stages would produce incomplete checkpoints or invalid EMA updates."
+            )
+
+        configured_gas = deepspeed_plugin.get_value("gradient_accumulation_steps")
+        if configured_gas not in (None, "auto") and int(configured_gas) != self.grad_accumulation_steps:
+            raise ValueError(
+                "DeepSpeed and Trainer gradient accumulation steps must match for global_masked_mean=True."
+            )
+
+        deepspeed_clip = deepspeed_plugin.get_value("gradient_clipping")
+        expected_clip = self.max_grad_norm if self.max_grad_norm > 0 else 0.0
+        if deepspeed_clip in (None, "auto"):
+            deepspeed_plugin.deepspeed_config["gradient_clipping"] = expected_clip
+        elif float(deepspeed_clip) != float(expected_clip):
+            raise ValueError(
+                "DeepSpeed gradient_clipping must match Trainer.max_grad_norm for global_masked_mean=True "
+                "because DeepSpeed steps inside Accelerator.backward()."
+            )
+
+    def _validate_global_masked_mean_backend(self):
+        """Validate the prepared DeepSpeed engine required by manual boundaries."""
+        if not self.global_masked_mean or self.accelerator.distributed_type != DistributedType.DEEPSPEED:
+            return
+
+        set_boundary = getattr(self.model, "set_gradient_accumulation_boundary", None)
+        if not callable(set_boundary):
+            raise NotImplementedError(
+                "global_masked_mean=True requires DeepSpeedEngine.set_gradient_accumulation_boundary()."
+            )
+
+        # One denominator is correct only when every process is a replica in
+        # the same data-parallel group. F5-TTS does not configure these
+        # model-parallel modes, but reject externally supplied combinations
+        # rather than silently over-counting their replicated samples.
+        unsupported_modes = []
+        if getattr(self.model, "sequence_parallel_size", 1) != 1:
+            unsupported_modes.append("sequence parallelism")
+        if getattr(self.model, "mp_world_size", 1) != 1:
+            unsupported_modes.append("model parallelism")
+        if getattr(self.model, "pipeline_parallelism", False):
+            unsupported_modes.append("pipeline parallelism")
+        if getattr(self.model, "has_moe_layers", False):
+            unsupported_modes.append("MoE expert parallelism")
+        if getattr(self.model, "dp_world_size", self.accelerator.num_processes) != self.accelerator.num_processes:
+            unsupported_modes.append("a non-world data-parallel group")
+        if unsupported_modes:
+            modes = ", ".join(unsupported_modes)
+            raise NotImplementedError(f"global_masked_mean=True does not yet support DeepSpeed {modes}.")
+
+        accelerator_gas = int(self.accelerator.gradient_accumulation_steps)
+        if accelerator_gas != self.grad_accumulation_steps:
+            raise ValueError(
+                "Accelerator and Trainer gradient accumulation steps must match for global_masked_mean=True."
+            )
+        deepspeed_gas = getattr(self.model, "gradient_accumulation_steps", None)
+        if callable(deepspeed_gas) and int(deepspeed_gas()) != self.grad_accumulation_steps:
+            raise ValueError(
+                "DeepSpeed and Trainer gradient accumulation steps must match for global_masked_mean=True."
+            )
 
     def _configure_compile(self):
         """Set up torch.compile on the CFM loss core if enabled.
@@ -339,7 +422,156 @@ class Trainer:
             self.compile_active = False
             self.compile_fallback_active = True
 
-    def save_checkpoint(self, update, last=False):
+    def _reduce_global_masked_value(self, local_value: torch.Tensor) -> torch.Tensor:
+        """Sum a detached scalar over the supported data-parallel group."""
+        local_value = local_value.detach().to(device=self.accelerator.device)
+        return cast(torch.Tensor, self.accelerator.reduce(local_value, reduction="sum"))
+
+    def _iter_global_masked_mean_batches(self, dataloader):
+        """Yield pre-normalized accumulation windows without retaining graphs."""
+        dataloader_iter = iter(dataloader)
+        sample_mask = getattr(self._unwrapped_model, "sample_training_mask", None)
+        if not callable(sample_mask):
+            raise TypeError("The training model does not expose sample_training_mask().")
+
+        while True:
+            batches = []
+
+            for _ in range(self.grad_accumulation_steps):
+                try:
+                    batch = next(dataloader_iter)
+                except StopIteration:
+                    break
+                batches.append(batch)
+
+            if not batches:
+                return
+
+            window = []
+            local_loss_denom = torch.zeros((), device=self.accelerator.device, dtype=torch.int64)
+            local_error = None
+            for batch in batches:
+                batch_error = self._validate_global_masked_batch(batch)
+                rand_span_mask = None
+                if batch_error is None:
+                    try:
+                        mel = batch["mel"]
+                        rand_span_mask = sample_mask(batch["mel_lengths"], mel.shape[-1])
+                        batch_loss_denom = rand_span_mask.sum(dtype=torch.int64) * mel.shape[1]
+                        local_loss_denom = local_loss_denom + batch_loss_denom
+                    except Exception as exc:
+                        batch_error = f"training-mask preparation failed: {exc}"
+                if batch_error is not None and local_error is None:
+                    local_error = batch_error
+                window.append((batch, rand_span_mask))
+
+            local_stats = torch.stack(
+                (
+                    local_loss_denom,
+                    torch.tensor(int(local_error is not None), device=self.accelerator.device, dtype=torch.int64),
+                )
+            )
+            global_stats = self._reduce_global_masked_value(local_stats)
+            global_denom_value, global_error_count = global_stats.cpu().tolist()
+            if global_error_count:
+                detail = local_error or "another rank reported malformed training input"
+                raise ValueError(f"global_masked_mean rejected an accumulation window: {detail}")
+            if global_denom_value == 0:
+                raise RuntimeError(
+                    "global_masked_mean produced an empty accumulation window; "
+                    "no optimizer update can be defined without masked elements."
+                )
+            global_loss_denom = global_stats[0]
+            loss_scale = global_loss_denom.to(dtype=torch.float32).reciprocal()
+            loss_scale = loss_scale * (self.grad_accumulation_steps * self.accelerator.num_processes)
+
+            for index, (batch, rand_span_mask) in enumerate(window):
+                assert rand_span_mask is not None
+                is_boundary = index == len(window) - 1
+                yield batch, rand_span_mask, loss_scale, global_loss_denom, is_boundary
+
+    def _validate_global_masked_batch(self, batch) -> str | None:
+        """Return a rank-local validation error without raising before collectives."""
+        if not isinstance(batch, dict):
+            return f"expected a batch dictionary, received {type(batch).__name__}"
+        if "mel" not in batch or "mel_lengths" not in batch or "text" not in batch:
+            return "batch must contain mel, mel_lengths, and text"
+
+        mel = batch["mel"]
+        mel_lengths = batch["mel_lengths"]
+        if not isinstance(mel, torch.Tensor) or mel.ndim != 3:
+            return "mel must be a rank-3 tensor shaped [batch, channels, frames]"
+        if not mel.is_floating_point():
+            return f"mel must use a floating-point dtype, received {mel.dtype}"
+        if mel.shape[0] == 0:
+            return "mel batch must not be empty"
+        expected_channels = getattr(self._unwrapped_model, "num_channels", mel.shape[1])
+        if mel.shape[1] != expected_channels:
+            return f"mel channel count must be {expected_channels}, received {mel.shape[1]}"
+        if not isinstance(mel_lengths, torch.Tensor) or mel_lengths.ndim != 1:
+            return "mel_lengths must be a rank-1 tensor"
+        if mel_lengths.shape[0] != mel.shape[0]:
+            return "mel_lengths count must match the mel batch size"
+        if mel_lengths.dtype == torch.bool or mel_lengths.is_floating_point() or mel_lengths.is_complex():
+            return f"mel_lengths must use an integer dtype, received {mel_lengths.dtype}"
+        if bool(((mel_lengths <= 0) | (mel_lengths > mel.shape[-1])).any().item()):
+            return f"mel_lengths values must be between 1 and the padded frame length ({mel.shape[-1]})"
+
+        text = batch["text"]
+        if isinstance(text, torch.Tensor):
+            if text.ndim == 0 or text.shape[0] != mel.shape[0]:
+                return "tensor text batch size must match the mel batch size"
+            if text.dtype == torch.bool or text.is_floating_point() or text.is_complex():
+                return f"tensor text must use an integer dtype, received {text.dtype}"
+        elif isinstance(text, list):
+            if len(text) != mel.shape[0]:
+                return "text list size must match the mel batch size"
+            if any(
+                not isinstance(item, str)
+                and (not isinstance(item, list) or any(not isinstance(token, str) for token in item))
+                for item in text
+            ):
+                return "text list entries must be strings or lists of strings"
+        else:
+            return "text must be a tensor or list"
+        return None
+
+    @contextmanager
+    def _accumulation_context(self, is_boundary: bool | None):
+        """Select automatic or explicit accumulation without backend ambiguity."""
+        if is_boundary is None:
+            with self.accelerator.accumulate(self.model):
+                yield
+            return
+
+        self.accelerator.sync_gradients = is_boundary
+        if self.accelerator.distributed_type == DistributedType.DEEPSPEED:
+            # Accelerate 0.33 always calls DeepSpeedEngine.step() from backward,
+            # while newer releases propagate sync_gradients themselves. Setting
+            # the public engine boundary works in both implementations and is
+            # required to flush a final partial accumulation window.
+            self.model.set_gradient_accumulation_boundary(is_boundary)
+            sync_context = nullcontext()
+        else:
+            sync_context = nullcontext() if is_boundary else self.accelerator.no_sync(self.model)
+
+        with sync_context:
+            yield
+
+    def _validate_global_masked_dataloader(self, dataloader):
+        """Fail collectively if ranks would execute different forward counts."""
+        local_length = torch.tensor([len(dataloader)], device=self.accelerator.device, dtype=torch.int64)
+        gathered_lengths = cast(torch.Tensor, self.accelerator.gather(local_length))
+        if gathered_lengths[0].item() == 0:
+            raise ValueError("global_masked_mean requires a non-empty training dataloader.")
+        if bool((gathered_lengths != gathered_lengths[0]).any().item()):
+            lengths = gathered_lengths.cpu().tolist()
+            raise RuntimeError(
+                "global_masked_mean requires the same number of dataloader batches on every rank; "
+                f"received per-rank lengths {lengths}."
+            )
+
+    def save_checkpoint(self, update, consumed_updates, last=False):
         self.accelerator.wait_for_everyone()
         if self.is_main:
             checkpoint = dict(
@@ -348,6 +580,7 @@ class Trainer:
                 ema_model_state_dict=self.ema_model.state_dict(),
                 scheduler_state_dict=self.scheduler.state_dict(),
                 update=update,
+                consumed_updates=consumed_updates,
             )
             if not os.path.exists(self.checkpoint_path):
                 os.makedirs(self.checkpoint_path)
@@ -380,7 +613,7 @@ class Trainer:
             or not os.path.exists(self.checkpoint_path)
             or not any(filename.endswith((".pt", ".safetensors")) for filename in os.listdir(self.checkpoint_path))
         ):
-            return 0
+            return 0, 0
 
         self.accelerator.wait_for_everyone()
         if "model_last.pt" in os.listdir(self.checkpoint_path):
@@ -441,6 +674,10 @@ class Trainer:
             if self.scheduler:
                 self.scheduler.load_state_dict(checkpoint["scheduler_state_dict"])
             update = checkpoint["update"]
+            # Optimizer overflows consume an accumulation window without
+            # completing an update. Older checkpoints predate that distinction
+            # and advanced "update" for every consumed window.
+            consumed_updates = checkpoint.get("consumed_updates", update)
         else:
             checkpoint["model_state_dict"] = {
                 k.replace("ema_model.", ""): v
@@ -449,10 +686,11 @@ class Trainer:
             }
             self.accelerator.unwrap_model(self.model).load_state_dict(checkpoint["model_state_dict"])
             update = 0
+            consumed_updates = 0
 
         del checkpoint
         gc.collect()
-        return update
+        return update, consumed_updates
 
     def train(self, train_dataset: Dataset, num_workers=16, resumable_with_seed: int = None):
         if self.log_samples:
@@ -516,17 +754,33 @@ class Trainer:
         self.scheduler = SequentialLR(
             self.optimizer, schedulers=[warmup_scheduler, decay_scheduler], milestones=[warmup_updates]
         )
-        train_dataloader, self.scheduler = self.accelerator.prepare(
-            train_dataloader, self.scheduler
-        )  # actual multi_gpu updates = single_gpu updates / gpu nums
-        start_update = self.load_checkpoint()
+        if self.global_masked_mean:
+            # Buffer accumulation windows on the host. A normally prepared
+            # dataloader places each yielded batch on the accelerator, which
+            # would retain G large mel batches and undermine accumulation's
+            # memory bound. The window iterator transfers one batch at a time.
+            if self.accelerator.dispatch_batches:
+                raise ValueError(
+                    "global_masked_mean=True requires dispatch_batches=False so accumulation windows "
+                    "can remain on the host until each microbatch is processed."
+                )
+            train_dataloader = self.accelerator.prepare_data_loader(train_dataloader, device_placement=False)
+            self.scheduler = self.accelerator.prepare(self.scheduler)
+            self._validate_global_masked_dataloader(train_dataloader)
+        else:
+            train_dataloader, self.scheduler = self.accelerator.prepare(
+                train_dataloader, self.scheduler
+            )  # actual multi_gpu updates = single_gpu updates / gpu nums
+        start_update, start_consumed_updates = self.load_checkpoint()
         global_update = start_update
+        consumed_updates = start_consumed_updates
 
         if exists(resumable_with_seed):
             orig_epoch_step = len(train_dataloader)
-            start_step = start_update * self.grad_accumulation_steps
-            skipped_epoch = int(start_step // orig_epoch_step)
-            skipped_batch = start_step % orig_epoch_step
+            updates_per_epoch = math.ceil(orig_epoch_step / self.grad_accumulation_steps)
+            skipped_epoch = int(start_consumed_updates // updates_per_epoch)
+            updates_into_epoch = start_consumed_updates % updates_per_epoch
+            skipped_batch = min(updates_into_epoch * self.grad_accumulation_steps, orig_epoch_step)
             skipped_dataloader = self.accelerator.skip_first_batches(train_dataloader, num_batches=skipped_batch)
         else:
             skipped_epoch = 0
@@ -552,8 +806,16 @@ class Trainer:
                 initial=progress_bar_initial,
             )
 
-            for batch in current_dataloader:
-                with self.accelerator.accumulate(self.model):
+            if self.global_masked_mean:
+                training_batches = self._iter_global_masked_mean_batches(current_dataloader)
+            else:
+                training_batches = ((batch, None, None, None, None) for batch in current_dataloader)
+
+            loss_sum_accum = None
+            for batch, rand_span_mask, loss_scale, global_loss_denom, is_boundary in training_batches:
+                if self.global_masked_mean:
+                    batch = send_to_device(batch, self.accelerator.device, non_blocking=True)
+                with self._accumulation_context(is_boundary):
                     text_inputs = batch["text"]
                     mel_spec = batch["mel"].permute(0, 2, 1)
                     mel_lengths = batch["mel_lengths"]
@@ -563,40 +825,89 @@ class Trainer:
                         dur_loss = self.duration_predictor(mel_spec, lens=batch.get("durations"))
                         self.accelerator.log({"duration loss": dur_loss.item()}, step=global_update)
 
-                    loss, cond, pred = self.model(
-                        mel_spec, text=text_inputs, lens=mel_lengths, noise_scheduler=self.noise_scheduler
-                    )
-                    self._check_compile_runtime_fallback()
-                    self.accelerator.backward(loss)
+                    if self.global_masked_mean:
+                        assert rand_span_mask is not None
+                        assert loss_scale is not None
+                        loss, loss_sum, loss_denom, cond, pred = self.model(
+                            mel_spec,
+                            text=text_inputs,
+                            lens=mel_lengths,
+                            noise_scheduler=self.noise_scheduler,
+                            rand_span_mask=rand_span_mask,
+                            return_loss_components=True,
+                        )
+                        loss_sum_accum = (
+                            loss_sum.detach() if loss_sum_accum is None else loss_sum_accum + loss_sum.detach()
+                        )
+                        self._check_compile_runtime_fallback()
+                        self.accelerator.backward(loss_sum * loss_scale)
+                    else:
+                        loss, cond, pred = self.model(
+                            mel_spec, text=text_inputs, lens=mel_lengths, noise_scheduler=self.noise_scheduler
+                        )
+                        self._check_compile_runtime_fallback()
+                        self.accelerator.backward(loss)
 
-                    if self.max_grad_norm > 0 and self.accelerator.sync_gradients:
+                    deepspeed_clips_in_backward = (
+                        self.global_masked_mean and self.accelerator.distributed_type == DistributedType.DEEPSPEED
+                    )
+                    if self.max_grad_norm > 0 and self.accelerator.sync_gradients and not deepspeed_clips_in_backward:
                         self.accelerator.clip_grad_norm_(self.model.parameters(), self.max_grad_norm)
 
                     self.optimizer.step()
                     self.scheduler.step()
                     self.optimizer.zero_grad()
 
+                if self.global_masked_mean and self.accelerator.sync_gradients:
+                    assert loss_sum_accum is not None
+                    assert global_loss_denom is not None
+                    global_loss_sum = self._reduce_global_masked_value(loss_sum_accum.to(dtype=torch.float32))
+                    loss_to_log = (global_loss_sum / global_loss_denom.to(dtype=torch.float32)).item()
+                    loss_sum_accum = None
+                elif self.global_masked_mean:
+                    loss_to_log = None
+                else:
+                    loss_to_log = loss.item()
+
+                update_completed = self.accelerator.sync_gradients and (
+                    not self.global_masked_mean or not self.accelerator.optimizer_step_was_skipped
+                )
                 if self.accelerator.sync_gradients:
+                    consumed_updates += 1
+                    progress_bar.update(1)
+
+                if update_completed:
                     if self.is_main:
                         self.ema_model.update()
 
                     global_update += 1
-                    progress_bar.update(1)
-                    progress_bar.set_postfix(update=str(global_update), loss=loss.item())
+                if self.accelerator.sync_gradients:
+                    assert loss_to_log is not None
+                    if self.global_masked_mean:
+                        progress_bar.set_postfix(
+                            update=str(global_update),
+                            loss=loss_to_log,
+                            skipped=not update_completed,
+                        )
+                    else:
+                        progress_bar.set_postfix(update=str(global_update), loss=loss_to_log)
 
-                if self.accelerator.is_local_main_process:
+                should_log = not self.global_masked_mean or self.accelerator.sync_gradients
+                if self.accelerator.is_local_main_process and should_log:
+                    assert loss_to_log is not None
                     self.accelerator.log(
-                        {"loss": loss.item(), "lr": self.scheduler.get_last_lr()[0]}, step=global_update
+                        {"loss": loss_to_log, "lr": self.scheduler.get_last_lr()[0]}, step=global_update
                     )
-                if self.logger == "tensorboard" and self.accelerator.is_main_process:
-                    self.writer.add_scalar("loss", loss.item(), global_update)
+                if self.logger == "tensorboard" and self.accelerator.is_main_process and should_log:
+                    assert loss_to_log is not None
+                    self.writer.add_scalar("loss", loss_to_log, global_update)
                     self.writer.add_scalar("lr", self.scheduler.get_last_lr()[0], global_update)
 
-                if global_update % self.last_per_updates == 0 and self.accelerator.sync_gradients:
-                    self.save_checkpoint(global_update, last=True)
+                if global_update % self.last_per_updates == 0 and update_completed:
+                    self.save_checkpoint(global_update, consumed_updates, last=True)
 
-                if global_update % self.save_per_updates == 0 and self.accelerator.sync_gradients:
-                    self.save_checkpoint(global_update)
+                if global_update % self.save_per_updates == 0 and update_completed:
+                    self.save_checkpoint(global_update, consumed_updates)
 
                     if self.log_samples and self.accelerator.is_local_main_process:
                         ref_audio_len = mel_lengths[0]
@@ -643,6 +954,6 @@ class Trainer:
                         finally:
                             sample_model.train(was_training)
 
-        self.save_checkpoint(global_update, last=True)
+        self.save_checkpoint(global_update, consumed_updates, last=True)
 
         self.accelerator.end_training()

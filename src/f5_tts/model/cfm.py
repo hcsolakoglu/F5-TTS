@@ -400,7 +400,33 @@ class CFM(nn.Module):
 
         return loss.mean(), cond, pred
 
-    def _prepare_training_inputs(self, inp, text, lens):
+    def sample_training_mask(self, lens: torch.Tensor, seq_len: int) -> torch.Tensor:
+        """Sample the random span mask used by one training forward.
+
+        ``global_masked_mean`` needs the exact masked-element count before any
+        backward pass in an accumulation window. Sampling the mask separately
+        keeps that preload lightweight: no transformer activations or autograd
+        graphs are retained while the window denominator is reduced.
+        """
+        if seq_len < 0:
+            raise ValueError(f"seq_len must be non-negative, but received {seq_len}")
+        if lens.ndim != 1:
+            raise ValueError(f"lens must be one-dimensional, but received shape {tuple(lens.shape)}")
+        if lens.dtype == torch.bool or lens.is_floating_point() or lens.is_complex():
+            raise TypeError(f"lens must use an integer dtype, but received {lens.dtype}")
+        if bool(((lens < 0) | (lens > seq_len)).any().item()):
+            raise ValueError(f"lens values must be between 0 and seq_len ({seq_len})")
+
+        lens = lens.to(device=self.device, dtype=torch.long)
+        valid_mask = lens_to_mask(lens, length=seq_len)
+        return self._sample_training_mask(lens, seq_len, valid_mask)
+
+    def _sample_training_mask(self, lens: torch.Tensor, seq_len: int, valid_mask: torch.Tensor) -> torch.Tensor:
+        frac_lengths = torch.zeros((lens.shape[0],), device=self.device).float().uniform_(*self.frac_lengths_mask)
+        rand_span_mask = mask_from_frac_lengths(lens, frac_lengths, length=seq_len)
+        return rand_span_mask & valid_mask
+
+    def _prepare_training_inputs(self, inp, text, lens, rand_span_mask: torch.Tensor | None = None):
         """Stochastic preparation shared by ``forward`` (stays eager; not compiled)."""
         # handle raw wave
         if inp.ndim == 2:
@@ -425,12 +451,21 @@ class CFM(nn.Module):
             lens = lens.to(device=device, dtype=torch.long)
         mask = lens_to_mask(lens, length=seq_len)
 
-        # get a random span to mask out for training conditionally
-        frac_lengths = torch.zeros((batch,), device=self.device).float().uniform_(*self.frac_lengths_mask)
-        rand_span_mask = mask_from_frac_lengths(lens, frac_lengths, length=seq_len)
-
-        if exists(mask):
-            rand_span_mask &= mask
+        # Get a random span to mask out for training conditionally. The global
+        # masked-mean trainer pre-samples this mask so it can normalize the
+        # whole accumulation window before backward; all other callers retain
+        # the historical in-forward sampling order.
+        if rand_span_mask is None:
+            rand_span_mask = self._sample_training_mask(lens, seq_len, mask)
+        else:
+            expected_shape = (batch, seq_len)
+            if tuple(rand_span_mask.shape) != expected_shape:
+                raise ValueError(
+                    f"rand_span_mask must have shape {expected_shape}, but received {tuple(rand_span_mask.shape)}"
+                )
+            if rand_span_mask.dtype != torch.bool:
+                raise TypeError(f"rand_span_mask must have dtype torch.bool, but received {rand_span_mask.dtype}")
+            rand_span_mask = rand_span_mask.to(device=device) & mask
 
         # mel is x1; x0 is gaussian noise; time step
         x1 = inp
@@ -659,10 +694,14 @@ class CFM(nn.Module):
         *,
         lens: int["b"] | None = None,
         noise_scheduler: str | None = None,
+        rand_span_mask: torch.Tensor | None = None,
+        return_loss_components: bool = False,
     ):
         # Stochastic preparation stays eager; deterministic loss core may be compiled.
         x1, text, mask, rand_span_mask, x0, time, drop_audio_cond, drop_text = self._prepare_training_inputs(
-            inp, text, lens
+            inp, text, lens, rand_span_mask
         )
+        if return_loss_components:
+            return self._run_loss_core_components(x1, text, mask, rand_span_mask, x0, time, drop_audio_cond, drop_text)
         loss, cond, pred = self._run_loss_core(x1, text, mask, rand_span_mask, x0, time, drop_audio_cond, drop_text)
         return loss, cond, pred
